@@ -13,15 +13,14 @@ dependencies = [
 
 [project.optional-dependencies]
 camera = [
+    "pyzed",
     "opencv-python>=4.5",
 ]
-# pyzed is not on PyPI — install from the ZED SDK wheel:
-#   uv pip install /path/to/pyzed-*.whl
-# The wheel is downloaded by: python3 /usr/local/zed/get_python_api.py
 
 [tool.uv.sources]
 threed-mouse = { git = "https://github.com/hcrlab/3dmouse-hid", branch = "develop", subdirectory = "python" }
 net-franky = { git = "https://github.com/yblei/net_franky", branch = "main" }
+pyzed = { url = "https://download.stereolabs.com/zedsdk/5.2/whl/linux_x86_64/pyzed-5.2-cp312-cp312-linux_x86_64.whl" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
