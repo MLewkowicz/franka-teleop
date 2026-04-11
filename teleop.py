@@ -51,6 +51,22 @@ def run_teleop(cfg: DictConfig):
         rotation_enabled=True,
     )
 
+    camera = None
+    if cfg.get("camera", {}).get("enabled", False):
+        try:
+            from camera import ZedCamera
+            camera = ZedCamera(
+                resolution=cfg.camera.resolution,
+                fps=cfg.camera.fps,
+                depth_mode=cfg.camera.depth_mode,
+            )
+            camera.run()
+            print("  ZED 2i camera ready.")
+        except Exception as e:
+            print(f"  [camera] Failed to initialize: {e}")
+            print("  Continuing without camera.")
+            camera = None
+
     recorder = TrajectoryRecorder(
         save_dir=cfg.data_dir,
         metadata={
@@ -58,6 +74,7 @@ def run_teleop(cfg: DictConfig):
             "angular_scale": tc.angular_scale,
             "period": tc.period,
         },
+        camera=camera,
     )
 
     print("SpaceMouse teleop ready.")
@@ -139,3 +156,5 @@ def run_teleop(cfg: DictConfig):
     finally:
         recorder.close()
         mouse.close()
+        if camera is not None:
+            camera.close()

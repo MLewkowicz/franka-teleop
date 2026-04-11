@@ -11,6 +11,12 @@ dependencies = [
     "threed-mouse",
 ]
 
+[project.optional-dependencies]
+camera = [
+    "pyzed",
+    "opencv-python>=4.5",
+]
+
 [tool.uv.sources]
 threed-mouse = { git = "https://github.com/hcrlab/3dmouse-hid", branch = "develop", subdirectory = "python" }
 net-franky = { git = "https://github.com/yblei/net_franky", branch = "main" }

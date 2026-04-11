@@ -13,16 +13,18 @@ import numpy as np
 
 class TrajectoryRecorder:
 
-    def __init__(self, save_dir="./data", capacity=120_000, metadata=None):
+    def __init__(self, save_dir="./data", capacity=120_000, metadata=None, camera=None):
         """
         Args:
             save_dir: Directory to save episode files.
             capacity: Pre-allocated buffer size in timesteps (120k = 2 min at 1kHz).
             metadata: Optional dict of extra metadata stored in HDF5 attrs.
+            camera: Optional ZedCamera instance for synchronized video recording.
         """
         self._save_dir = Path(save_dir)
         self._capacity = capacity
         self._metadata = metadata or {}
+        self._camera = camera
         self._recording = False
         self._count = 0
         self._start_time = 0.0
@@ -70,14 +72,25 @@ class TrajectoryRecorder:
         self._start_time = time.monotonic()
         self._start_wall = time.strftime("%Y%m%d_%H%M%S")
         self._recording = True
+
+        if self._camera is not None:
+            self._save_dir.mkdir(parents=True, exist_ok=True)
+            video_path = str(self._save_dir / f"episode_{self._start_wall}_video.hdf5")
+            self._camera.start_recording(video_path, self._start_time)
+
         print("  [recorder] RECORDING started")
 
     def stop(self):
         if not self._recording:
             return
         self._recording = False
+
+        camera_ts = None
+        if self._camera is not None:
+            camera_ts, _ = self._camera.stop_recording()
+
         if self._count > 0:
-            self._save_episode()
+            self._save_episode(camera_ts)
             print(f"  [recorder] SAVED {self._count} steps")
         else:
             print("  [recorder] No data recorded, skipping save")
@@ -112,7 +125,7 @@ class TrajectoryRecorder:
 
         self._count += 1
 
-    def _save_episode(self):
+    def _save_episode(self, camera_ts=None):
         self._save_dir.mkdir(parents=True, exist_ok=True)
         n = self._count
         fname = self._save_dir / f"episode_{self._start_wall}.h5"
@@ -121,6 +134,14 @@ class TrajectoryRecorder:
             for key, buf in self._buffers.items():
                 f.create_dataset(key, data=buf[:n], compression="gzip",
                                  compression_opts=1)
+
+            if camera_ts is not None and len(camera_ts) > 0:
+                f.create_dataset("camera_timestamps", data=camera_ts,
+                                 compression="gzip", compression_opts=1)
+                f.attrs["camera_video_file"] = f"episode_{self._start_wall}_video.hdf5"
+                f.attrs["camera_resolution"] = self._camera.resolution
+                f.attrs["camera_fps"] = self._camera.fps
+
             for k, v in self._metadata.items():
                 f.attrs[k] = v
             f.attrs["start_time"] = self._start_wall

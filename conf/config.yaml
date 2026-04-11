@@ -24,6 +24,12 @@ teleop:
     translation_deadband: 0.08
     rotation_deadband: 0.08
 
+camera:
+  enabled: false          # Set true when ZED 2i is connected
+  resolution: HD720       # HD2K, HD1080, HD720, VGA
+  fps: 30                 # 15, 30, 60 (resolution-dependent)
+  depth_mode: PERFORMANCE # NONE, PERFORMANCE, QUALITY, ULTRA, NEURAL
+
 replay:
   episode: null  # path to .h5 file, or null for latest in data_dir
   speed: 1.0
