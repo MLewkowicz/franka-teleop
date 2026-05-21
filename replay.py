@@ -1,4 +1,4 @@
-"""Replay a recorded trajectory using Cartesian impedance control."""
+"""Replay a recorded trajectory using joint impedance control."""
 
 import time
 from pathlib import Path
@@ -8,13 +8,15 @@ import numpy as np
 from omegaconf import DictConfig
 
 from net_franky.franky import (
-    Affine,
-    CartesianImpedanceTracker,
     ControlException,
+    JointImpedanceTracker,
+    JointMotion,
+    JointState,
     Robot,
-    Twist,
 )
-from threed_mouse.geometry import pack_Rp
+
+DEFAULT_LOWER_JOINT_LIMITS = [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973]
+DEFAULT_UPPER_JOINT_LIMITS = [2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973]
 
 
 def find_latest_episode(data_dir: str) -> Path:
@@ -46,33 +48,47 @@ def run_replay(cfg: DictConfig):
     episode = load_episode(episode_path)
 
     timestamps = episode["timestamps"]
-    ee_pos = episode["ee_pos"]
-    ee_rot = episode["ee_rot"]
-    cmd_linear_vel = episode["cmd_linear_vel"]
-    cmd_angular_vel = episode["cmd_angular_vel"]
-    enabled = episode["enabled"]
+    joint_pos = episode["joint_pos"]
+    joint_vel = episode["joint_vel"]
     n_steps = len(timestamps)
     duration = timestamps[-1]
 
+    if np.any(np.isnan(joint_pos)):
+        raise ValueError(
+            "Episode has NaN joint_pos samples — was joint state captured during recording?"
+        )
+    has_joint_vel = not np.any(np.isnan(joint_vel))
+
+    stiffness = np.asarray(rc.joint_stiffness, dtype=float)
+    if stiffness.shape != (7,):
+        raise ValueError(f"replay.joint_stiffness must have 7 entries, got shape {stiffness.shape}")
+
     print(f"  {n_steps} steps, {duration:.1f}s duration")
     print(f"  Replay speed: {rc.speed}x")
+    print(f"  Joint stiffness: {stiffness.tolist()}")
+    print(f"  Joint velocity feedforward: {'enabled' if has_joint_vel else 'disabled (NaN in recording)'}")
     print(f"  Press Ctrl-C to abort.")
 
     robot = Robot(cfg.robot.ip)
     robot.recover_from_errors()
+
+    print(f"  Pre-positioning to start configuration...")
+    robot.move(JointMotion(
+        JointState(joint_pos[0]),
+        relative_dynamics_factor=float(rc.preposition_dynamics_factor),
+    ))
+    time.sleep(float(rc.preposition_settle_s))
 
     try:
         while True:
             robot.recover_from_errors()
 
             try:
-                with CartesianImpedanceTracker(
+                with JointImpedanceTracker(
                     robot,
-                    translational_stiffness=rc.translational_stiffness,
-                    rotational_stiffness=rc.rotational_stiffness,
-                    nullspace_stiffness=rc.nullspace_stiffness,
-                    lower_joint_limits=[-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973],
-                    upper_joint_limits=[2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973],
+                    stiffness=stiffness,
+                    lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
+                    upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
                     period=rc.period,
                 ) as tracker:
                     step = 0
@@ -84,30 +100,22 @@ def run_replay(cfg: DictConfig):
 
                         elapsed = (time.monotonic() - replay_start) * rc.speed
 
-                        # Advance to the step matching current elapsed time.
                         while step < n_steps - 1 and timestamps[step + 1] <= elapsed:
                             step += 1
 
                         if step >= n_steps - 1:
                             print("  Replay complete.")
-                            # Hold final pose briefly then exit.
-                            current = tracker.current_pose.end_effector_pose
-                            tracker.set_target(current)
+                            tracker.set_target(joint_pos[-1])
                             break
 
-                        if enabled[step]:
-                            pos = ee_pos[step]
-                            rot = ee_rot[step]
-                            v = cmd_linear_vel[step]
-                            w = cmd_angular_vel[step]
-
-                            pose = Affine(pack_Rp(rot, pos))
-                            tracker.set_target(pose, Twist(v * rc.speed, w * rc.speed))
+                        q = joint_pos[step]
+                        if has_joint_vel:
+                            dq = joint_vel[step] * rc.speed
+                            tracker.set_target(q, dq=dq)
                         else:
-                            current = tracker.current_pose.end_effector_pose
-                            tracker.set_target(current)
+                            tracker.set_target(q)
 
-                break  # Clean exit after replay completes.
+                break
 
             except ControlException as e:
                 print(f"\n  Controller faulted: {e}")

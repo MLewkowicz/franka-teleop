@@ -132,6 +132,42 @@ class ZedCamera:
         return timestamps, n
 
     # ------------------------------------------------------------------
+    # Synchronous access (used by calibration; safe before run() is called)
+    # ------------------------------------------------------------------
+
+    def get_intrinsics(self):
+        """Return (K, dist) for the LEFT camera using factory ZED calibration.
+
+        dist follows OpenCV convention: [k1, k2, p1, p2, k3].
+        """
+        cal = self._zed.get_camera_information().camera_configuration.calibration_parameters.left_cam
+        K = np.array(
+            [[cal.fx, 0.0, cal.cx],
+             [0.0, cal.fy, cal.cy],
+             [0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
+        dist = np.array(cal.disto[:5], dtype=np.float64)
+        return K, dist
+
+    def grab_frame(self):
+        """Synchronously grab one (rgb, depth) frame. Returns None on failure.
+
+        Does not require run() to have been called. Must not be invoked
+        concurrently with the background capture thread — intended for
+        offline/calibration use where run() is never started.
+        """
+        sl = self._sl
+        runtime = sl.RuntimeParameters()
+        if self._zed.grab(runtime) != sl.ERROR_CODE.SUCCESS:
+            return None
+        self._zed.retrieve_image(self._rgb_mat, sl.VIEW.LEFT)
+        self._zed.retrieve_measure(self._depth_mat, sl.MEASURE.DEPTH)
+        rgb = self._rgb_mat.get_data()[:, :, :3][:, :, ::-1].copy()
+        depth = self._depth_mat.get_data().copy()
+        return rgb, depth
+
+    # ------------------------------------------------------------------
     # Thread lifecycle
     # ------------------------------------------------------------------
 

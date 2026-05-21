@@ -23,6 +23,9 @@ def main(cfg: DictConfig):
     elif cfg.mode == "replay":
         from replay import run_replay
         run_replay(cfg)
+    elif cfg.mode == "calibrate":
+        from calibrate_extrinsics import run_calibration
+        run_calibration(cfg)
     else:
         raise ValueError(f"Unknown mode: {cfg.mode}")
 
