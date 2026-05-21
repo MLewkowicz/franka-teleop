@@ -1,0 +1,288 @@
+"""Optional viser visualization for the Cortado robot description."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import unquote, urlparse
+
+import numpy as np
+
+
+DEFAULT_ARM_JOINT_NAMES = tuple(f"fr3_joint{i}" for i in range(1, 8))
+DEFAULT_GRIPPER_JOINT_NAME = "finger_joint"
+DEFAULT_GRIPPER_JOINT_CLOSED = 0.8
+
+ROBOT_XACRO_ARGS = {
+    "robot_name": "cortado",
+    "wrist_camera": "true",
+    "flip_gripper": "true",
+    "camera_mast": "2",
+}
+
+ROBOT_DESCRIPTIONS_CACHE_ROOT = Path(
+    os.environ.get("ROBOT_DESCRIPTIONS_CACHE", "~/.cache/robot_descriptions")
+).expanduser()
+
+_CORTADO_DESCRIPTION_REPO_URL = "https://github.com/MIT-CLEAR-Lab/cortado_description.git"
+_CORTADO_DESCRIPTION_COMMIT = "2e2c0f11199c059b8aef633fb5599e8255c64b30"
+_CORTADO_DESCRIPTION_MODULE = "cortado_description"
+_ROBOTIQ_2F85_REPO_URL = "https://github.com/nickswalker/robotiq-2f-85.git"
+_ROBOTIQ_2F85_COMMIT = "aa93c26c09bf5c78d1e6508bbce47657d809d16a"
+_ROBOTIQ_2F85_PACKAGE = "robotiq_2f_85_gripper_visualization"
+_ROBOTIQ_2F85_MODULE = "robotiq_2f85_v4_description"
+_ZED_DESCRIPTION_REPO_URL = "https://github.com/stereolabs/zed-ros2-description.git"
+_ZED_DESCRIPTION_COMMIT = "1aa88b319897311d2f33882a4abbc40da8d75ace"
+_ZED_DESCRIPTION_PACKAGE = "zed_description"
+_ZED_DESCRIPTION_MODULE = "zed_description"
+
+
+def _get_manual_description(repo_url: str, commit: str | None, module: str, package: str | None):
+    from robot_descriptions._cache import clone_to_directory
+
+    repo_dir = ROBOT_DESCRIPTIONS_CACHE_ROOT / "manual" / module
+    clone_to_directory(repo_url, str(repo_dir), commit=commit)
+    package_path = repo_dir / package if package is not None else repo_dir.resolve()
+    return SimpleNamespace(
+        REPOSITORY_PATH=str(repo_dir),
+        PACKAGE_PATH=str(package_path),
+    )
+
+
+def _get_cortado_description(repo_url: str, commit: str | None):
+    description = _get_manual_description(
+        repo_url,
+        commit,
+        _CORTADO_DESCRIPTION_MODULE,
+        None,
+    )
+    _ensure_cortado_description_compatibility(Path(description.REPOSITORY_PATH))
+    return description
+
+
+def _ensure_cortado_description_compatibility(description_root: Path) -> None:
+    """Patch known upstream xacro filename drift in the local cache."""
+    common_dir = description_root / "robots" / "common"
+    for stem in ("cortado_cart", "fr3_robotiq_2f_85"):
+        expected = common_dir / f"{stem}.urdf.xacro"
+        actual = common_dir / f"{stem}.xacro"
+        if expected.exists() or not actual.exists():
+            continue
+        expected.symlink_to(actual.name)
+
+
+def _get_package_roots(description_root: Path) -> dict[str, Path]:
+    import xacrodoc
+    from robot_descriptions import fr3_description
+
+    robotiq_description = _get_manual_description(
+        _ROBOTIQ_2F85_REPO_URL,
+        _ROBOTIQ_2F85_COMMIT,
+        _ROBOTIQ_2F85_MODULE,
+        _ROBOTIQ_2F85_PACKAGE,
+    )
+    zed_description = _get_manual_description(
+        _ZED_DESCRIPTION_REPO_URL,
+        _ZED_DESCRIPTION_COMMIT,
+        _ZED_DESCRIPTION_MODULE,
+        None,
+    )
+    package_roots = {
+        "cortado_description": description_root,
+        "franka_description": Path(fr3_description.REPOSITORY_PATH).resolve(),
+        _ROBOTIQ_2F85_PACKAGE: Path(robotiq_description.PACKAGE_PATH).resolve(),
+        _ZED_DESCRIPTION_PACKAGE: Path(zed_description.PACKAGE_PATH).resolve(),
+    }
+    xacrodoc.packages.update_package_cache(package_roots)
+    return package_roots
+
+
+def _bake_cortado_urdf(description_root: Path) -> Path:
+    from robot_descriptions import _xacro
+
+    xacro_path = description_root / "robots" / "cortado.urdf.xacro"
+    description_module = SimpleNamespace(
+        __name__="cortado_description_cortado_urdf",
+        XACRO_PATH=str(xacro_path.resolve()),
+        XACRO_ARGS=ROBOT_XACRO_ARGS,
+        PACKAGE_PATH=str(description_root.resolve()),
+    )
+    return Path(_xacro.get_urdf_path(description_module)).resolve()
+
+
+def _package_filename_handler(fname: str, package_roots: dict[str, Path]) -> str:
+    if fname.startswith("file://"):
+        parsed = urlparse(fname)
+        return unquote(parsed.path)
+
+    fname = unquote(fname)
+    if fname.startswith("package://"):
+        package, relpath = fname.removeprefix("package://").split("/", 1)
+        if package in package_roots:
+            return str(package_roots[package] / relpath)
+    return fname
+
+
+class CortadoViserVisualizer:
+    """Load Cortado into viser and update its arm joints from Franka state."""
+
+    def __init__(
+        self,
+        description_root: str | Path | None = None,
+        description_repo_url: str = _CORTADO_DESCRIPTION_REPO_URL,
+        description_commit: str | None = _CORTADO_DESCRIPTION_COMMIT,
+        host: str = "0.0.0.0",
+        port: int = 8080,
+        root_node_name: str = "/cortado",
+    ):
+        import viser
+        import yourdfpy
+        from viser.extras import ViserUrdf
+
+        self._pointcloud_handles = {}
+
+        if description_root is None:
+            description = _get_cortado_description(description_repo_url, description_commit)
+            description_root = description.REPOSITORY_PATH
+
+        self.description_root = Path(description_root).expanduser().resolve()
+        if not self.description_root.exists():
+            raise FileNotFoundError(f"Cortado description root does not exist: {self.description_root}")
+
+        package_roots = _get_package_roots(self.description_root)
+        urdf_path = _bake_cortado_urdf(self.description_root)
+        urdf_model = yourdfpy.URDF.load(
+            str(urdf_path),
+            filename_handler=lambda fname: _package_filename_handler(fname, package_roots),
+            force_mesh=True,
+        )
+
+        self.server = viser.ViserServer(host=host, port=port)
+        self.server.scene.add_frame(root_node_name, show_axes=False)
+        self.urdf = ViserUrdf(
+            self.server,
+            urdf_or_path=urdf_model,
+            root_node_name=root_node_name,
+            load_meshes=True,
+        )
+        self.urdf.show_visual = True
+
+        self.actuated_joint_names = list(self.urdf.get_actuated_joint_names())
+        self._cfg = np.zeros(len(self.actuated_joint_names), dtype=float)
+        self._arm_joint_indices = self._resolve_arm_joint_indices()
+        self._gripper_joint_index = self._resolve_optional_joint_index(DEFAULT_GRIPPER_JOINT_NAME)
+        self.urdf.update_cfg(self._cfg)
+        # Static transform: fr3_link0 pose in URDF root frame (all fixed joints from cart).
+        self._T_fr3link0_in_root: np.ndarray = urdf_model.get_transform("fr3_link0")
+
+        url_host = "localhost" if host in {"0.0.0.0", "::"} else host
+        print(f"  [viser] Cortado URDF loaded from {urdf_path}")
+        print(f"  [viser] Open http://{url_host}:{port} in your browser.")
+
+    def _resolve_arm_joint_indices(self) -> list[int]:
+        indices = []
+        for joint_name in DEFAULT_ARM_JOINT_NAMES:
+            try:
+                indices.append(self.actuated_joint_names.index(joint_name))
+            except ValueError as exc:
+                names = ", ".join(self.actuated_joint_names)
+                raise ValueError(
+                    f"URDF is missing expected arm joint {joint_name!r}. "
+                    f"Actuated joints: {names}"
+                ) from exc
+        return indices
+
+    def _resolve_optional_joint_index(self, joint_name: str) -> int | None:
+        try:
+            return self.actuated_joint_names.index(joint_name)
+        except ValueError:
+            return None
+
+    def update(self, joint_pos: np.ndarray | None) -> None:
+        if joint_pos is None:
+            return
+
+        q = np.asarray(joint_pos, dtype=float).reshape(-1)
+        if q.shape[0] < len(self._arm_joint_indices):
+            raise ValueError(f"Expected at least 7 joint positions, got shape {q.shape}")
+
+        self._cfg[self._arm_joint_indices] = q[:7]
+        self.urdf.update_cfg(self._cfg)
+
+    def update_gripper_width(
+        self,
+        opening_width_m: float,
+        max_width_m: float,
+    ) -> None:
+        if self._gripper_joint_index is None:
+            return
+        if max_width_m <= 0.0:
+            raise ValueError(f"max_width_m must be positive, got {max_width_m!r}")
+
+        opening_width_m = min(max(float(opening_width_m), 0.0), float(max_width_m))
+        closed_fraction = 1.0 - opening_width_m / float(max_width_m)
+        self._cfg[self._gripper_joint_index] = closed_fraction * DEFAULT_GRIPPER_JOINT_CLOSED
+        self.urdf.update_cfg(self._cfg)
+
+    def add_camera_frame(
+        self,
+        name: str,
+        T_cam2base: np.ndarray,
+        axes_length: float = 0.08,
+        axes_radius: float = 0.003,
+    ) -> None:
+        import viser.transforms
+
+        T_cam2base = np.asarray(T_cam2base, dtype=float)
+        if T_cam2base.shape != (4, 4):
+            raise ValueError(f"Expected a 4x4 camera transform, got {T_cam2base.shape}")
+
+        T_cam2root = self._T_fr3link0_in_root @ T_cam2base
+
+        frame = self.server.scene.add_frame(
+            name,
+            axes_length=axes_length,
+            axes_radius=axes_radius,
+        )
+        frame.wxyz = viser.transforms.SO3.from_matrix(T_cam2root[:3, :3]).wxyz
+        frame.position = T_cam2root[:3, 3]
+
+    def add_camera_frame_from_extrinsics(self, name: str, extrinsics_path: str | Path) -> None:
+        T_cam2base = load_T_cam2base(extrinsics_path)
+        self.add_camera_frame(name, T_cam2base)
+
+    def update_pointcloud(
+        self,
+        frame_name: str,
+        points: np.ndarray,
+        colors: np.ndarray,
+        point_size: float = 0.01,
+    ) -> None:
+        cloud_name = f"{frame_name}/pointcloud"
+        points = np.asarray(points, dtype=np.float32)
+        colors = np.asarray(colors, dtype=np.uint8)
+        handle = self._pointcloud_handles.get(cloud_name)
+        if handle is None:
+            handle = self.server.scene.add_point_cloud(
+                name=cloud_name,
+                points=points,
+                colors=colors,
+                point_size=point_size,
+            )
+            self._pointcloud_handles[cloud_name] = handle
+            return
+
+        handle.points = points
+        handle.colors = colors
+        handle.point_size = point_size
+
+
+def load_T_cam2base(extrinsics_path: str | Path) -> np.ndarray:
+    with Path(extrinsics_path).expanduser().open("r") as f:
+        payload = json.load(f)
+    T_cam2base = np.asarray(payload["T_cam2base"], dtype=float)
+    if T_cam2base.shape != (4, 4):
+        raise ValueError(f"Expected T_cam2base to be 4x4, got {T_cam2base.shape}")
+    return T_cam2base
