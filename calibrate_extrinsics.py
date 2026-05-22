@@ -269,6 +269,41 @@ def _compute_eye_in_hand_quality(samples, T_cam2gripper, T_board2base, K, dist):
     }
 
 
+def _per_frame_mean_reproj_errors(samples, T_cam2base, T_board2gripper, K, dist):
+    """Per-frame mean reprojection error (px) for eye-on-base setup."""
+    R_cam2base = T_cam2base[:3, :3]
+    t_cam2base = T_cam2base[:3, 3]
+    R_board2gripper = T_board2gripper[:3, :3]
+    t_board2gripper = T_board2gripper[:3, 3]
+    errors = []
+    for s in samples:
+        R_g2b, t_g2b = s["R_gripper2base"], s["t_gripper2base"]
+        R_b2cam = R_cam2base.T @ R_g2b @ R_board2gripper
+        t_b2cam = R_cam2base.T @ (R_g2b @ t_board2gripper + t_g2b - t_cam2base)
+        rvec, _ = cv2.Rodrigues(R_b2cam)
+        proj, _ = cv2.projectPoints(s["obj_pts"], rvec, t_b2cam, K, dist)
+        errors.append(np.linalg.norm(proj.reshape(-1, 2) - s["img_pts"].reshape(-1, 2), axis=1).mean())
+    return np.array(errors)
+
+
+def _per_frame_mean_reproj_errors_eye_in_hand(samples, T_cam2gripper, T_board2base, K, dist):
+    """Per-frame mean reprojection error (px) for eye-in-hand setup."""
+    errors = []
+    for s in samples:
+        T_gripper2base = _make_transform(s["R_gripper2base"], s["t_gripper2base"])
+        T_target2cam_expected = _invert_transform(T_gripper2base @ T_cam2gripper) @ T_board2base
+        rvec, _ = cv2.Rodrigues(T_target2cam_expected[:3, :3])
+        proj, _ = cv2.projectPoints(s["obj_pts"], rvec, T_target2cam_expected[:3, 3], K, dist)
+        errors.append(np.linalg.norm(proj.reshape(-1, 2) - s["img_pts"].reshape(-1, 2), axis=1).mean())
+    return np.array(errors)
+
+
+def _iqr_inlier_mask(errors, k=1.5):
+    """Tukey IQR fence: True = inlier (error <= Q3 + k*IQR)."""
+    q1, q3 = np.percentile(errors, [25, 75])
+    return errors <= q3 + k * (q3 - q1)
+
+
 # ---------------------------------------------------------------------------
 # Capture: kinesthetic manual
 # ---------------------------------------------------------------------------
@@ -499,7 +534,8 @@ def run_calibration(cfg: DictConfig):
         )
 
     # ---------------------------------------------------------------- solve
-    logger.info("Running hand-eye calibration over %d samples ...", len(samples))
+    n_captured = len(samples)
+    logger.info("Running hand-eye calibration over %d samples ...", n_captured)
     R_g2b = [s["R_gripper2base"] for s in samples]
     t_g2b = [s["t_gripper2base"] for s in samples]
     R_t2c = [s["R_target2cam"] for s in samples]
@@ -512,7 +548,7 @@ def run_calibration(cfg: DictConfig):
         "intrinsics": {"K": K.tolist(), "dist": dist.tolist()},
         "image_size": [int(camera._img_w), int(camera._img_h)],
         "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
-        "num_poses_used": len(samples),
+        "num_poses_captured": n_captured,
         "board": {
             "squares_x": cal.board.squares_x,
             "squares_y": cal.board.squares_y,
@@ -522,12 +558,50 @@ def run_calibration(cfg: DictConfig):
         },
     }
 
+    # Initial solve over all samples to obtain per-frame errors for outlier rejection.
     if camera_mount == "hand":
         T_cam2gripper = _solve_eye_in_hand(R_g2b, t_g2b, R_t2c, t_t2c)
         T_gripper2cam = _invert_transform(T_cam2gripper)
         T_board2base, _ = _solve_board2base(R_g2b, t_g2b, R_t2c, t_t2c, T_cam2gripper)
-        quality = _compute_eye_in_hand_quality(samples, T_cam2gripper, T_board2base, K, dist)
+        per_frame_errors = _per_frame_mean_reproj_errors_eye_in_hand(
+            samples, T_cam2gripper, T_board2base, K, dist
+        )
+    else:
+        T_cam2base = _solve_hand_eye(R_g2b, t_g2b, R_t2c, t_t2c)
+        T_board2gripper, _ = _solve_board2gripper(R_g2b, t_g2b, R_t2c, t_t2c, T_cam2base)
+        per_frame_errors = _per_frame_mean_reproj_errors(
+            samples, T_cam2base, T_board2gripper, K, dist
+        )
 
+    # IQR-based outlier rejection: re-solve if any frames are removed.
+    inlier_mask = _iqr_inlier_mask(per_frame_errors)
+    n_outliers = int((~inlier_mask).sum())
+    if n_outliers > 0:
+        logger.info("Outlier rejection: removing %d/%d samples (IQR k=1.5 fence):", n_outliers, n_captured)
+        for i, (err, is_inlier) in enumerate(zip(per_frame_errors, inlier_mask)):
+            logger.info("  sample %02d: %.2f px%s", i + 1, err, "" if is_inlier else "  <-- outlier")
+        samples = [s for s, m in zip(samples, inlier_mask) if m]
+        if len(samples) < 4:
+            raise RuntimeError(
+                f"Only {len(samples)} samples remain after outlier rejection; need >= 4. "
+                "Recapture with better board visibility."
+            )
+        R_g2b = [s["R_gripper2base"] for s in samples]
+        t_g2b = [s["t_gripper2base"] for s in samples]
+        R_t2c = [s["R_target2cam"] for s in samples]
+        t_t2c = [s["t_target2cam"] for s in samples]
+        if camera_mount == "hand":
+            T_cam2gripper = _solve_eye_in_hand(R_g2b, t_g2b, R_t2c, t_t2c)
+            T_gripper2cam = _invert_transform(T_cam2gripper)
+            T_board2base, _ = _solve_board2base(R_g2b, t_g2b, R_t2c, t_t2c, T_cam2gripper)
+        else:
+            T_cam2base = _solve_hand_eye(R_g2b, t_g2b, R_t2c, t_t2c)
+            T_board2gripper, _ = _solve_board2gripper(R_g2b, t_g2b, R_t2c, t_t2c, T_cam2base)
+
+    payload["num_poses_used"] = len(samples)
+
+    if camera_mount == "hand":
+        quality = _compute_eye_in_hand_quality(samples, T_cam2gripper, T_board2base, K, dist)
         logger.info("T_gripper2cam translation: %s m", T_gripper2cam[:3, 3].tolist())
         logger.info("T_gripper2cam rotation (xyz Euler): %s rad",
                     R.from_matrix(T_gripper2cam[:3, :3]).as_euler("xyz").tolist())
@@ -537,10 +611,7 @@ def run_calibration(cfg: DictConfig):
             "T_board2base": T_board2base.tolist(),
         })
     else:
-        T_cam2base = _solve_hand_eye(R_g2b, t_g2b, R_t2c, t_t2c)
-        T_board2gripper, _ = _solve_board2gripper(R_g2b, t_g2b, R_t2c, t_t2c, T_cam2base)
         quality = _compute_quality(samples, T_cam2base, T_board2gripper, K, dist)
-
         logger.info("T_cam2base translation: %s m", T_cam2base[:3, 3].tolist())
         logger.info("T_cam2base rotation (xyz Euler): %s rad",
                     R.from_matrix(T_cam2base[:3, :3]).as_euler("xyz").tolist())

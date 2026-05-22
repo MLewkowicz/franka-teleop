@@ -245,7 +245,7 @@ class CortadoViserVisualizer:
         if T_cam2base.shape != (4, 4):
             raise ValueError(f"Expected a 4x4 camera transform, got {T_cam2base.shape}")
 
-        T_cam2root = urdf_model.get_transform("fr3_link0") @ T_cam2base
+        T_cam2root = self.urdf_model.get_transform("fr3_link0") @ T_cam2base
 
         frame = self.server.scene.add_frame(
             name,
@@ -308,4 +308,25 @@ class CortadoViserVisualizer:
         handle.points = points
         handle.colors = colors
         handle.point_size = point_size
+
+    def update_eef_frame(
+        self,
+        O_T_EE: np.ndarray,
+        name: str = "/eef_debug",
+        axes_length: float = 0.08,
+        axes_radius: float = 0.003,
+    ) -> None:
+        import viser.transforms
+
+        # O_T_EE is in the Franka base (fr3_link0) frame. Transform into the
+        # viser world frame the same way add_camera_frame does for extrinsics.
+        T = self.urdf_model.get_transform("fr3_link0") @ np.asarray(O_T_EE, dtype=float)
+        handle = getattr(self, "_eef_frame_handle", None)
+        if handle is None:
+            handle = self.server.scene.add_frame(
+                name, axes_length=axes_length, axes_radius=axes_radius
+            )
+            self._eef_frame_handle = handle
+        handle.wxyz = viser.transforms.SO3.from_matrix(T[:3, :3]).wxyz
+        handle.position = T[:3, 3]
 

@@ -14,8 +14,8 @@ teleop:
   angular_scale: 0.5
   period: 0.001
   global_frame: true
-  translational_stiffness: 200.0
-  rotational_stiffness: 10.0
+  translational_stiffness: 100.0
+  rotational_stiffness: 5.0
   nullspace_stiffness: 2.0
   spacemouse:
     control_rate: 120
@@ -27,14 +27,14 @@ teleop:
 cameras:
   third_person:
     name: third_person
-    enabled: false       # Set true to record/open the fixed external ZED.
+    enabled: true
     serial_number: 37820861
     resolution: HD720
     fps: 30
     depth_mode: NEURAL
   hand:
     name: hand
-    enabled: false       # Set true to record/open the wrist-mounted ZED.
+    enabled: true
     serial_number: 10986074
     resolution: HD720
     fps: 30
@@ -94,6 +94,7 @@ replay:
   # Pre-positioning move to the first joint configuration of the episode.
   preposition_dynamics_factor: 0.1  # fraction of max velocity/accel/jerk
   preposition_settle_s: 0.5         # pause after preposition before streaming
+  record: false                     # save measured robot state as a new episode
 
 calibration:
   camera_mount: third_person           # third_person | hand

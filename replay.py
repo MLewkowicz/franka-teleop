@@ -31,13 +31,15 @@ def load_episode(path: Path) -> dict:
     data = {}
     with h5py.File(path, "r") as f:
         for key in f.keys():
-            data[key] = f[key][:]
+            if isinstance(f[key], h5py.Dataset):
+                data[key] = f[key][:]
         data["attrs"] = dict(f.attrs)
     return data
 
 
 def run_replay(cfg: DictConfig):
     rc = cfg.replay
+    gc = cfg.get("gripper", {})
 
     if rc.episode is not None:
         episode_path = Path(rc.episode)
@@ -59,6 +61,11 @@ def run_replay(cfg: DictConfig):
         )
     has_joint_vel = not np.any(np.isnan(joint_vel))
 
+    gripper_open_data = episode.get("gripper_open")
+    has_gripper_data = (
+        gripper_open_data is not None and not np.all(np.isnan(gripper_open_data))
+    )
+
     stiffness = np.asarray(rc.joint_stiffness, dtype=float)
     if stiffness.shape != (7,):
         raise ValueError(f"replay.joint_stiffness must have 7 entries, got shape {stiffness.shape}")
@@ -67,17 +74,72 @@ def run_replay(cfg: DictConfig):
     print(f"  Replay speed: {rc.speed}x")
     print(f"  Joint stiffness: {stiffness.tolist()}")
     print(f"  Joint velocity feedforward: {'enabled' if has_joint_vel else 'disabled (NaN in recording)'}")
+    if has_gripper_data:
+        print(f"  Gripper replay: {'enabled' if gc.get('enabled', False) else 'disabled (gripper.enabled=false in config)'}")
+    else:
+        print(f"  Gripper replay: disabled (no gripper data in episode)")
+    print(f"  Recording: {'enabled' if rc.get('record', False) else 'disabled'}")
     print(f"  Press Ctrl-C to abort.")
 
     robot = Robot(cfg.robot.ip)
     robot.recover_from_errors()
+
+    gripper = None
+    if has_gripper_data and gc.get("enabled", False):
+        try:
+            from clear_franka.robotiq_net_proxy import RobotiqGripperProxy
+
+            gripper = RobotiqGripperProxy(
+                server_host=gc.get("host", cfg.net_franky.ip),
+                server_port=int(gc.get("port", cfg.net_franky.port)),
+                com_port=gc.get("com_port", "auto"),
+                device_id=int(gc.get("device_id", 9)),
+                connection_type=gc.get("connection_type", "RTU"),
+                tcp_host=gc.get("tcp_host", "127.0.0.1"),
+                tcp_port=int(gc.get("tcp_port", 54321)),
+                auto_activate=bool(gc.get("activate_on_start", True)),
+            )
+            if gc.get("activate_on_start", True):
+                print("  Robotiq gripper activated.")
+        except Exception as e:
+            print(f"  [gripper] Failed to initialize: {e}")
+            gripper = None
 
     print(f"  Pre-positioning to start configuration...")
     robot.move(JointMotion(
         JointState(joint_pos[0]),
         relative_dynamics_factor=float(rc.preposition_dynamics_factor),
     ))
+
+    gripper_open_for_record = None
+    if gripper is not None:
+        initial_gripper_open = bool(round(float(gripper_open_data[0])))
+        initial_width = (
+            gc.get("open_width_m", 0.085) if initial_gripper_open else gc.get("close_width_m", 0.0)
+        )
+        gripper.move_width(
+            initial_width,
+            speed=int(gc.get("speed", 255)),
+            force=int(gc.get("force", 255)),
+            wait=True,
+            max_width_m=gc.get("max_width_m", 0.085),
+        )
+        gripper_open_for_record = initial_gripper_open
+
     time.sleep(float(rc.preposition_settle_s))
+
+    recorder = None
+    if rc.get("record", False):
+        from clear_franka.recorder import TrajectoryRecorder
+        recorder = TrajectoryRecorder(
+            save_dir=cfg.data_dir,
+            metadata={
+                "replay_episode": str(episode_path),
+                "replay_speed": float(rc.speed),
+                "gripper_enabled": gripper is not None,
+            },
+        )
+        recorder.start()
 
     try:
         while True:
@@ -93,6 +155,7 @@ def run_replay(cfg: DictConfig):
                 ) as tracker:
                     step = 0
                     replay_start = None
+                    last_gripper_open = None
 
                     while tracker.tick():
                         if replay_start is None:
@@ -115,6 +178,43 @@ def run_replay(cfg: DictConfig):
                         else:
                             tracker.set_target(q)
 
+                        if gripper is not None and np.isfinite(gripper_open_data[step]):
+                            current_gripper_open = bool(round(float(gripper_open_data[step])))
+                            if current_gripper_open != last_gripper_open:
+                                target_width = (
+                                    gc.get("open_width_m", 0.085)
+                                    if current_gripper_open
+                                    else gc.get("close_width_m", 0.0)
+                                )
+                                try:
+                                    gripper.move_width(
+                                        target_width,
+                                        speed=int(gc.get("speed", 255)),
+                                        force=int(gc.get("force", 255)),
+                                        wait=False,
+                                        max_width_m=gc.get("max_width_m", 0.085),
+                                    )
+                                    last_gripper_open = current_gripper_open
+                                    gripper_open_for_record = current_gripper_open
+                                except Exception as e:
+                                    print(f"\n  [gripper] move failed: {e}")
+
+                        if recorder is not None:
+                            teleop_state = robot.get_last_teleop_state()
+                            measured_pose = np.asarray(teleop_state["O_T_EE"], dtype=float).reshape(4, 4)
+                            recorder.step(
+                                ee_pos=measured_pose[:3, 3],
+                                ee_rot=measured_pose[:3, :3],
+                                cmd_linear_vel=np.zeros(3),
+                                cmd_angular_vel=np.zeros(3),
+                                buttons=0,
+                                enabled=True,
+                                joint_pos=np.asarray(teleop_state["q"], dtype=float),
+                                joint_vel=np.asarray(teleop_state["dq"], dtype=float),
+                                gripper_open=gripper_open_for_record,
+                                robot_abs_time=float(teleop_state["abs_time"]),
+                            )
+
                 break
 
             except ControlException as e:
@@ -123,3 +223,8 @@ def run_replay(cfg: DictConfig):
 
     except KeyboardInterrupt:
         print("\n  Replay aborted.")
+    finally:
+        if recorder is not None:
+            recorder.close()
+        if gripper is not None:
+            gripper.disconnect()

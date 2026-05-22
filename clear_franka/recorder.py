@@ -155,39 +155,22 @@ class TrajectoryRecorder:
                                  compression_opts=1)
 
             if isinstance(camera_ts, dict) and camera_ts:
-                if len(camera_ts) == 1:
-                    name, timestamps = next(iter(camera_ts.items()))
+                group = f.create_group("camera_timestamps")
+                for name, timestamps in camera_ts.items():
                     camera = self._cameras[name]
                     safe = _safe_name(name)
-                    f.create_dataset(
-                        "camera_timestamps",
+                    group.create_dataset(
+                        safe,
                         data=timestamps,
                         compression="gzip",
                         compression_opts=1,
                     )
-                    f.attrs["camera_video_file"] = f"episode_{self._start_wall}_{safe}_video.hdf5"
-                    f.attrs["camera_resolution"] = camera.resolution
-                    f.attrs["camera_fps"] = camera.fps
-                    f.attrs["camera_id"] = getattr(camera, "camera_id", name)
+                    f.attrs[f"{safe}_camera_video_file"] = f"episode_{self._start_wall}_{safe}_video.hdf5"
+                    f.attrs[f"{safe}_camera_id"] = getattr(camera, "camera_id", name)
                     serial_number = getattr(camera, "serial_number", None)
-                    f.attrs["camera_serial_number"] = "" if serial_number is None else str(serial_number)
-                else:
-                    group = f.create_group("camera_timestamps")
-                    for name, timestamps in camera_ts.items():
-                        camera = self._cameras[name]
-                        safe = _safe_name(name)
-                        group.create_dataset(
-                            safe,
-                            data=timestamps,
-                            compression="gzip",
-                            compression_opts=1,
-                        )
-                        f.attrs[f"{safe}_camera_video_file"] = f"episode_{self._start_wall}_{safe}_video.hdf5"
-                        f.attrs[f"{safe}_camera_id"] = getattr(camera, "camera_id", name)
-                        serial_number = getattr(camera, "serial_number", None)
-                        f.attrs[f"{safe}_camera_serial_number"] = "" if serial_number is None else str(serial_number)
-                        f.attrs[f"{safe}_camera_resolution"] = camera.resolution
-                        f.attrs[f"{safe}_camera_fps"] = camera.fps
+                    f.attrs[f"{safe}_camera_serial_number"] = "" if serial_number is None else str(serial_number)
+                    f.attrs[f"{safe}_camera_resolution"] = camera.resolution
+                    f.attrs[f"{safe}_camera_fps"] = camera.fps
             for k, v in self._metadata.items():
                 f.attrs[k] = v
             f.attrs["start_time"] = self._start_wall

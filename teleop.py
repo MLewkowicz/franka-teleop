@@ -147,6 +147,16 @@ def run_teleop(cfg: DictConfig):
 
     latest_joint_pos = None
 
+    extrinsics_metadata = {}
+    for cam_name in cameras:
+        cam_pc_cfg = vc.get("pointclouds", {}).get(cam_name, {})
+        ext_path = cam_pc_cfg.get("extrinsics_path", f"./data/extrinsics_{cam_name}.json")
+        try:
+            with open(ext_path) as f:
+                extrinsics_metadata[f"extrinsics_{cam_name}"] = f.read()
+        except OSError:
+            print(f"  [recorder] No extrinsics found for {cam_name} at {ext_path}; not embedded in episode.")
+
     recorder = TrajectoryRecorder(
         save_dir=cfg.data_dir,
         metadata={
@@ -154,6 +164,7 @@ def run_teleop(cfg: DictConfig):
             "angular_scale": tc.angular_scale,
             "period": tc.period,
             "gripper_enabled": bool(gc.get("enabled", False)),
+            **extrinsics_metadata,
         },
         cameras=cameras,
     )
@@ -318,6 +329,7 @@ def run_teleop(cfg: DictConfig):
 
                             if visualizer is not None:
                                 visualizer.update(joint_pos)
+                                visualizer.update_eef_frame(measured_pose)
                                 if pointcloud_enabled and pointcloud_camera is not None:
                                     latest_pointcloud = pointcloud_camera.get_latest_pointcloud()
                                     if latest_pointcloud is not None:
