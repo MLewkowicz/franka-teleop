@@ -24,11 +24,21 @@ teleop:
     translation_deadband: 0.08
     rotation_deadband: 0.08
 
-camera:
-  enabled: false          # Set true when ZED 2i is connected
-  resolution: HD2K      # HD2K, HD1080, HD720, VGA
-  fps: 30                 # HD2K caps at 15fps; HD1080/HD720 up to 30; VGA up to 100
-  depth_mode: NEURAL # NONE, QUALITY, ULTRA, NEURAL
+cameras:
+  third_person:
+    name: third_person
+    enabled: false       # Set true to record/open the fixed external ZED.
+    serial_number: 37820861
+    resolution: HD720
+    fps: 30
+    depth_mode: NEURAL
+  hand:
+    name: hand
+    enabled: false       # Set true to record/open the wrist-mounted ZED.
+    serial_number: 10986074
+    resolution: HD720
+    fps: 30
+    depth_mode: NEURAL
 
 gripper:
   enabled: true
@@ -49,14 +59,25 @@ gripper:
 
 visualization:
   viser:
-    enabled: true
+    enabled: false
     host: "0.0.0.0"
     port: 8080
     update_hz: 30.0
     pointclouds:
       third_person:
-        enabled: true
+        enabled: false
         extrinsics_path: ./data/extrinsics_third_person.json
+        frame_name: /third_person_zed
+        update_hz: 5.0
+        stride: 4
+        max_points: 100000
+        max_distance_m: 3.0
+        point_size: 0.01
+      hand:
+        enabled: false
+        extrinsics_path: ./data/extrinsics_hand.json
+        # Child of the Franka end-effector/flange frame in the viser URDF.
+        frame_name: /cortado/fr3_link8/hand_zed
         update_hz: 5.0
         stride: 4
         max_points: 100000
@@ -75,24 +96,16 @@ replay:
   preposition_settle_s: 0.5         # pause after preposition before streaming
 
 calibration:
-  mode: manual                        # manual | replay | sweep
-  output: ./data/extrinsics_third_person.json
-  waypoints_file: ./data/calibration_waypoints.json  # manual saves here; replay reads here
-  debug_dir: ./data/calibration_debug  # per-waypoint annotated images (null to disable)
-  relative_dynamics_factor: 0.05      # franky velocity/accel/jerk scaling (replay/sweep)
-  settle_seconds: 1                   # pause after motion finishes before grabbing
-  min_charuco_corners: 12             # skip waypoint / require for capture if fewer corners
+  camera_mount: third_person           # third_person | hand
+  min_charuco_corners: 12             # require for capture if fewer corners
   reprojection_error_max_px: 1.5      # mean reprojection error threshold
   board_position_std_max_mm: 5.0      # per-axis std of recovered board origin
 
   kinesthetic:
-    # Low Cartesian impedance so the operator can backdrive the arm by hand.
+    # Low joint impedance so the operator can backdrive the arm by hand.
     # Franka's built-in gravity comp keeps the arm afloat; the tracker just
     # damps oscillation. Bump these up if the arm drifts under load.
-    translational_stiffness: 0.0
-    rotational_stiffness: 0.0
-    nullspace_stiffness: 0.0
-    period: 0.001
+    joint_stiffness: [5.0, 5.0, 5.0, 5.0, 3.0, 3.0, 2.0]
 
   board:
     # Physical printed ChArUco board. Must match what is mounted to the gripper.
@@ -101,36 +114,3 @@ calibration:
     square_length_m: 0.020
     marker_length_m: 0.015
     dictionary: DICT_5X5_100         # cv2.aruco.DICT_*
-
-  # Center pose of the calibration sweep (board in third-person camera FOV).
-  # Position in [m], orientation in xyz Euler [rad].
-  home:
-    position: [0.45, 0.0, 0.40]
-    euler_xyz: [3.14159, 0.0, 0.0]    # gripper pointing down
-
-  # Sweep design — perturbations from the home pose. The script combines these
-  # to build a varied list of waypoints. Override per-physical-setup as needed.
-  sweep:
-    position_offsets_m:
-      - [0.0,  0.0,  0.0]
-      - [0.10, 0.0,  0.0]
-      - [-0.10, 0.0, 0.0]
-      - [0.0,  0.10, 0.0]
-      - [0.0, -0.10, 0.0]
-      - [0.0,  0.0,  0.10]
-      - [0.0,  0.0, -0.10]
-      - [0.10, 0.10, 0.0]
-      - [-0.10, -0.10, 0.0]
-      - [0.05, 0.05, 0.10]
-    # Each entry is an extra Euler-xyz delta [rad] composed onto home orientation.
-    rotation_offsets_rad:
-      - [0.0,   0.0,    0.0]
-      - [0.52,  0.0,    0.0]    #  +30° roll
-      - [-0.52, 0.0,    0.0]    #  -30° roll
-      - [0.0,   0.52,   0.0]    #  +30° pitch
-      - [0.0,  -0.52,   0.0]    #  -30° pitch
-      - [0.0,   0.0,    0.78]   #  +45° yaw
-      - [0.0,   0.0,   -0.78]   #  -45° yaw
-      - [0.35,  0.35,   0.0]    #  combined
-      - [-0.35, 0.35,   0.35]
-      - [0.35, -0.35,  -0.35]

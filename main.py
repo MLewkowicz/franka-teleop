@@ -5,6 +5,7 @@ Usage:
     uv run python main.py mode=replay            # replay latest episode
     uv run python main.py mode=replay replay.episode=data/episode_20260407_150000.h5
     uv run python main.py mode=replay replay.speed=0.5
+    uv run python main.py mode=calibrate calibration.camera_mount=hand
 """
 
 import hydra

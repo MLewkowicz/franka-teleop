@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,10 +9,19 @@ from urllib.parse import unquote, urlparse
 
 import numpy as np
 
+from clear_franka.geometry import load_T_cam2base, load_T_cam2gripper
+
 
 DEFAULT_ARM_JOINT_NAMES = tuple(f"fr3_joint{i}" for i in range(1, 8))
 DEFAULT_GRIPPER_JOINT_NAME = "finger_joint"
 DEFAULT_GRIPPER_JOINT_CLOSED = 0.8
+_GRIPPER_TCP_VISER_PATH = (
+    "/cortado/visual/st_ext_005_0585_1/st_gp_001_0019_2/st_ext_002_0045"
+    "/st_ext_005_0405_1/st_ext_001_0225/st_ext_002_0225/st_rb_013_0001"
+    "/franka_base_mount/fr3_link0/fr3_link1/fr3_link2/fr3_link3/fr3_link4"
+    "/fr3_link5/fr3_link6/fr3_link7/fr3_link8/coupling_link/base_link"
+    "/robotiq_arg2f_base_link/robotiq_arg2f_tcp"
+)
 
 ROBOT_XACRO_ARGS = {
     "robot_name": "cortado",
@@ -153,7 +161,7 @@ class CortadoViserVisualizer:
 
         package_roots = _get_package_roots(self.description_root)
         urdf_path = _bake_cortado_urdf(self.description_root)
-        urdf_model = yourdfpy.URDF.load(
+        self.urdf_model = yourdfpy.URDF.load(
             str(urdf_path),
             filename_handler=lambda fname: _package_filename_handler(fname, package_roots),
             force_mesh=True,
@@ -163,7 +171,7 @@ class CortadoViserVisualizer:
         self.server.scene.add_frame(root_node_name, show_axes=False)
         self.urdf = ViserUrdf(
             self.server,
-            urdf_or_path=urdf_model,
+            urdf_or_path=self.urdf_model,
             root_node_name=root_node_name,
             load_meshes=True,
         )
@@ -174,8 +182,6 @@ class CortadoViserVisualizer:
         self._arm_joint_indices = self._resolve_arm_joint_indices()
         self._gripper_joint_index = self._resolve_optional_joint_index(DEFAULT_GRIPPER_JOINT_NAME)
         self.urdf.update_cfg(self._cfg)
-        # Static transform: fr3_link0 pose in URDF root frame (all fixed joints from cart).
-        self._T_fr3link0_in_root: np.ndarray = urdf_model.get_transform("fr3_link0")
 
         url_host = "localhost" if host in {"0.0.0.0", "::"} else host
         print(f"  [viser] Cortado URDF loaded from {urdf_path}")
@@ -239,7 +245,7 @@ class CortadoViserVisualizer:
         if T_cam2base.shape != (4, 4):
             raise ValueError(f"Expected a 4x4 camera transform, got {T_cam2base.shape}")
 
-        T_cam2root = self._T_fr3link0_in_root @ T_cam2base
+        T_cam2root = urdf_model.get_transform("fr3_link0") @ T_cam2base
 
         frame = self.server.scene.add_frame(
             name,
@@ -252,6 +258,31 @@ class CortadoViserVisualizer:
     def add_camera_frame_from_extrinsics(self, name: str, extrinsics_path: str | Path) -> None:
         T_cam2base = load_T_cam2base(extrinsics_path)
         self.add_camera_frame(name, T_cam2base)
+
+    def add_hand_camera_frame(
+        self,
+        name: str,
+        T_cam2gripper: np.ndarray,
+        axes_length: float = 0.08,
+        axes_radius: float = 0.003,
+    ) -> None:
+        import viser.transforms
+
+        T_cam2gripper = np.asarray(T_cam2gripper, dtype=float)
+        if T_cam2gripper.shape != (4, 4):
+            raise ValueError(f"Expected a 4x4 camera transform, got {T_cam2gripper.shape}")
+
+        frame = self.server.scene.add_frame(
+            f"{_GRIPPER_TCP_VISER_PATH}/{name}",
+            axes_length=axes_length,
+            axes_radius=axes_radius,
+        )
+        frame.wxyz = viser.transforms.SO3.from_matrix(T_cam2gripper[:3, :3]).wxyz
+        frame.position = T_cam2gripper[:3, 3]
+
+    def add_hand_camera_frame_from_extrinsics(self, name: str, extrinsics_path: str | Path) -> None:
+        T_cam2gripper = load_T_cam2gripper(extrinsics_path)
+        self.add_hand_camera_frame(name, T_cam2gripper)
 
     def update_pointcloud(
         self,
@@ -278,11 +309,3 @@ class CortadoViserVisualizer:
         handle.colors = colors
         handle.point_size = point_size
 
-
-def load_T_cam2base(extrinsics_path: str | Path) -> np.ndarray:
-    with Path(extrinsics_path).expanduser().open("r") as f:
-        payload = json.load(f)
-    T_cam2base = np.asarray(payload["T_cam2base"], dtype=float)
-    if T_cam2base.shape != (4, 4):
-        raise ValueError(f"Expected T_cam2base to be 4x4, got {T_cam2base.shape}")
-    return T_cam2base

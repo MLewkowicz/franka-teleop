@@ -3,7 +3,7 @@
 import time
 from pathlib import Path
 
-from camera import ZedCamera
+from clear_franka.camera import ZedCamera
 
 data_dir = Path("./data")
 data_dir.mkdir(exist_ok=True)

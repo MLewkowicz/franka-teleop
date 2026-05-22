@@ -4,6 +4,7 @@ Records timestamped episodes to HDF5 files for future replay.
 Designed for minimal overhead in a 1kHz control loop.
 """
 
+import re
 import time
 from pathlib import Path
 
@@ -11,20 +12,29 @@ import h5py
 import numpy as np
 
 
+def _safe_name(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(name)).strip("_") or "camera"
+
+
 class TrajectoryRecorder:
 
-    def __init__(self, save_dir="./data", capacity=120_000, metadata=None, camera=None):
+    def __init__(self, save_dir="./data", capacity=120_000, metadata=None, cameras=None):
         """
         Args:
             save_dir: Directory to save episode files.
             capacity: Pre-allocated buffer size in timesteps (120k = 2 min at 1kHz).
             metadata: Optional dict of extra metadata stored in HDF5 attrs.
-            camera: Optional ZedCamera instance for synchronized video recording.
+            cameras: Optional dict/list of named ZedCamera instances. If provided,
+                every camera is recorded with the same trajectory clock epoch.
         """
         self._save_dir = Path(save_dir)
         self._capacity = capacity
         self._metadata = metadata or {}
-        self._camera = camera
+        if cameras is None:
+            cameras = {}
+        elif not isinstance(cameras, dict):
+            cameras = {getattr(cam, "camera_id", f"camera_{i}"): cam for i, cam in enumerate(cameras)}
+        self._cameras = dict(cameras)
         self._recording = False
         self._count = 0
         self._start_time = 0.0
@@ -35,6 +45,7 @@ class TrajectoryRecorder:
         n = self._capacity
         self._buffers = {
             "timestamps": np.empty(n, dtype=np.float64),
+            "robot_abs_time": np.empty(n, dtype=np.float64),
             "ee_pos": np.empty((n, 3), dtype=np.float64),
             "ee_rot": np.empty((n, 3, 3), dtype=np.float64),
             "joint_pos": np.empty((n, 7), dtype=np.float64),
@@ -43,6 +54,7 @@ class TrajectoryRecorder:
             "cmd_angular_vel": np.empty((n, 3), dtype=np.float64),
             "buttons": np.empty(n, dtype=np.int32),
             "enabled": np.empty(n, dtype=bool),
+            "gripper_open": np.empty(n, dtype=np.float64),
         }
 
     def _grow_buffers(self):
@@ -73,10 +85,12 @@ class TrajectoryRecorder:
         self._start_wall = time.strftime("%Y%m%d_%H%M%S")
         self._recording = True
 
-        if self._camera is not None:
-            self._save_dir.mkdir(parents=True, exist_ok=True)
-            video_path = str(self._save_dir / f"episode_{self._start_wall}_video.hdf5")
-            self._camera.start_recording(video_path, self._start_time)
+        self._save_dir.mkdir(parents=True, exist_ok=True)
+        for name, camera in self._cameras.items():
+            video_path = str(
+                self._save_dir / f"episode_{self._start_wall}_{_safe_name(name)}_video.hdf5"
+            )
+            camera.start_recording(video_path, self._start_time)
 
         print("  [recorder] RECORDING started")
 
@@ -85,9 +99,11 @@ class TrajectoryRecorder:
             return
         self._recording = False
 
-        camera_ts = None
-        if self._camera is not None:
-            camera_ts, _ = self._camera.stop_recording()
+        camera_ts = {}
+        for name, camera in self._cameras.items():
+            timestamps, _ = camera.stop_recording()
+            if timestamps is not None and len(timestamps) > 0:
+                camera_ts[name] = timestamps
 
         if self._count > 0:
             self._save_episode(camera_ts)
@@ -96,7 +112,8 @@ class TrajectoryRecorder:
             print("  [recorder] No data recorded, skipping save")
 
     def step(self, ee_pos, ee_rot, cmd_linear_vel, cmd_angular_vel,
-             buttons, enabled, joint_pos=None, joint_vel=None):
+             buttons, enabled, joint_pos=None, joint_vel=None, gripper_open=None,
+             robot_abs_time=None):
         """Record one timestep. Fast path: single branch check when not recording."""
         if not self._recording:
             return
@@ -106,12 +123,14 @@ class TrajectoryRecorder:
             self._grow_buffers()
 
         self._buffers["timestamps"][i] = time.monotonic() - self._start_time
-        self._buffers["ee_pos"][i] = ee_pos
-        self._buffers["ee_rot"][i] = ee_rot
+        self._buffers["robot_abs_time"][i] = np.nan if robot_abs_time is None else robot_abs_time
+        self._buffers["ee_pos"][i] = np.nan if ee_pos is None else ee_pos
+        self._buffers["ee_rot"][i] = np.nan if ee_rot is None else ee_rot
         self._buffers["cmd_linear_vel"][i] = cmd_linear_vel
         self._buffers["cmd_angular_vel"][i] = cmd_angular_vel
         self._buffers["buttons"][i] = buttons
         self._buffers["enabled"][i] = enabled
+        self._buffers["gripper_open"][i] = np.nan if gripper_open is None else float(gripper_open)
 
         if joint_pos is not None:
             self._buffers["joint_pos"][i] = joint_pos
@@ -135,13 +154,40 @@ class TrajectoryRecorder:
                 f.create_dataset(key, data=buf[:n], compression="gzip",
                                  compression_opts=1)
 
-            if camera_ts is not None and len(camera_ts) > 0:
-                f.create_dataset("camera_timestamps", data=camera_ts,
-                                 compression="gzip", compression_opts=1)
-                f.attrs["camera_video_file"] = f"episode_{self._start_wall}_video.hdf5"
-                f.attrs["camera_resolution"] = self._camera.resolution
-                f.attrs["camera_fps"] = self._camera.fps
-
+            if isinstance(camera_ts, dict) and camera_ts:
+                if len(camera_ts) == 1:
+                    name, timestamps = next(iter(camera_ts.items()))
+                    camera = self._cameras[name]
+                    safe = _safe_name(name)
+                    f.create_dataset(
+                        "camera_timestamps",
+                        data=timestamps,
+                        compression="gzip",
+                        compression_opts=1,
+                    )
+                    f.attrs["camera_video_file"] = f"episode_{self._start_wall}_{safe}_video.hdf5"
+                    f.attrs["camera_resolution"] = camera.resolution
+                    f.attrs["camera_fps"] = camera.fps
+                    f.attrs["camera_id"] = getattr(camera, "camera_id", name)
+                    serial_number = getattr(camera, "serial_number", None)
+                    f.attrs["camera_serial_number"] = "" if serial_number is None else str(serial_number)
+                else:
+                    group = f.create_group("camera_timestamps")
+                    for name, timestamps in camera_ts.items():
+                        camera = self._cameras[name]
+                        safe = _safe_name(name)
+                        group.create_dataset(
+                            safe,
+                            data=timestamps,
+                            compression="gzip",
+                            compression_opts=1,
+                        )
+                        f.attrs[f"{safe}_camera_video_file"] = f"episode_{self._start_wall}_{safe}_video.hdf5"
+                        f.attrs[f"{safe}_camera_id"] = getattr(camera, "camera_id", name)
+                        serial_number = getattr(camera, "serial_number", None)
+                        f.attrs[f"{safe}_camera_serial_number"] = "" if serial_number is None else str(serial_number)
+                        f.attrs[f"{safe}_camera_resolution"] = camera.resolution
+                        f.attrs[f"{safe}_camera_fps"] = camera.fps
             for k, v in self._metadata.items():
                 f.attrs[k] = v
             f.attrs["start_time"] = self._start_wall

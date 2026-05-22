@@ -17,15 +17,53 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-class ZedCamera:
-    """Threaded ZED 2i camera capture with HDF5 video recording."""
+def get_camera_config(cfg, name: str = "third_person") -> dict:
+    named = cfg.get("cameras", {}).get(name, {})
+    return {
+        "name": named.get("name", name),
+        "enabled": bool(named.get("enabled", False)),
+        "resolution": named.get("resolution", "HD720"),
+        "fps": int(named.get("fps", 30)),
+        "depth_mode": named.get("depth_mode", "PERFORMANCE"),
+        "serial_number": named.get("serial_number"),
+    }
 
-    def __init__(self, resolution="HD720", fps=30, depth_mode="PERFORMANCE"):
+
+def make_zed_camera(cfg, name: str = "third_person"):
+    camera_cfg = get_camera_config(cfg, name)
+    return ZedCamera(
+        resolution=camera_cfg["resolution"],
+        fps=camera_cfg["fps"],
+        depth_mode=camera_cfg["depth_mode"],
+        serial_number=camera_cfg["serial_number"],
+        camera_id=camera_cfg["name"],
+    )
+
+
+def enabled_camera_names(cfg, include: tuple[str, ...] = ()) -> list[str]:
+    names = set(include) | set(cfg.get("cameras", {}).keys())
+    return [
+        name for name in ("third_person", "hand")
+        if name in names and (name in include or get_camera_config(cfg, name)["enabled"])
+    ] + [
+        name for name in sorted(names)
+        if name not in {"third_person", "hand"}
+        and (name in include or get_camera_config(cfg, name)["enabled"])
+    ]
+
+
+class ZedCamera:
+    """Threaded ZED camera capture with HDF5 video recording."""
+
+    def __init__(self, resolution="HD720", fps=30, depth_mode="PERFORMANCE",
+                 serial_number=None, camera_id=None):
         """
         Args:
             resolution: ZED resolution string (HD2K, HD1080, HD720, VGA).
             fps: Target framerate.
             depth_mode: NONE, PERFORMANCE, QUALITY, ULTRA, or NEURAL.
+            serial_number: Optional ZED serial number for multi-camera rigs.
+            camera_id: Logical name stored in metadata/logs.
         """
         import pyzed.sl as sl
 
@@ -37,11 +75,18 @@ class ZedCamera:
         init_params.camera_fps = fps
         init_params.depth_mode = getattr(sl.DEPTH_MODE, depth_mode)
         init_params.coordinate_units = sl.UNIT.METER
+        if serial_number is not None:
+            init_params.set_from_serial_number(int(serial_number))
 
         status = self._zed.open(init_params)
         if status != sl.ERROR_CODE.SUCCESS:
-            raise RuntimeError(f"Failed to open ZED camera: {status}")
+            suffix = f" serial={serial_number}" if serial_number is not None else ""
+            raise RuntimeError(f"Failed to open ZED camera{suffix}: {status}")
 
+        self._camera_id = camera_id or (
+            f"zed_{serial_number}" if serial_number is not None else "zed"
+        )
+        self._serial_number = serial_number
         self._resolution_str = resolution
         self._fps = fps
         self._running = False
@@ -58,6 +103,17 @@ class ZedCamera:
         # Pre-allocate retrieval buffers
         self._rgb_mat = sl.Mat()
         self._depth_mat = sl.Mat()
+        self._pointcloud_mat = sl.Mat()
+
+        # Latest point cloud state (protected by _pc_lock)
+        self._pc_lock = threading.Lock()
+        self._pointcloud_enabled = False
+        self._pointcloud_period = 0.2
+        self._pointcloud_stride = 4
+        self._pointcloud_max_points = 100_000
+        self._pointcloud_max_distance_m = 3.0
+        self._last_pointcloud_time = 0.0
+        self._latest_pointcloud = None
 
         # Resolve image dimensions from camera config
         cam_info = self._zed.get_camera_information()
@@ -65,8 +121,8 @@ class ZedCamera:
         self._img_w = cam_info.camera_configuration.resolution.width
 
         logger.info(
-            "ZED 2i opened: %s %dx%d @ %dfps, depth=%s",
-            resolution, self._img_w, self._img_h, fps, depth_mode,
+            "ZED 2i opened: id=%s serial=%s %s %dx%d @ %dfps, depth=%s",
+            self._camera_id, serial_number, resolution, self._img_w, self._img_h, fps, depth_mode,
         )
 
     # ------------------------------------------------------------------
@@ -167,6 +223,34 @@ class ZedCamera:
         depth = self._depth_mat.get_data().copy()
         return rgb, depth
 
+    def start_pointcloud_stream(
+        self,
+        update_hz: float = 5.0,
+        stride: int = 4,
+        max_points: int = 100_000,
+        max_distance_m: float = 3.0,
+    ) -> None:
+        """Enable background capture of decimated colored point clouds."""
+        with self._pc_lock:
+            self._pointcloud_enabled = True
+            self._pointcloud_period = 0.0 if update_hz <= 0 else 1.0 / update_hz
+            self._pointcloud_stride = max(1, int(stride))
+            self._pointcloud_max_points = max(1, int(max_points))
+            self._pointcloud_max_distance_m = float(max_distance_m)
+
+    def stop_pointcloud_stream(self) -> None:
+        with self._pc_lock:
+            self._pointcloud_enabled = False
+            self._latest_pointcloud = None
+
+    def get_latest_pointcloud(self):
+        """Return the latest (points, colors, timestamp) tuple, or None."""
+        with self._pc_lock:
+            if self._latest_pointcloud is None:
+                return None
+            points, colors, timestamp = self._latest_pointcloud
+            return points.copy(), colors.copy(), timestamp
+
     # ------------------------------------------------------------------
     # Thread lifecycle
     # ------------------------------------------------------------------
@@ -189,34 +273,85 @@ class ZedCamera:
             if err != sl.ERROR_CODE.SUCCESS:
                 continue
 
+            now = time.monotonic()
+            should_capture_pointcloud = self._should_capture_pointcloud(now)
+
             with self._rec_lock:
-                if not self._recording:
+                recording = self._recording
+                if not recording and not should_capture_pointcloud:
                     continue
 
-                ts = time.monotonic() - self._start_time
+                if recording:
+                    ts = now - self._start_time
 
-                # Retrieve left RGB (BGRA) and depth
-                self._zed.retrieve_image(self._rgb_mat, sl.VIEW.LEFT)
-                self._zed.retrieve_measure(self._depth_mat, sl.MEASURE.DEPTH)
+                    # Retrieve left RGB (BGRA) and depth
+                    self._zed.retrieve_image(self._rgb_mat, sl.VIEW.LEFT)
+                    self._zed.retrieve_measure(self._depth_mat, sl.MEASURE.DEPTH)
 
-                rgb = self._rgb_mat.get_data()[:, :, :3]    # BGRA → BGR
-                rgb = rgb[:, :, ::-1].copy()                 # BGR → RGB
-                depth = self._depth_mat.get_data().copy()
+                    rgb = self._rgb_mat.get_data()[:, :, :3]    # BGRA → BGR
+                    rgb = rgb[:, :, ::-1].copy()                 # BGR → RGB
+                    depth = self._depth_mat.get_data().copy()
 
-                # Append to HDF5 datasets
-                i = self._frame_count
-                f = self._video_file
+                    # Append to HDF5 datasets
+                    i = self._frame_count
+                    f = self._video_file
 
-                f["rgb"].resize(i + 1, axis=0)
-                f["rgb"][i] = rgb
+                    f["rgb"].resize(i + 1, axis=0)
+                    f["rgb"][i] = rgb
 
-                f["depth"].resize(i + 1, axis=0)
-                f["depth"][i] = depth
+                    f["depth"].resize(i + 1, axis=0)
+                    f["depth"][i] = depth
 
-                f["timestamps"].resize(i + 1, axis=0)
-                f["timestamps"][i] = ts
+                    f["timestamps"].resize(i + 1, axis=0)
+                    f["timestamps"][i] = ts
 
-                self._frame_count = i + 1
+                    self._frame_count = i + 1
+
+                if should_capture_pointcloud:
+                    self._retrieve_pointcloud(now)
+
+    def _should_capture_pointcloud(self, now: float) -> bool:
+        with self._pc_lock:
+            if not self._pointcloud_enabled:
+                return False
+            if now - self._last_pointcloud_time < self._pointcloud_period:
+                return False
+            self._last_pointcloud_time = now
+            return True
+
+    def _retrieve_pointcloud(self, timestamp: float) -> None:
+        sl = self._sl
+        self._zed.retrieve_measure(self._pointcloud_mat, sl.MEASURE.XYZRGBA)
+        xyzrgba = self._pointcloud_mat.get_data()
+
+        with self._pc_lock:
+            stride = self._pointcloud_stride
+            max_points = self._pointcloud_max_points
+            max_distance_m = self._pointcloud_max_distance_m
+
+        if stride > 1:
+            xyzrgba = xyzrgba[::stride, ::stride]
+
+        flat = xyzrgba.reshape(-1, 4)
+        points = flat[:, :3]
+        colors_packed = flat[:, 3]
+
+        finite = np.isfinite(points).all(axis=1)
+        if max_distance_m > 0.0:
+            finite &= np.linalg.norm(points, axis=1) <= max_distance_m
+        points = points[finite].astype(np.float32, copy=False)
+        colors_packed = colors_packed[finite].astype(np.float32, copy=False)
+
+        if points.shape[0] > max_points:
+            step = int(np.ceil(points.shape[0] / max_points))
+            points = points[::step]
+            colors_packed = colors_packed[::step]
+
+        colors = np.ascontiguousarray(colors_packed).view(np.uint8).reshape(-1, 4)[:, :3].copy()
+        points = points.copy()
+
+        with self._pc_lock:
+            self._latest_pointcloud = (points, colors, timestamp)
 
     def close(self):
         """Stop capture thread and release camera."""
@@ -239,3 +374,11 @@ class ZedCamera:
     @property
     def fps(self) -> int:
         return self._fps
+
+    @property
+    def camera_id(self) -> str:
+        return self._camera_id
+
+    @property
+    def serial_number(self):
+        return self._serial_number
