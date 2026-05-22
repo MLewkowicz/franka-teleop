@@ -128,15 +128,35 @@ def run_replay(cfg: DictConfig):
 
     time.sleep(float(rc.preposition_settle_s))
 
+    cameras = {}
     recorder = None
     if rc.get("record", False):
+        from clear_franka.camera import enabled_camera_names, make_zed_camera
+        for name in enabled_camera_names(cfg):
+            cameras[name] = make_zed_camera(cfg, name)
+            cameras[name].run()
+
+        vc = cfg.get("visualization", {}).get("viser", {})
+        extrinsics_metadata = {}
+        for cam_name in cameras:
+            ext_path = vc.get("pointclouds", {}).get(cam_name, {}).get(
+                "extrinsics_path", f"./data/extrinsics_{cam_name}.json"
+            )
+            try:
+                with open(ext_path) as f:
+                    extrinsics_metadata[f"extrinsics_{cam_name}"] = f.read()
+            except OSError:
+                pass
+
         from clear_franka.recorder import TrajectoryRecorder
         recorder = TrajectoryRecorder(
             save_dir=cfg.data_dir,
+            cameras=cameras,
             metadata={
                 "replay_episode": str(episode_path),
                 "replay_speed": float(rc.speed),
                 "gripper_enabled": gripper is not None,
+                **extrinsics_metadata,
             },
         )
         recorder.start()
@@ -228,3 +248,5 @@ def run_replay(cfg: DictConfig):
             recorder.close()
         if gripper is not None:
             gripper.disconnect()
+        for cam in cameras.values():
+            cam.close()

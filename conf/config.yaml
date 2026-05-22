@@ -17,6 +17,7 @@ teleop:
   translational_stiffness: 100.0
   rotational_stiffness: 5.0
   nullspace_stiffness: 2.0
+  reset_joint_config: [-0.06217873,  0.11705305, -0.5995304 , -2.72505689,  1.98229098, 1.78315043,  0.44959301]
   spacemouse:
     control_rate: 120
     smoothing_factor: 0.3

@@ -2,12 +2,14 @@
 
 Push/twist the SpaceMouse knob to stream velocity commands to the end-effector.
 Tap the left button to toggle motion on/off.
+Hold the left button to reset to the configured start joint config.
 Tap the right button to toggle the gripper open/closed.
 Tap both buttons together to start/stop recording.
 Press Ctrl-C to stop.
 """
 
 import threading
+import time
 
 import numpy as np
 from omegaconf import DictConfig
@@ -22,6 +24,8 @@ from clear_franka.utils import LoopRatePrinter
 
 DEFAULT_LOWER_JOINT_LIMITS = [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973]
 DEFAULT_UPPER_JOINT_LIMITS = [2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973]
+
+RESET_LONG_PRESS_S = 0.8
 
 
 class AsyncTargetSender:
@@ -70,10 +74,11 @@ class AsyncTargetSender:
 
 
 def run_teleop(cfg: DictConfig):
-    from net_franky.franky import Affine, CartesianImpedanceTracker, ControlException, Robot, Twist
+    from net_franky.franky import Affine, CartesianImpedanceTracker, ControlException, JointMotion, JointState, JointStopMotion, Robot, Twist
 
     tc = cfg.teleop
     sc = tc.spacemouse
+    reset_joint_config = np.asarray(tc.reset_joint_config, dtype=float)
     gc = cfg.get("gripper", {})
     vc = cfg.get("visualization", {}).get("viser", {})
     pointcloud_cfg = vc.get("pointclouds", {})
@@ -233,23 +238,56 @@ def run_teleop(cfg: DictConfig):
             pointcloud_enabled = False
 
     print("SpaceMouse teleop ready.")
-    print("  Tap LEFT button to toggle motion on/off.")
+    print("  Tap LEFT to toggle motion on/off.")
+    print(f"  Hold LEFT ({RESET_LONG_PRESS_S}s) to reset to start joint config.")
     if gripper is not None:
-        print("  Tap RIGHT button to toggle gripper open/closed.")
+        print("  Tap RIGHT to toggle gripper open/closed.")
     else:
         print("  RIGHT button gripper control disabled.")
     print("  Tap LEFT+RIGHT together to start/stop recording.")
     print("  Press Ctrl-C to stop.")
 
     loop_rate = LoopRatePrinter()
+    reset_pending = False
     try:
         while True:
             robot.recover_from_errors()
+
+            if reset_pending:
+                reset_pending = False
+                print("  Resetting to start config (release LEFT to stop)...")
+                robot.move(JointMotion(
+                    JointState(reset_joint_config),
+                    relative_dynamics_factor=float(tc.get("reset_dynamics_factor", 0.1)),
+                ), asynchronous=True)
+                motion_done = threading.Event()
+                threading.Thread(
+                    target=lambda: (robot.join_motion(), motion_done.set()),
+                    daemon=True,
+                ).start()
+                stopped_early = False
+                while not motion_done.is_set():
+                    sample = mouse.get_controller_state()
+                    if sample is not None:
+                        buttons = np.asarray(sample.buttons, dtype=int)
+                        cur_button = int(buttons[0]) if len(buttons) > 0 else 1
+                    else:
+                        cur_button = 1
+                    if not cur_button:
+                        robot.move(JointStopMotion())
+                        stopped_early = True
+                        break
+                    time.sleep(0.01)
+                motion_done.wait()
+                print("  Reset stopped." if stopped_early else "  Reset complete.")
+
             enabled = False
             prev_button = 0
             prev_right_button = 0
             prev_record_button = 0
             last_pointcloud_timestamp = None
+            left_press_time = None
+            left_used_in_record = False
 
             try:
                 with CartesianImpedanceTracker(
@@ -280,13 +318,33 @@ def run_teleop(cfg: DictConfig):
                             right_button = int(buttons[1]) if len(buttons) > 1 else 0
                             record_button = button and right_button
 
+                            # Track left-alone press start for long-press detection
+                            if button and not prev_button and not right_button:
+                                left_press_time = time.monotonic()
+                                left_used_in_record = False
+                            # Cancel long-press if right pressed while left held
+                            if right_button and not prev_right_button and button:
+                                left_used_in_record = True
+                            # Long-press threshold crossed → trigger reset immediately
+                            if button and left_press_time is not None and not left_used_in_record:
+                                if time.monotonic() - left_press_time >= RESET_LONG_PRESS_S:
+                                    enabled = False
+                                    reset_pending = True
+
                             if record_button and not prev_record_button:
+                                left_used_in_record = True
                                 loop_rate.newline()
                                 recorder.toggle()
-                            elif button and not prev_button:
-                                enabled = not enabled
-                                loop_rate.newline()
-                                print("  ENABLED" if enabled else "  DISABLED")
+                            elif not button and prev_button:
+                                # Left released — always a short tap if we get here
+                                if not left_used_in_record and left_press_time is not None:
+                                    enabled = not enabled
+                                    if enabled:
+                                        robot.recover_from_errors()
+                                    loop_rate.newline()
+                                    print("  ENABLED" if enabled else "  DISABLED")
+                                left_press_time = None
+                                left_used_in_record = False
                             elif right_button and not prev_right_button:
                                 if gripper is not None:
                                     target_width = (
@@ -386,6 +444,8 @@ def run_teleop(cfg: DictConfig):
                                 robot_abs_time=robot_abs_time,
                             )
                             loop_rate.finish_tick()
+                            if reset_pending:
+                                break
                     finally:
                         target_sender.close()
             except ControlException as e:
