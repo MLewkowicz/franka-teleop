@@ -101,6 +101,20 @@ replay:
   preposition_settle_s: 0.5         # pause after preposition before streaming
   record: false                     # save measured robot state as a new episode
 
+deploy:
+  # 3D Diffuser Actor MPC deployment (deploy_diffuser_actor.py).
+  # Resolve these paths to the actual files on the robot machine before launching.
+  checkpoint: ???                                 # path to last.pth / best.pth from train_diffuser_actor.py
+  policy_config: ./conf/deploy_policy.yaml        # mirrors LangSteer/conf/policy/diffuser_actor_primitive_object.yaml
+  langsteer_path: ${oc.env:LANGSTEER_PATH,~/Documents/michal/LangSteer}
+  extrinsics_hand: ./data/extrinsics_hand.json
+  extrinsics_third_person: ./data/extrinsics_third_person.json
+  control_hz: 10                                  # MPC tick rate — DiffuserActor forward is ~50-100ms on a 5090
+  # Workspace safety box (base frame, metres). Cartesian targets are clipped here.
+  # Sized from the recorded teleop's ee_pos range with a small buffer; tighten before serious runs.
+  workspace_lo: [0.30, -0.35, 0.02]
+  workspace_hi: [0.85,  0.20, 0.85]
+
 calibration:
   camera_mount: third_person           # third_person | hand
   min_charuco_corners: 12             # require for capture if fewer corners
