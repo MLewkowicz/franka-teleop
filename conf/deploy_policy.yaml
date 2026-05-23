@@ -1,0 +1,42 @@
+# Policy yaml consumed by deploy_diffuser_actor.py — must match what was
+# in scope during training (LangSteer/conf/training/diffuser_actor_realworld_primitive_object.yaml).
+# Any drift here vs the trainer config will cause silent shape/index errors.
+
+name: diffuser_actor
+ckpt_path: null   # populated via deploy.checkpoint on the CLI
+device: "cuda"
+
+# Architecture — identical to the trained checkpoint.
+backbone: clip
+image_size: [256, 256]
+embedding_dim: 192
+num_vis_ins_attn_layers: 2
+use_instruction: true
+use_primitive_id: true
+num_primitives: 2          # grasp=0, place=1
+use_object_id: true
+num_objects: 1             # glass=0
+primitive_vocab:
+  grasp: 0
+  place: 1
+object_vocab:
+  glass: 0
+fps_subsampling_factor: 3
+gripper_loc_bounds: [[-0.3021, -0.2569, -0.2156], [0.3613, 0.3377, 0.1837]]
+rotation_parametrization: "6D"
+quaternion_format: "wxyz"
+diffusion_timesteps: 25
+nhist: 3
+relative: true
+lang_enhanced: true
+
+# Inference
+pred_horizon: 20
+
+# Camera setup — same key order the dataset stored.
+cameras: ["front", "wrist"]
+crop_images: true
+
+mask_language: false
+corrector_steps: 0
+corrector_step_size: 0.001
