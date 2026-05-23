@@ -153,7 +153,6 @@ def main(cfg: DictConfig) -> int:
 
     # Late imports — zero_franky and the policy depend on host-side venvs.
     from zero_franky import Robot, setup_zero_franky
-    from zero_franky.tracker_policies import passthrough_cartesian
     from franky import Affine, JointMotion, JointState
     from clear_franka.utils import LoopRatePrinter
     from clear_franka.diffuser_actor_io import euler_xyz_to_matrix
@@ -221,44 +220,50 @@ def main(cfg: DictConfig) -> int:
     enabled = False
     rate = LoopRatePrinter()
 
-    tracker = robot.start_cartesian_impedance_session(
-        passthrough_cartesian,
-        period=cfg.teleop.period,
-        translational_stiffness=cfg.teleop.translational_stiffness,
-        rotational_stiffness=cfg.teleop.rotational_stiffness,
-        nullspace_stiffness=cfg.teleop.nullspace_stiffness,
-        lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
-        upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
-    )
-    try:
-        prev_left = 0
-        prev_right = 0
-        forward_count = 0
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(cam_hand)
+        stack.enter_context(cam_tp)
+        if gripper is not None:
+            stack.enter_context(gripper)
+        if mouse is not None:
+            stack.callback(mouse.close)
+        with robot.start_cartesian_impedance_session(
+            period=0.001,
+            translational_stiffness=cfg.teleop.translational_stiffness,
+            rotational_stiffness=cfg.teleop.rotational_stiffness,
+            nullspace_stiffness=cfg.teleop.nullspace_stiffness,
+            lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
+            upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
+        ) as tracker:
+            try:
+                prev_left = 0
+                prev_right = 0
+                forward_count = 0
 
         while True:
             rate.start_tick()
 
-            # ---------- button polling ----------
-            if mouse is not None:
-                sample = mouse.get_controller_state()
-                if sample is not None:
-                    buttons = np.asarray(sample.buttons, dtype=int)
-                    left = int(buttons[0]) if len(buttons) > 0 else 0
-                    right = int(buttons[1]) if len(buttons) > 1 else 0
-                    if left and not prev_left:
-                        enabled = not enabled
-                        logger.info(f"  {'ENABLED' if enabled else 'DISABLED'}")
-                    if right and not prev_right:
-                        stage_idx += 1
-                        if stage_idx >= len(stages):
-                            logger.info("  All stages done — exiting.")
-                            break
-                        policy.set_primitive(stages[stage_idx]["primitive"])
-                        policy.set_object(stages[stage_idx]["object"])
-                        policy.reset()  # clear gripper history at the boundary
-                        logger.info(f"[stage {stage_idx}] {stages[stage_idx]['label']}")
-                    prev_left = left
-                    prev_right = right
+                # ---------- button polling ----------
+                if mouse is not None:
+                    sample = mouse.get_controller_state()
+                    if sample is not None:
+                        buttons = np.asarray(sample.buttons, dtype=int)
+                        left = int(buttons[0]) if len(buttons) > 0 else 0
+                        right = int(buttons[1]) if len(buttons) > 1 else 0
+                        if left and not prev_left:
+                            enabled = not enabled
+                            logger.info(f"  {'ENABLED' if enabled else 'DISABLED'}")
+                        if right and not prev_right:
+                            stage_idx += 1
+                            if stage_idx >= len(stages):
+                                logger.info("  All stages done — exiting.")
+                                break
+                            policy.set_primitive(stages[stage_idx]["primitive"])
+                            policy.set_object(stages[stage_idx]["object"])
+                            policy.reset()
+                            logger.info(f"[stage {stage_idx}] {stages[stage_idx]['label']}")
+                        prev_left = left
+                        prev_right = right
 
             if not enabled:
                 rate.finish_tick()
@@ -333,23 +338,22 @@ def main(cfg: DictConfig) -> int:
 
             rate.finish_tick()
 
-    except KeyboardInterrupt:
-        logger.info("Interrupted — stopping.")
-    finally:
-        tracker.stop()
-        try:
-            cam_hand.close()
-        except Exception:
-            pass
-        try:
-            cam_tp.close()
-        except Exception:
-            pass
-        if gripper is not None:
+        except KeyboardInterrupt:
+            logger.info("Interrupted — stopping.")
+        finally:
             try:
-                gripper.disconnect()
+                cam_hand.close()
             except Exception:
                 pass
+            try:
+                cam_tp.close()
+            except Exception:
+                pass
+            if gripper is not None:
+                try:
+                    gripper.disconnect()
+                except Exception:
+                    pass
 
     return 0
 

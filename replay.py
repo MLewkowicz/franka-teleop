@@ -8,7 +8,6 @@ import numpy as np
 from omegaconf import DictConfig
 
 from zero_franky import Robot
-from zero_franky.tracker_policies import hold_current_joint
 from franky import JointMotion, JointState
 
 from clear_franka.franka import DEFAULT_LOWER_JOINT_LIMITS, DEFAULT_UPPER_JOINT_LIMITS
@@ -103,7 +102,6 @@ def run_replay(cfg: DictConfig):
     print(f"  Pre-positioning to start configuration...")
     robot.move(JointMotion(
         JointState(joint_pos[0]),
-        relative_dynamics_factor=float(rc.preposition_dynamics_factor),
     ))
 
     gripper_open_for_record = None
@@ -121,7 +119,7 @@ def run_replay(cfg: DictConfig):
         )
         gripper_open_for_record = initial_gripper_open
 
-    time.sleep(float(rc.preposition_settle_s))
+    time.sleep(0.5)
 
     cameras = {}
     recorder = None
@@ -161,14 +159,12 @@ def run_replay(cfg: DictConfig):
             robot.recover_from_errors()
 
             try:
-                session = robot.start_joint_impedance_session(
-                    hold_current_joint,
+                with robot.start_joint_impedance_session(
                     period=rc.period,
                     stiffness=stiffness.tolist(),
                     lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
                     upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
-                )
-                try:
+                ) as session:
                     step = 0
                     replay_start = None
                     last_gripper_open = None
@@ -232,9 +228,6 @@ def run_replay(cfg: DictConfig):
                             )
 
                         time.sleep(rc.period)
-
-                finally:
-                    session.stop()
 
                 break
 

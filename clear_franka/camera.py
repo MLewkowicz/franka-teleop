@@ -385,6 +385,13 @@ class ZedCamera:
         with self._pc_lock:
             self._latest_pointcloud = (points, colors, timestamp)
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
     def close(self):
         """Stop capture thread and release camera."""
         if self._recording:

@@ -201,6 +201,13 @@ class TrajectoryRecorder:
             f.attrs["num_steps"] = n
             f.attrs["duration_s"] = float(self._buffers["timestamps"][n - 1])
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
     def close(self):
         if self._recording:
             self.stop()

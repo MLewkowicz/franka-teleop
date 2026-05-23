@@ -320,8 +320,7 @@ def _run_calibration_pointcloud_viewer(
         print(f"  [viser] No visualization.viser.pointclouds.{camera_mount} config found.")
         return
 
-    camera = make_zed_camera(cfg, camera_mount)
-    try:
+    with make_zed_camera(cfg, camera_mount) as camera:
         camera.run()
 
         from clear_franka.visualization import CortadoViserVisualizer
@@ -368,9 +367,7 @@ def _run_calibration_pointcloud_viewer(
             if wait_for_enter(0.05):
                 break
             time.sleep(0.02)
-    finally:
         camera.stop_pointcloud_stream()
-        camera.close()
 
 
 def _capture_kinesthetic(robot, camera, cal, detector, board, K, dist, debug_dir):
@@ -387,82 +384,80 @@ def _capture_kinesthetic(robot, camera, cal, detector, board, K, dist, debug_dir
     """
     kin = cal.kinesthetic
 
-    session = robot.start_joint_impedance_session(
+    with robot.start_joint_impedance_session(
         hold_current_joint,
         period=0.001,
         stiffness=[float(v) for v in kin.joint_stiffness],
         lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
         upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
-    )
+    ) as session:
+        print()
+        print("=" * 70)
+        print("KINESTHETIC CAPTURE — the arm is now compliant.")
+        if cal.get("camera_mount", "third_person") == "hand":
+            print("Fix the ChArUco board RIGIDLY in the robot base/world.")
+            print("Keep the hand camera pointed at the board while varying wrist pose.")
+        else:
+            print("Mount the ChArUco board RIGIDLY to the gripper.")
+        print("Physically guide the arm to each calibration pose, then press:")
+        print("  SPACE  → capture current frame + EE pose")
+        print("  ENTER  → finish (need >= 4 captures to solve)")
+        print("  Q      → abort without solving")
+        print("=" * 70)
+        print()
 
-    print()
-    print("=" * 70)
-    print("KINESTHETIC CAPTURE — the arm is now compliant.")
-    if cal.get("camera_mount", "third_person") == "hand":
-        print("Fix the ChArUco board RIGIDLY in the robot base/world.")
-        print("Keep the hand camera pointed at the board while varying wrist pose.")
-    else:
-        print("Mount the ChArUco board RIGIDLY to the gripper.")
-    print("Physically guide the arm to each calibration pose, then press:")
-    print("  SPACE  → capture current frame + EE pose")
-    print("  ENTER  → finish (need >= 4 captures to solve)")
-    print("  Q      → abort without solving")
-    print("=" * 70)
-    print()
+        samples = []
+        frame_count = 0
+        try:
+            while True:
+                frame_count += 1
+                if frame_count % 30 == 0:
+                    status = session.status()
+                    if not status.get("running", True):
+                        raise RuntimeError(f"Impedance tracker faulted: {status.get('error')}")
 
-    samples = []
-    frame_count = 0
-    try:
-        while True:
-            frame_count += 1
-            if frame_count % 30 == 0:
-                status = session.status()
-                if not status.get("running", True):
-                    raise RuntimeError(f"Impedance tracker faulted: {status.get('error')}")
-
-            frame = camera.grab_frame()
-            if frame is None:
-                # tiny yield to keep the GUI responsive
-                cv2.waitKey(1)
-                continue
-            rgb, _ = frame
-
-            detection = _detect_board_pose(detector, board, rgb, K, dist, cal.min_charuco_corners)
-            preview = _annotate_preview(
-                rgb, detection, K, dist,
-                axis_length_m=cal.board.square_length_m * 2.0,
-                num_captured=len(samples),
-            )
-            cv2.imshow("Calibration preview", preview)
-            key = cv2.waitKey(1) & 0xFF
-
-            if key == ord(' '):
-                if detection is None:
-                    logger.warning("Capture rejected: board not detected.")
+                frame = camera.grab_frame()
+                if frame is None:
+                    # tiny yield to keep the GUI responsive
+                    cv2.waitKey(1)
                     continue
-                state = robot.get_last_teleop_state()
-                O_T_EE = np.asarray(state["O_T_EE"], dtype=float)
-                R_gripper2base = O_T_EE[:3, :3].copy()
-                t_gripper2base = O_T_EE[:3, 3].copy()
-                samples.append({
-                    "R_gripper2base": R_gripper2base,
-                    "t_gripper2base": t_gripper2base,
-                    **detection,
-                })
-                logger.info("  captured sample %d (%d corners)", len(samples), detection["n_corners"])
-                if debug_dir is not None:
-                    _save_debug_image(
-                        debug_dir / f"manual_{len(samples):02d}_ok.png",
-                        rgb, detection, K, dist, board, cal.board.square_length_m,
-                    )
-            elif key in (13, 10):  # Enter
-                break
-            elif key == ord('q'):
-                samples = []
-                break
-    finally:
-        cv2.destroyAllWindows()
-        session.stop()
+                rgb, _ = frame
+
+                detection = _detect_board_pose(detector, board, rgb, K, dist, cal.min_charuco_corners)
+                preview = _annotate_preview(
+                    rgb, detection, K, dist,
+                    axis_length_m=cal.board.square_length_m * 2.0,
+                    num_captured=len(samples),
+                )
+                cv2.imshow("Calibration preview", preview)
+                key = cv2.waitKey(1) & 0xFF
+
+                if key == ord(' '):
+                    if detection is None:
+                        logger.warning("Capture rejected: board not detected.")
+                        continue
+                    state = robot.get_last_teleop_state()
+                    O_T_EE = np.asarray(state["O_T_EE"], dtype=float)
+                    R_gripper2base = O_T_EE[:3, :3].copy()
+                    t_gripper2base = O_T_EE[:3, 3].copy()
+                    samples.append({
+                        "R_gripper2base": R_gripper2base,
+                        "t_gripper2base": t_gripper2base,
+                        **detection,
+                    })
+                    logger.info("  captured sample %d (%d corners)", len(samples), detection["n_corners"])
+                    if debug_dir is not None:
+                        _save_debug_image(
+                            debug_dir / f"manual_{len(samples):02d}_ok.png",
+                            rgb, detection, K, dist, board, cal.board.square_length_m,
+                        )
+                elif key in (13, 10):  # Enter
+                    break
+                elif key == ord('q'):
+                    samples = []
+                    break
+        finally:
+            cv2.destroyAllWindows()
 
     return samples
 
@@ -488,36 +483,33 @@ def run_calibration(cfg: DictConfig):
 
     # ------------------------------------------------------------------ camera
     camera_cfg = get_camera_config(cfg, camera_mount)
-    camera = ZedCamera(
+    with ZedCamera(
         resolution="HD2K",
         fps=camera_cfg["fps"],
         depth_mode=camera_cfg["depth_mode"],
         serial_number=camera_cfg["serial_number"],
         camera_id=camera_cfg["name"],
-    )
-    K, dist = camera.get_intrinsics()
-    logger.info(
-        "Opened %s ZED serial=%s; intrinsics: fx=%.2f fy=%.2f cx=%.2f cy=%.2f",
-        camera_mount,
-        camera_cfg["serial_number"],
-        K[0, 0],
-        K[1, 1],
-        K[0, 2],
-        K[1, 2],
-    )
+    ) as camera:
+        K, dist = camera.get_intrinsics()
+        logger.info(
+            "Opened %s ZED serial=%s; intrinsics: fx=%.2f fy=%.2f cx=%.2f cy=%.2f",
+            camera_mount,
+            camera_cfg["serial_number"],
+            K[0, 0],
+            K[1, 1],
+            K[0, 2],
+            K[1, 2],
+        )
 
-    board, detector = _build_board(cal.board)
+        board, detector = _build_board(cal.board)
 
-    # ------------------------------------------------------------------- robot
-    logger.info("Connecting to Franka at %s ...", cfg.robot.ip)
-    robot = Robot(cfg.robot.ip)
-    robot.recover_from_errors()
+        # ------------------------------------------------------------------- robot
+        logger.info("Connecting to Franka at %s ...", cfg.robot.ip)
+        robot = Robot(cfg.robot.ip)
+        robot.recover_from_errors()
 
-    # ------------------------------------------------------------------- capture
-    try:
+        # ------------------------------------------------------------------- capture
         samples = _capture_kinesthetic(robot, camera, cal, detector, board, K, dist, debug_dir)
-    finally:
-        camera.close()
 
     if len(samples) < 4:
         raise RuntimeError(
