@@ -39,13 +39,20 @@ There is no trajectory queue — every tick re-plans from scratch. That's the po
 ### Software stack on the robot machine
 1. **`franka-teleop`** with this branch (`deploy/diffuser-actor`) checked out.
 2. **`net_franky` server** running and reachable at `cfg.net_franky.ip:port` (defaults `172.16.0.1:18812`). Same server `teleop.py` uses.
-3. **`LangSteer`** cloned somewhere accessible. *For inference only*, you can install just the policy/model subset:
+3. **`LangSteer`** cloned somewhere accessible. The default install is:
    ```bash
-   # in LangSteer/
-   # drop calvin-env from project deps (move it under the `calvin` extra) and:
-   uv sync --no-group calvin --no-group diffusion --no-group sagemaker
+   cd LangSteer
+   uv sync                # installs the full main deps + the `dev` group
    ```
-   The minimal deps the policy actually imports are `torch`, `transformers` (for CLIP), `diffusers`, `einops`, `scipy`, `numpy`, `hydra-core`. The `pyrender`/`pyopengl`/`dash`/`plotly`/`trimesh`/`zarr`/`wandb` deps in LangSteer's main group are *not* needed for inference. The `realworld/data-support` branch is only required if you also re-train on this machine — for pure deployment `main` or `refactoring` is enough.
+   That gets you everything the policy needs: torch, transformers (for CLIP), diffusers, einops, hydra-core, numpy, scipy, h5py, opencv-python-headless, plus accelerate / huggingface-hub / blosc / dill etc. as transitive deps.
+
+   *uv groups vs extras*: the only optional groups are `dev`, `calvin`, `diffusion`, `sagemaker` — pass `--group <name>` to opt into one. There are no `[project.optional-dependencies]` (a.k.a. extras), so `--extra <anything>` will always error. `transformers` is a regular dependency and is already installed by bare `uv sync`.
+
+   *If `uv sync` fails on `calvin-env`*: that's a git dep with PyBullet + NumPy-2.0 compatibility issues that occasionally won't build. The inference path does not import `calvin_env`, so the fix is to comment out the `"calvin-env @ git+..."` line inside `dependencies = [...]` in `pyproject.toml` and rerun `uv sync`. (Don't remove `calvin-env` from the `[dependency-groups].calvin` block — that one's behind `--group calvin` and is already skipped by default.)
+
+   *Running the deploy script*: always invoke through the venv, either `uv run python deploy_diffuser_actor.py ...` or `source LangSteer/.venv/bin/activate` first. Plain `python deploy_diffuser_actor.py` will use system Python and fail with `No module named 'torch'`.
+
+   *Which LangSteer branch*: the `realworld/data-support` branch is only required if you also re-train on this machine. For pure deployment, `main` or `refactoring` is enough — the inference code paths are identical.
 4. **ZED SDK** installed and visible to the venv (the `pyzed` Python bindings). Both cameras must be claimed by this process — no `ZED Explorer` or other ZED-using process running concurrently.
 5. **`threed_mouse` Python package** (the SpaceMouse client `teleop.py` uses).
 
