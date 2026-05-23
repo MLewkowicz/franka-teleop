@@ -85,6 +85,10 @@ visualization:
         max_distance_m: 3.0
         point_size: 0.01
 
+recorder:
+  record_svo: false           # true = native ZED SVO2 files; false = HDF5 frames
+  svo_compression: H265_LOSSLESS       # H264 | H265 | LOSSLESS | H264_LOSSLESS | H265_LOSSLESS
+
 replay:
   episode: null  # path to .h5 file, or null for latest in data_dir
   speed: 1.0

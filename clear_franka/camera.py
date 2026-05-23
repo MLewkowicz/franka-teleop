@@ -96,6 +96,7 @@ class ZedCamera:
         # Recording state (protected by _rec_lock)
         self._rec_lock = threading.Lock()
         self._recording = False
+        self._svo_recording = False
         self._video_file: Optional[h5py.File] = None
         self._start_time = 0.0
         self._frame_count = 0
@@ -129,34 +130,52 @@ class ZedCamera:
     # Recording control
     # ------------------------------------------------------------------
 
-    def start_recording(self, video_path: str, start_time: float):
-        """Begin writing RGB + depth frames to an HDF5 video file.
+    def start_recording(self, video_path: str, start_time: float,
+                        svo: bool = False, svo_compression: str = "H264"):
+        """Begin recording frames to disk.
 
         Args:
-            video_path: Output path for the video HDF5 file.
-            start_time: The time.monotonic() epoch shared with the
-                        trajectory recorder, for synchronized timestamps.
+            video_path: Output path. HDF5 (.hdf5) or SVO2 (.svo2) depending on ``svo``.
+            start_time: The time.monotonic() epoch shared with the trajectory
+                        recorder, for synchronized timestamps.
+            svo: If True, record a native ZED SVO2 file instead of HDF5.
+            svo_compression: SVO compression mode name (H264, H265, LOSSLESS,
+                             H264_LOSSLESS, H265_LOSSLESS). Ignored when svo=False.
         """
         with self._rec_lock:
             if self._recording:
                 return
 
-            h, w = self._img_h, self._img_w
-            f = h5py.File(video_path, "w")
-            f.create_dataset(
-                "rgb", shape=(0, h, w, 3), maxshape=(None, h, w, 3),
-                dtype=np.uint8, chunks=(1, h, w, 3), compression="lzf",
-            )
-            f.create_dataset(
-                "depth", shape=(0, h, w), maxshape=(None, h, w),
-                dtype=np.float32, chunks=(1, h, w), compression="lzf",
-            )
-            f.create_dataset(
-                "timestamps", shape=(0,), maxshape=(None,),
-                dtype=np.float64, chunks=(256,),
-            )
+            if svo:
+                sl = self._sl
+                recording_params = sl.RecordingParameters()
+                recording_params.video_filename = video_path
+                recording_params.compression_mode = getattr(
+                    sl.SVO_COMPRESSION_MODE, svo_compression
+                )
+                err = self._zed.enable_recording(recording_params)
+                if err != sl.ERROR_CODE.SUCCESS:
+                    raise RuntimeError(f"Failed to start SVO recording: {err}")
+                self._svo_recording = True
+                self._video_file = None
+            else:
+                h, w = self._img_h, self._img_w
+                f = h5py.File(video_path, "w")
+                f.create_dataset(
+                    "rgb", shape=(0, h, w, 3), maxshape=(None, h, w, 3),
+                    dtype=np.uint8, chunks=(1, h, w, 3), compression="lzf",
+                )
+                f.create_dataset(
+                    "depth", shape=(0, h, w), maxshape=(None, h, w),
+                    dtype=np.float32, chunks=(1, h, w), compression="lzf",
+                )
+                f.create_dataset(
+                    "timestamps", shape=(0,), maxshape=(None,),
+                    dtype=np.float64, chunks=(256,),
+                )
+                self._svo_recording = False
+                self._video_file = f
 
-            self._video_file = f
             self._start_time = start_time
             self._frame_count = 0
             self._recording = True
@@ -167,18 +186,27 @@ class ZedCamera:
 
         Returns:
             (camera_timestamps, frame_count) or (None, 0) if not recording.
+            camera_timestamps is None for SVO recordings (timestamps are
+            embedded in the SVO file).
         """
         with self._rec_lock:
             if not self._recording:
                 return None, 0
             self._recording = False
+            svo = self._svo_recording
+            self._svo_recording = False
 
             f = self._video_file
             self._video_file = None
 
+        n = self._frame_count
+        if svo:
+            self._zed.disable_recording()
+            logger.info("  [camera] SVO recording stopped, %d frames", n)
+            return None, n
+
         # Read back timestamps (file access outside lock is fine since
         # the capture loop won't touch it after _recording is False).
-        n = self._frame_count
         if n > 0:
             timestamps = f["timestamps"][:n]
         else:
@@ -282,30 +310,34 @@ class ZedCamera:
                     continue
 
                 if recording:
-                    ts = now - self._start_time
+                    if self._svo_recording:
+                        # ZED SDK writes the SVO frame automatically on grab().
+                        self._frame_count += 1
+                    else:
+                        ts = now - self._start_time
 
-                    # Retrieve left RGB (BGRA) and depth
-                    self._zed.retrieve_image(self._rgb_mat, sl.VIEW.LEFT)
-                    self._zed.retrieve_measure(self._depth_mat, sl.MEASURE.DEPTH)
+                        # Retrieve left RGB (BGRA) and depth
+                        self._zed.retrieve_image(self._rgb_mat, sl.VIEW.LEFT)
+                        self._zed.retrieve_measure(self._depth_mat, sl.MEASURE.DEPTH)
 
-                    rgb = self._rgb_mat.get_data()[:, :, :3]    # BGRA → BGR
-                    rgb = rgb[:, :, ::-1].copy()                 # BGR → RGB
-                    depth = self._depth_mat.get_data().copy()
+                        rgb = self._rgb_mat.get_data()[:, :, :3]    # BGRA → BGR
+                        rgb = rgb[:, :, ::-1].copy()                 # BGR → RGB
+                        depth = self._depth_mat.get_data().copy()
 
-                    # Append to HDF5 datasets
-                    i = self._frame_count
-                    f = self._video_file
+                        # Append to HDF5 datasets
+                        i = self._frame_count
+                        f = self._video_file
 
-                    f["rgb"].resize(i + 1, axis=0)
-                    f["rgb"][i] = rgb
+                        f["rgb"].resize(i + 1, axis=0)
+                        f["rgb"][i] = rgb
 
-                    f["depth"].resize(i + 1, axis=0)
-                    f["depth"][i] = depth
+                        f["depth"].resize(i + 1, axis=0)
+                        f["depth"][i] = depth
 
-                    f["timestamps"].resize(i + 1, axis=0)
-                    f["timestamps"][i] = ts
+                        f["timestamps"].resize(i + 1, axis=0)
+                        f["timestamps"][i] = ts
 
-                    self._frame_count = i + 1
+                        self._frame_count = i + 1
 
                 if should_capture_pointcloud:
                     self._retrieve_pointcloud(now)

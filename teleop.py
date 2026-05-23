@@ -162,6 +162,7 @@ def run_teleop(cfg: DictConfig):
         except OSError:
             print(f"  [recorder] No extrinsics found for {cam_name} at {ext_path}; not embedded in episode.")
 
+    recorder_cfg = cfg.get("recorder", {})
     recorder = TrajectoryRecorder(
         save_dir=cfg.data_dir,
         metadata={
@@ -172,6 +173,8 @@ def run_teleop(cfg: DictConfig):
             **extrinsics_metadata,
         },
         cameras=cameras,
+        record_svo=bool(recorder_cfg.get("record_svo", False)),
+        svo_compression=str(recorder_cfg.get("svo_compression", "H264")),
     )
 
     gripper = None

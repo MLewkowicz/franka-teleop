@@ -18,7 +18,8 @@ def _safe_name(name: str) -> str:
 
 class TrajectoryRecorder:
 
-    def __init__(self, save_dir="./data", capacity=120_000, metadata=None, cameras=None):
+    def __init__(self, save_dir="./data", capacity=120_000, metadata=None, cameras=None,
+                 record_svo=False, svo_compression="H264"):
         """
         Args:
             save_dir: Directory to save episode files.
@@ -26,6 +27,9 @@ class TrajectoryRecorder:
             metadata: Optional dict of extra metadata stored in HDF5 attrs.
             cameras: Optional dict/list of named ZedCamera instances. If provided,
                 every camera is recorded with the same trajectory clock epoch.
+            record_svo: If True, cameras record native ZED SVO2 files instead of HDF5.
+            svo_compression: SVO compression mode (H264, H265, LOSSLESS, etc.).
+                             Only used when record_svo=True.
         """
         self._save_dir = Path(save_dir)
         self._capacity = capacity
@@ -35,6 +39,8 @@ class TrajectoryRecorder:
         elif not isinstance(cameras, dict):
             cameras = {getattr(cam, "camera_id", f"camera_{i}"): cam for i, cam in enumerate(cameras)}
         self._cameras = dict(cameras)
+        self._record_svo = record_svo
+        self._svo_compression = svo_compression
         self._recording = False
         self._count = 0
         self._start_time = 0.0
@@ -86,11 +92,13 @@ class TrajectoryRecorder:
         self._recording = True
 
         self._save_dir.mkdir(parents=True, exist_ok=True)
+        video_ext = "svo2" if self._record_svo else "hdf5"
         for name, camera in self._cameras.items():
             video_path = str(
-                self._save_dir / f"episode_{self._start_wall}_{_safe_name(name)}_video.hdf5"
+                self._save_dir / f"episode_{self._start_wall}_{_safe_name(name)}_video.{video_ext}"
             )
-            camera.start_recording(video_path, self._start_time)
+            camera.start_recording(video_path, self._start_time,
+                                   svo=self._record_svo, svo_compression=self._svo_compression)
 
         print("  [recorder] RECORDING started")
 
@@ -148,29 +156,45 @@ class TrajectoryRecorder:
         self._save_dir.mkdir(parents=True, exist_ok=True)
         n = self._count
         fname = self._save_dir / f"episode_{self._start_wall}.h5"
+        video_ext = "svo2" if self._record_svo else "hdf5"
 
         with h5py.File(fname, "w") as f:
             for key, buf in self._buffers.items():
                 f.create_dataset(key, data=buf[:n], compression="gzip",
                                  compression_opts=1)
 
-            if isinstance(camera_ts, dict) and camera_ts:
-                group = f.create_group("camera_timestamps")
-                for name, timestamps in camera_ts.items():
-                    camera = self._cameras[name]
+            # Write per-camera metadata for all attached cameras (not just those
+            # that returned timestamps — SVO recordings embed timestamps internally).
+            cameras_to_record = set(self._cameras.keys())
+            if isinstance(camera_ts, dict):
+                cameras_to_record |= set(camera_ts.keys())
+
+            if cameras_to_record:
+                if isinstance(camera_ts, dict) and camera_ts:
+                    group = f.create_group("camera_timestamps")
+                    for name, timestamps in camera_ts.items():
+                        safe = _safe_name(name)
+                        group.create_dataset(
+                            safe,
+                            data=timestamps,
+                            compression="gzip",
+                            compression_opts=1,
+                        )
+
+                for name in cameras_to_record:
+                    camera = self._cameras.get(name)
+                    if camera is None:
+                        continue
                     safe = _safe_name(name)
-                    group.create_dataset(
-                        safe,
-                        data=timestamps,
-                        compression="gzip",
-                        compression_opts=1,
+                    f.attrs[f"{safe}_camera_video_file"] = (
+                        f"episode_{self._start_wall}_{safe}_video.{video_ext}"
                     )
-                    f.attrs[f"{safe}_camera_video_file"] = f"episode_{self._start_wall}_{safe}_video.hdf5"
                     f.attrs[f"{safe}_camera_id"] = getattr(camera, "camera_id", name)
                     serial_number = getattr(camera, "serial_number", None)
                     f.attrs[f"{safe}_camera_serial_number"] = "" if serial_number is None else str(serial_number)
                     f.attrs[f"{safe}_camera_resolution"] = camera.resolution
                     f.attrs[f"{safe}_camera_fps"] = camera.fps
+
             for k, v in self._metadata.items():
                 f.attrs[k] = v
             f.attrs["start_time"] = self._start_wall
