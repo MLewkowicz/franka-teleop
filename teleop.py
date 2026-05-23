@@ -22,8 +22,7 @@ from clear_franka.recorder import TrajectoryRecorder
 from clear_franka.robotiq_net_proxy import RobotiqGripperProxy
 from clear_franka.utils import LoopRatePrinter
 
-DEFAULT_LOWER_JOINT_LIMITS = [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973]
-DEFAULT_UPPER_JOINT_LIMITS = [2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973]
+from clear_franka.franka import DEFAULT_LOWER_JOINT_LIMITS, DEFAULT_UPPER_JOINT_LIMITS
 
 RESET_LONG_PRESS_S = 0.8
 

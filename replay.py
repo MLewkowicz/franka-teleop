@@ -11,8 +11,7 @@ from zero_franky import Robot
 from zero_franky.tracker_policies import hold_current_joint
 from franky import JointMotion, JointState
 
-DEFAULT_LOWER_JOINT_LIMITS = [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973]
-DEFAULT_UPPER_JOINT_LIMITS = [2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973]
+from clear_franka.franka import DEFAULT_LOWER_JOINT_LIMITS, DEFAULT_UPPER_JOINT_LIMITS
 
 
 def find_latest_episode(data_dir: str) -> Path:
