@@ -181,9 +181,12 @@ def main(cfg: DictConfig) -> int:
     logger.info(f"[stage 0] {stages[stage_idx]['label']}")
 
     # ----- cameras -----
+    # make_zed_camera() returns an already-opened ZedCamera (it calls
+    # zed.open() inside __init__). We use synchronous grab_frame() per tick,
+    # so we deliberately do NOT call .run() — that would start a background
+    # capture thread and grab_frame() warns it must not run concurrently with
+    # it (see camera.py:237 docstring).
     cam_hand, cam_tp, pre_hand, pre_tp = _setup_cameras(cfg)
-    cam_hand.start()
-    cam_tp.start()
 
     # ----- gripper (init pattern mirrors teleop.py:184-200) -----
     gc = cfg.gripper
