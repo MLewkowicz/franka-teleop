@@ -11,12 +11,12 @@ Usage:
 import hydra
 from omegaconf import DictConfig
 
-from net_franky import setup_net_franky
+from zero_franky import setup_zero_franky
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="config")
 def main(cfg: DictConfig):
-    setup_net_franky(cfg.net_franky.ip, cfg.net_franky.port)
+    setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port, pub_port=cfg.zero_franky.pub_port)
 
     if cfg.mode == "teleop":
         from teleop import run_teleop

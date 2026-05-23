@@ -1,8 +1,9 @@
 mode: teleop  # teleop or replay
 
-net_franky:
+zero_franky:
   ip: "172.16.0.1"
   port: 18812
+  pub_port: null
 
 robot:
   ip: "172.16.0.2"
@@ -43,8 +44,8 @@ cameras:
 
 gripper:
   enabled: true
-  host: "172.16.0.1"      # Host running rpyc_classic with pyrobotiqgripper.
-  port: 18812
+  host: "172.16.0.1"
+  port: 18815
   com_port: auto
   device_id: 9
   connection_type: RTU    # RTU | RTU_VIA_TCP

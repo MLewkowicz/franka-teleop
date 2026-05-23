@@ -21,7 +21,6 @@ and quality statistics.
 import datetime
 import json
 import logging
-import threading
 import time
 from pathlib import Path
 
@@ -30,7 +29,8 @@ import numpy as np
 from omegaconf import DictConfig
 from scipy.spatial.transform import Rotation as R
 
-from net_franky.franky import JointImpedanceTracker, Robot
+from zero_franky import Robot
+from zero_franky.tracker_policies import hold_current_joint
 
 from clear_franka.camera import ZedCamera, get_camera_config, make_zed_camera
 from clear_franka.geometry import (
@@ -332,7 +332,8 @@ def _run_calibration_pointcloud_viewer(
             port=int(vc.get("port", 8080)),
         )
         try:
-            visualizer.update(np.asarray(robot.current_joint_positions, dtype=float))
+            state = robot.get_last_teleop_state()
+            visualizer.update(np.asarray(state["q"], dtype=float))
         except Exception as exc:
             print(f"  [viser] Could not update robot state: {exc}")
 
@@ -386,26 +387,14 @@ def _capture_kinesthetic(robot, camera, cal, detector, board, K, dist, debug_dir
         Q     — abort
     """
     kin = cal.kinesthetic
-    stop_event = threading.Event()
-    tracker_error = [None]
 
-    def _hold_compliant():
-        try:
-            with JointImpedanceTracker(
-                robot,
-                stiffness=[float(value) for value in kin.joint_stiffness],
-                lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
-                upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
-                period=0.001,
-            ) as tracker:
-                while not stop_event.is_set():
-                    q = robot.current_joint_positions
-                    tracker.set_target(q)
-        except Exception as e:  # noqa: BLE001
-            tracker_error[0] = e
-
-    thread = threading.Thread(target=_hold_compliant, daemon=True)
-    thread.start()
+    session = robot.start_joint_impedance_session(
+        hold_current_joint,
+        period=0.001,
+        stiffness=[float(v) for v in kin.joint_stiffness],
+        lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
+        upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
+    )
 
     print()
     print("=" * 70)
@@ -423,10 +412,14 @@ def _capture_kinesthetic(robot, camera, cal, detector, board, K, dist, debug_dir
     print()
 
     samples = []
+    frame_count = 0
     try:
         while True:
-            if tracker_error[0] is not None:
-                raise RuntimeError(f"Impedance tracker faulted: {tracker_error[0]}")
+            frame_count += 1
+            if frame_count % 30 == 0:
+                status = session.status()
+                if not status.get("running", True):
+                    raise RuntimeError(f"Impedance tracker faulted: {status.get('error')}")
 
             frame = camera.grab_frame()
             if frame is None:
@@ -448,9 +441,10 @@ def _capture_kinesthetic(robot, camera, cal, detector, board, K, dist, debug_dir
                 if detection is None:
                     logger.warning("Capture rejected: board not detected.")
                     continue
-                ee_pose = robot.current_cartesian_state.pose.end_effector_pose
-                R_gripper2base = np.array(ee_pose.matrix)[:3, :3]
-                t_gripper2base = np.array(ee_pose.translation)
+                state = robot.get_last_teleop_state()
+                O_T_EE = np.asarray(state["O_T_EE"], dtype=float)
+                R_gripper2base = O_T_EE[:3, :3].copy()
+                t_gripper2base = O_T_EE[:3, 3].copy()
                 samples.append({
                     "R_gripper2base": R_gripper2base,
                     "t_gripper2base": t_gripper2base,
@@ -469,8 +463,7 @@ def _capture_kinesthetic(robot, camera, cal, detector, board, K, dist, debug_dir
                 break
     finally:
         cv2.destroyAllWindows()
-        stop_event.set()
-        thread.join(timeout=2.0)
+        session.stop()
 
     return samples
 

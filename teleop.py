@@ -28,53 +28,11 @@ DEFAULT_UPPER_JOINT_LIMITS = [2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2
 RESET_LONG_PRESS_S = 0.8
 
 
-class AsyncTargetSender:
-    def __init__(self, tracker, affine_cls, twist_cls):
-        self._tracker = tracker
-        self._affine_cls = affine_cls
-        self._twist_cls = twist_cls
-        self._condition = threading.Condition()
-        self._latest = None
-        self._closed = False
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def send(self, target_rot, target_pos, v_world, w_world) -> None:
-        with self._condition:
-            self._latest = (
-                np.asarray(target_rot, dtype=float).copy(),
-                np.asarray(target_pos, dtype=float).copy(),
-                np.asarray(v_world, dtype=float).copy(),
-                np.asarray(w_world, dtype=float).copy(),
-            )
-            self._condition.notify()
-
-    def close(self) -> None:
-        with self._condition:
-            self._closed = True
-            self._condition.notify()
-        self._thread.join(timeout=2.0)
-
-    def _run(self) -> None:
-        while True:
-            with self._condition:
-                while self._latest is None and not self._closed:
-                    self._condition.wait()
-                if self._closed:
-                    return
-                target_rot, target_pos, v_world, w_world = self._latest
-                self._latest = None
-
-            try:
-                pose = self._affine_cls(pack_Rp(target_rot, target_pos))
-                twist = self._twist_cls(v_world, w_world)
-                self._tracker.set_target(pose, twist)
-            except Exception as exc:
-                print(f"\n  [tracker] async set_target failed: {exc}")
-
 
 def run_teleop(cfg: DictConfig):
-    from net_franky.franky import Affine, CartesianImpedanceTracker, ControlException, JointMotion, JointState, JointStopMotion, Robot, Twist
+    from zero_franky import Robot
+    from zero_franky.tracker_policies import passthrough_cartesian
+    from franky import Affine, JointMotion, JointState, JointStopMotion, Twist
 
     tc = cfg.teleop
     sc = tc.spacemouse
@@ -182,8 +140,8 @@ def run_teleop(cfg: DictConfig):
     if gc.get("enabled", False):
         try:
             gripper = RobotiqGripperProxy(
-                server_host=gc.get("host", cfg.net_franky.ip),
-                server_port=int(gc.get("port", cfg.net_franky.port)),
+                server_host=gc.get("host", cfg.zero_franky.ip),
+                server_port=int(gc.get("port", cfg.zero_franky.port)),
                 com_port=gc.get("com_port", "auto"),
                 device_id=int(gc.get("device_id", 9)),
                 connection_type=gc.get("connection_type", "RTU"),
@@ -292,169 +250,168 @@ def run_teleop(cfg: DictConfig):
             left_press_time = None
             left_used_in_record = False
 
+            session = robot.start_cartesian_impedance_session(
+                passthrough_cartesian,
+                period=tc.period,
+                translational_stiffness=tc.translational_stiffness,
+                rotational_stiffness=tc.rotational_stiffness,
+                nullspace_stiffness=tc.nullspace_stiffness,
+                lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
+                upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
+            )
             try:
-                with CartesianImpedanceTracker(
-                    robot,
-                    translational_stiffness=tc.translational_stiffness,
-                    rotational_stiffness=tc.rotational_stiffness,
-                    nullspace_stiffness=tc.nullspace_stiffness,
-                    lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
-                    upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
-                    period=tc.period,
-                ) as tracker:
-                    initial_pose = tracker.current_pose.end_effector_pose
-                    target_pos = np.asarray(initial_pose.translation, dtype=float)
-                    target_rot = np.asarray(initial_pose.matrix[:3, :3], dtype=float)
-                    target_sender = AsyncTargetSender(tracker, Affine, Twist)
+                teleop_state = robot.get_last_teleop_state()
+                initial_pose = np.asarray(teleop_state["O_T_EE"], dtype=float)
+                target_pos = initial_pose[:3, 3].copy()
+                target_rot = initial_pose[:3, :3].copy()
+                while True:
+                    loop_rate.start_tick()
 
-                    try:
-                        while True:
-                            loop_rate.start_tick()
+                    sample = mouse.get_controller_state()
+                    if sample is None:
+                        loop_rate.finish_tick()
+                        continue
 
-                            sample = mouse.get_controller_state()
-                            if sample is None:
-                                loop_rate.finish_tick()
-                                continue
+                    buttons = np.asarray(sample.buttons, dtype=int)
+                    button = int(buttons[0]) if len(buttons) > 0 else 0
+                    right_button = int(buttons[1]) if len(buttons) > 1 else 0
+                    record_button = button and right_button
 
-                            buttons = np.asarray(sample.buttons, dtype=int)
-                            button = int(buttons[0]) if len(buttons) > 0 else 0
-                            right_button = int(buttons[1]) if len(buttons) > 1 else 0
-                            record_button = button and right_button
+                    # Track left-alone press start for long-press detection
+                    if button and not prev_button and not right_button:
+                        left_press_time = time.monotonic()
+                        left_used_in_record = False
+                    # Cancel long-press if right pressed while left held
+                    if right_button and not prev_right_button and button:
+                        left_used_in_record = True
+                    # Long-press threshold crossed → trigger reset immediately
+                    if button and left_press_time is not None and not left_used_in_record:
+                        if time.monotonic() - left_press_time >= RESET_LONG_PRESS_S:
+                            enabled = False
+                            reset_pending = True
 
-                            # Track left-alone press start for long-press detection
-                            if button and not prev_button and not right_button:
-                                left_press_time = time.monotonic()
-                                left_used_in_record = False
-                            # Cancel long-press if right pressed while left held
-                            if right_button and not prev_right_button and button:
-                                left_used_in_record = True
-                            # Long-press threshold crossed → trigger reset immediately
-                            if button and left_press_time is not None and not left_used_in_record:
-                                if time.monotonic() - left_press_time >= RESET_LONG_PRESS_S:
-                                    enabled = False
-                                    reset_pending = True
-
-                            if record_button and not prev_record_button:
-                                left_used_in_record = True
-                                loop_rate.newline()
-                                recorder.toggle()
-                            elif not button and prev_button:
-                                # Left released — always a short tap if we get here
-                                if not left_used_in_record and left_press_time is not None:
-                                    enabled = not enabled
-                                    if enabled:
-                                        robot.recover_from_errors()
-                                    loop_rate.newline()
-                                    print("  ENABLED" if enabled else "  DISABLED")
-                                left_press_time = None
-                                left_used_in_record = False
-                            elif right_button and not prev_right_button:
-                                if gripper is not None:
-                                    target_width = (
-                                        gc.get("close_width_m", 0.0)
-                                        if gripper_open
-                                        else gc.get("open_width_m", 0.085)
-                                    )
-                                    try:
-                                        gripper.move_width(
-                                            target_width,
-                                            speed=int(gc.get("speed", 255)),
-                                            force=int(gc.get("force", 255)),
-                                            wait=False,
-                                            max_width_m=gc.get("max_width_m", 0.085),
-                                        )
-                                        gripper_open = not gripper_open
-                                        if visualizer is not None:
-                                            visualizer.update_gripper_width(
-                                                target_width,
-                                                max_width_m=gc.get("max_width_m", 0.085),
-                                            )
-                                        state = "open" if gripper_open else "closed"
-                                        loop_rate.newline()
-                                        print(f"  [gripper] toggled {state}")
-                                    except Exception as e:
-                                        loop_rate.newline()
-                                        print(f"  [gripper] toggle failed: {e}")
-                            prev_button = button
-                            prev_right_button = right_button
-                            prev_record_button = record_button
-
-                            teleop_state = robot.get_last_teleop_state()
-                            joint_pos = np.asarray(teleop_state["q"], dtype=float)
-                            latest_joint_pos = joint_pos.copy()
-                            joint_vel = np.asarray(teleop_state["dq"], dtype=float)
-                            measured_pose = np.asarray(teleop_state["O_T_EE"], dtype=float).reshape(4, 4)
-                            robot_abs_time = float(teleop_state["abs_time"])
-                            robot_pos = measured_pose[:3, 3]
-                            robot_rot = measured_pose[:3, :3]
-
-                            if visualizer is not None:
-                                visualizer.update(joint_pos)
-                                visualizer.update_eef_frame(measured_pose)
-                                if pointcloud_enabled and pointcloud_camera is not None:
-                                    latest_pointcloud = pointcloud_camera.get_latest_pointcloud()
-                                    if latest_pointcloud is not None:
-                                        points, colors, timestamp = latest_pointcloud
-                                        if timestamp != last_pointcloud_timestamp:
-                                            visualizer.update_pointcloud(
-                                                pc.get(
-                                                    "frame_name",
-                                                    "/cortado/fr3_link8/hand_zed"
-                                                    if pointcloud_source == "hand"
-                                                    else "/third_person_zed",
-                                                ),
-                                                points,
-                                                colors,
-                                                point_size=float(pc.get("point_size", 0.01)),
-                                            )
-                                            last_pointcloud_timestamp = timestamp
-
+                    if record_button and not prev_record_button:
+                        left_used_in_record = True
+                        loop_rate.newline()
+                        recorder.toggle()
+                    elif not button and prev_button:
+                        # Left released — always a short tap if we get here
+                        if not left_used_in_record and left_press_time is not None:
+                            enabled = not enabled
                             if enabled:
-                                v = np.asarray(sample.xyz, dtype=float).copy()
-                                w = np.asarray(sample.rpy, dtype=float).copy()
-                                input_filter._translation_modifier(v)
-                                input_filter._rotation_modifier(w)
-
-                                if tc.global_frame:
-                                    target_pos = robot_pos + v
-                                    target_rot = so3_exp(w) @ robot_rot
-                                    v_world = v
-                                    w_world = w
-                                else:
-                                    base_rot = robot_rot
-                                    target_pos = robot_pos + base_rot @ v
-                                    target_rot = base_rot @ so3_exp(w)
-                                    v_world = base_rot @ v
-                                    w_world = base_rot @ w
-
-                                target_sender.send(
-                                    target_rot,
-                                    target_pos,
-                                    v_world,
-                                    w_world,
-                                )
-
-                            recorder.step(
-                                ee_pos=robot_pos,
-                                ee_rot=robot_rot,
-                                cmd_linear_vel=v_world if enabled else np.zeros(3),
-                                cmd_angular_vel=w_world if enabled else np.zeros(3),
-                                buttons=button | (right_button << 1),
-                                enabled=enabled,
-                                joint_pos=joint_pos,
-                                joint_vel=joint_vel,
-                                gripper_open=gripper_open if gripper is not None else None,
-                                robot_abs_time=robot_abs_time,
+                                robot.recover_from_errors()
+                            loop_rate.newline()
+                            print("  ENABLED" if enabled else "  DISABLED")
+                        left_press_time = None
+                        left_used_in_record = False
+                    elif right_button and not prev_right_button:
+                        if gripper is not None:
+                            target_width = (
+                                gc.get("close_width_m", 0.0)
+                                if gripper_open
+                                else gc.get("open_width_m", 0.085)
                             )
-                            loop_rate.finish_tick()
-                            if reset_pending:
-                                break
-                    finally:
-                        target_sender.close()
-            except ControlException as e:
+                            try:
+                                gripper.move_width(
+                                    target_width,
+                                    speed=int(gc.get("speed", 255)),
+                                    force=int(gc.get("force", 255)),
+                                    wait=False,
+                                    max_width_m=gc.get("max_width_m", 0.085),
+                                )
+                                gripper_open = not gripper_open
+                                if visualizer is not None:
+                                    visualizer.update_gripper_width(
+                                        target_width,
+                                        max_width_m=gc.get("max_width_m", 0.085),
+                                    )
+                                state = "open" if gripper_open else "closed"
+                                loop_rate.newline()
+                                print(f"  [gripper] toggled {state}")
+                            except Exception as e:
+                                loop_rate.newline()
+                                print(f"  [gripper] toggle failed: {e}")
+                    prev_button = button
+                    prev_right_button = right_button
+                    prev_record_button = record_button
+
+                    teleop_state = robot.get_last_teleop_state()
+                    joint_pos = np.asarray(teleop_state["q"], dtype=float)
+                    latest_joint_pos = joint_pos.copy()
+                    joint_vel = np.asarray(teleop_state["dq"], dtype=float)
+                    measured_pose = np.asarray(teleop_state["O_T_EE"], dtype=float).reshape(4, 4)
+                    robot_abs_time = float(teleop_state["abs_time"])
+                    robot_pos = measured_pose[:3, 3]
+                    robot_rot = measured_pose[:3, :3]
+
+                    if visualizer is not None:
+                        visualizer.update(joint_pos)
+                        visualizer.update_eef_frame(measured_pose)
+                        if pointcloud_enabled and pointcloud_camera is not None:
+                            latest_pointcloud = pointcloud_camera.get_latest_pointcloud()
+                            if latest_pointcloud is not None:
+                                points, colors, timestamp = latest_pointcloud
+                                if timestamp != last_pointcloud_timestamp:
+                                    visualizer.update_pointcloud(
+                                        pc.get(
+                                            "frame_name",
+                                            "/cortado/fr3_link8/hand_zed"
+                                            if pointcloud_source == "hand"
+                                            else "/third_person_zed",
+                                        ),
+                                        points,
+                                        colors,
+                                        point_size=float(pc.get("point_size", 0.01)),
+                                    )
+                                    last_pointcloud_timestamp = timestamp
+
+                    if enabled:
+                        v = np.asarray(sample.xyz, dtype=float).copy()
+                        w = np.asarray(sample.rpy, dtype=float).copy()
+                        input_filter._translation_modifier(v)
+                        input_filter._rotation_modifier(w)
+
+                        if tc.global_frame:
+                            target_pos = robot_pos + v
+                            target_rot = so3_exp(w) @ robot_rot
+                            v_world = v
+                            w_world = w
+                        else:
+                            base_rot = robot_rot
+                            target_pos = robot_pos + base_rot @ v
+                            target_rot = base_rot @ so3_exp(w)
+                            v_world = base_rot @ v
+                            w_world = base_rot @ w
+
+                        try:
+                            session.set_cartesian_reference(
+                                Affine(pack_Rp(target_rot, target_pos)),
+                                Twist(v_world, w_world),
+                            )
+                        except Exception as exc:
+                            print(f"\n  [tracker] set_cartesian_reference failed: {exc}")
+
+                    recorder.step(
+                        ee_pos=robot_pos,
+                        ee_rot=robot_rot,
+                        cmd_linear_vel=v_world if enabled else np.zeros(3),
+                        cmd_angular_vel=w_world if enabled else np.zeros(3),
+                        buttons=button | (right_button << 1),
+                        enabled=enabled,
+                        joint_pos=joint_pos,
+                        joint_vel=joint_vel,
+                        gripper_open=gripper_open if gripper is not None else None,
+                        robot_abs_time=robot_abs_time,
+                    )
+                    loop_rate.finish_tick()
+                    if reset_pending:
+                        break
+            except RuntimeError as e:
                 loop_rate.newline()
                 print(f"\n  Controller faulted: {e}")
                 print("  Recovering... tap button to re-enable.")
+            finally:
+                session.stop()
     finally:
         loop_rate.newline()
         recorder.close()

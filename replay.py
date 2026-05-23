@@ -7,13 +7,9 @@ import h5py
 import numpy as np
 from omegaconf import DictConfig
 
-from net_franky.franky import (
-    ControlException,
-    JointImpedanceTracker,
-    JointMotion,
-    JointState,
-    Robot,
-)
+from zero_franky import Robot
+from zero_franky.tracker_policies import hold_current_joint
+from franky import JointMotion, JointState
 
 DEFAULT_LOWER_JOINT_LIMITS = [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973]
 DEFAULT_UPPER_JOINT_LIMITS = [2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973]
@@ -90,8 +86,8 @@ def run_replay(cfg: DictConfig):
             from clear_franka.robotiq_net_proxy import RobotiqGripperProxy
 
             gripper = RobotiqGripperProxy(
-                server_host=gc.get("host", cfg.net_franky.ip),
-                server_port=int(gc.get("port", cfg.net_franky.port)),
+                server_host=gc.get("host", cfg.zero_franky.ip),
+                server_port=int(gc.get("port", cfg.zero_franky.port)),
                 com_port=gc.get("com_port", "auto"),
                 device_id=int(gc.get("device_id", 9)),
                 connection_type=gc.get("connection_type", "RTU"),
@@ -166,18 +162,19 @@ def run_replay(cfg: DictConfig):
             robot.recover_from_errors()
 
             try:
-                with JointImpedanceTracker(
-                    robot,
-                    stiffness=stiffness,
+                session = robot.start_joint_impedance_session(
+                    hold_current_joint,
+                    period=rc.period,
+                    stiffness=stiffness.tolist(),
                     lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
                     upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
-                    period=rc.period,
-                ) as tracker:
+                )
+                try:
                     step = 0
                     replay_start = None
                     last_gripper_open = None
 
-                    while tracker.tick():
+                    while True:
                         if replay_start is None:
                             replay_start = time.monotonic()
 
@@ -188,15 +185,15 @@ def run_replay(cfg: DictConfig):
 
                         if step >= n_steps - 1:
                             print("  Replay complete.")
-                            tracker.set_target(joint_pos[-1])
+                            session.set_joint_reference(joint_pos[-1].tolist())
                             break
 
                         q = joint_pos[step]
                         if has_joint_vel:
                             dq = joint_vel[step] * rc.speed
-                            tracker.set_target(q, dq=dq)
+                            session.set_joint_reference(q.tolist(), velocity=dq.tolist())
                         else:
-                            tracker.set_target(q)
+                            session.set_joint_reference(q.tolist())
 
                         if gripper is not None and np.isfinite(gripper_open_data[step]):
                             current_gripper_open = bool(round(float(gripper_open_data[step])))
@@ -235,9 +232,14 @@ def run_replay(cfg: DictConfig):
                                 robot_abs_time=float(teleop_state["abs_time"]),
                             )
 
+                        time.sleep(rc.period)
+
+                finally:
+                    session.stop()
+
                 break
 
-            except ControlException as e:
+            except RuntimeError as e:
                 print(f"\n  Controller faulted: {e}")
                 print("  Recovering and retrying...")
 
