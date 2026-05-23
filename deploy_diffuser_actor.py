@@ -151,21 +151,16 @@ def main(cfg: DictConfig) -> int:
 
     _wire_langsteer(cfg.deploy.langsteer_path)
 
-    # Late imports — net_franky and the policy depend on host-side venvs.
-    from net_franky.franky import (
-        Affine, CartesianImpedanceTracker, ControlException,
-        JointMotion, JointState, Robot,
-    )
+    # Late imports — zero_franky and the policy depend on host-side venvs.
+    from zero_franky import Robot, setup_zero_franky
+    from zero_franky.tracker_policies import passthrough_cartesian
+    from franky import Affine, JointMotion, JointState
     from clear_franka.utils import LoopRatePrinter
     from clear_franka.diffuser_actor_io import euler_xyz_to_matrix
     from clear_franka.robotiq_net_proxy import RobotiqGripperProxy
     from threed_mouse import ThreeDMouse
 
-    # Franka joint limits — duplicated from teleop.py:25-26 (no shared module).
-    DEFAULT_LOWER_JOINT_LIMITS = [-2.8973, -1.7628, -2.8973, -3.0718,
-                                   -2.8973, -0.0175, -2.8973]
-    DEFAULT_UPPER_JOINT_LIMITS = [2.8973, 1.7628, 2.8973, -0.0698,
-                                   2.8973, 3.7525, 2.8973]
+    from clear_franka.franka import DEFAULT_LOWER_JOINT_LIMITS, DEFAULT_UPPER_JOINT_LIMITS
 
     # ----- policy -----
     policy = _build_policy(cfg.deploy)
@@ -190,8 +185,8 @@ def main(cfg: DictConfig) -> int:
     gripper = None
     if gc.get("enabled", False):
         gripper = RobotiqGripperProxy(
-            server_host=gc.get("host", cfg.net_franky.ip),
-            server_port=int(gc.get("port", cfg.net_franky.port)),
+            server_host=gc.get("host", cfg.zero_franky.ip),
+            server_port=int(gc.get("port", cfg.zero_franky.port)),
             com_port=gc.get("com_port", "auto"),
             device_id=int(gc.get("device_id", 9)),
             connection_type=gc.get("connection_type", "RTU"),
@@ -204,6 +199,8 @@ def main(cfg: DictConfig) -> int:
     gripper_command_state = 1.0  # 1 = open, 0 = closed (matches training format)
 
     # ----- robot -----
+    setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port,
+                      pub_port=cfg.zero_franky.pub_port)
     robot = Robot(cfg.robot.ip)
     robot.recover_from_errors()
     reset_joint_config = np.asarray(cfg.teleop.reset_joint_config, dtype=float)
@@ -224,120 +221,122 @@ def main(cfg: DictConfig) -> int:
     enabled = False
     rate = LoopRatePrinter()
 
+    tracker = robot.start_cartesian_impedance_session(
+        passthrough_cartesian,
+        period=cfg.teleop.period,
+        translational_stiffness=cfg.teleop.translational_stiffness,
+        rotational_stiffness=cfg.teleop.rotational_stiffness,
+        nullspace_stiffness=cfg.teleop.nullspace_stiffness,
+        lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
+        upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
+    )
     try:
-        with CartesianImpedanceTracker(
-            robot,
-            translational_stiffness=cfg.teleop.translational_stiffness,
-            rotational_stiffness=cfg.teleop.rotational_stiffness,
-            nullspace_stiffness=cfg.teleop.nullspace_stiffness,
-            lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
-            upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
-            period=cfg.teleop.period,
-        ) as tracker:
-            prev_left = 0
-            prev_right = 0
-            forward_count = 0
+        prev_left = 0
+        prev_right = 0
+        forward_count = 0
 
-            while True:
-                rate.start_tick()
+        while True:
+            rate.start_tick()
 
-                # ---------- button polling ----------
-                if mouse is not None:
-                    sample = mouse.get_controller_state()
-                    if sample is not None:
-                        buttons = np.asarray(sample.buttons, dtype=int)
-                        left = int(buttons[0]) if len(buttons) > 0 else 0
-                        right = int(buttons[1]) if len(buttons) > 1 else 0
-                        if left and not prev_left:
-                            enabled = not enabled
-                            logger.info(f"  {'ENABLED' if enabled else 'DISABLED'}")
-                        if right and not prev_right:
-                            stage_idx += 1
-                            if stage_idx >= len(stages):
-                                logger.info("  All stages done — exiting.")
-                                break
-                            policy.set_primitive(stages[stage_idx]["primitive"])
-                            policy.set_object(stages[stage_idx]["object"])
-                            policy.reset()  # clear gripper history at the boundary
-                            logger.info(f"[stage {stage_idx}] {stages[stage_idx]['label']}")
-                        prev_left = left
-                        prev_right = right
+            # ---------- button polling ----------
+            if mouse is not None:
+                sample = mouse.get_controller_state()
+                if sample is not None:
+                    buttons = np.asarray(sample.buttons, dtype=int)
+                    left = int(buttons[0]) if len(buttons) > 0 else 0
+                    right = int(buttons[1]) if len(buttons) > 1 else 0
+                    if left and not prev_left:
+                        enabled = not enabled
+                        logger.info(f"  {'ENABLED' if enabled else 'DISABLED'}")
+                    if right and not prev_right:
+                        stage_idx += 1
+                        if stage_idx >= len(stages):
+                            logger.info("  All stages done — exiting.")
+                            break
+                        policy.set_primitive(stages[stage_idx]["primitive"])
+                        policy.set_object(stages[stage_idx]["object"])
+                        policy.reset()  # clear gripper history at the boundary
+                        logger.info(f"[stage {stage_idx}] {stages[stage_idx]['label']}")
+                    prev_left = left
+                    prev_right = right
 
-                if not enabled:
-                    rate.finish_tick()
-                    continue
-
-                # ---------- read robot state ----------
-                cur_pose = tracker.current_pose.end_effector_pose
-                ee_pos = np.asarray(cur_pose.translation, dtype=np.float64)
-                ee_rot = np.asarray(cur_pose.matrix[:3, :3], dtype=np.float64)
-                T_g2b = np.eye(4)
-                T_g2b[:3, :3] = ee_rot
-                T_g2b[:3, 3] = ee_pos
-
-                # ---------- grab cameras ----------
-                hand_frame = cam_hand.grab_frame()
-                tp_frame = cam_tp.grab_frame()
-                if hand_frame is None or tp_frame is None:
-                    logger.warning("Camera grab failed — skipping tick")
-                    rate.finish_tick()
-                    continue
-                rgb_hand_full, depth_hand_full = hand_frame
-                rgb_tp_full, depth_tp_full = tp_frame
-
-                rgb_hand_200, pcd_hand_200 = pre_hand.process(
-                    rgb_hand_full, depth_hand_full, T_g2b
-                )
-                rgb_tp_200, pcd_tp_200 = pre_tp.process(
-                    rgb_tp_full, depth_tp_full
-                )
-
-                # ---------- build obs + forward ----------
-                obs = _build_observation(
-                    rgb_tp_200, pcd_tp_200,
-                    rgb_hand_200, pcd_hand_200,
-                    ee_pos, ee_rot, gripper_command_state,
-                )
-                t0 = time.perf_counter()
-                action = policy.forward(obs)
-                forward_ms = (time.perf_counter() - t0) * 1000.0
-                forward_count += 1
-                if forward_count <= 5:
-                    logger.info(
-                        f"  forward[{forward_count}] {forward_ms:.1f}ms  "
-                        f"traj[0]={action.trajectory[0]}  gripper={action.gripper:.2f}"
-                    )
-
-                # ---------- execute first pose only (MPC) ----------
-                target_xyz = action.trajectory[0, :3].astype(np.float64)
-                target_euler = action.trajectory[0, 3:6].astype(np.float64)
-                target_rot = euler_xyz_to_matrix(target_euler)
-
-                # Optional safety clip — keep targets inside the recorded workspace.
-                lo = np.array(cfg.deploy.workspace_lo, dtype=np.float64)
-                hi = np.array(cfg.deploy.workspace_hi, dtype=np.float64)
-                target_xyz = np.clip(target_xyz, lo, hi)
-
-                try:
-                    tracker.set_target(Affine(target_xyz, target_rot))
-                except ControlException as exc:
-                    logger.error(f"  tracker.set_target failed: {exc}")
-                    enabled = False
-
-                # ---------- gripper command on state change ----------
-                cmd_state = 1.0 if action.gripper >= 0.5 else 0.0
-                if gripper is not None and cmd_state != gripper_command_state:
-                    width = (cfg.gripper.open_width_m if cmd_state == 1.0
-                             else cfg.gripper.close_width_m)
-                    logger.info(f"  gripper → {'OPEN' if cmd_state == 1.0 else 'CLOSE'}")
-                    gripper.move_width(width, wait=False)
-                    gripper_command_state = cmd_state
-
+            if not enabled:
                 rate.finish_tick()
+                continue
+
+            # ---------- read robot state ----------
+            teleop_state = robot.get_last_teleop_state()
+            O_T_EE = np.asarray(teleop_state["O_T_EE"], dtype=np.float64).reshape(4, 4)
+            ee_pos = O_T_EE[:3, 3].copy()
+            ee_rot = O_T_EE[:3, :3].copy()
+            T_g2b = np.eye(4)
+            T_g2b[:3, :3] = ee_rot
+            T_g2b[:3, 3] = ee_pos
+
+            # ---------- grab cameras ----------
+            hand_frame = cam_hand.grab_frame()
+            tp_frame = cam_tp.grab_frame()
+            if hand_frame is None or tp_frame is None:
+                logger.warning("Camera grab failed — skipping tick")
+                rate.finish_tick()
+                continue
+            rgb_hand_full, depth_hand_full = hand_frame
+            rgb_tp_full, depth_tp_full = tp_frame
+
+            rgb_hand_200, pcd_hand_200 = pre_hand.process(
+                rgb_hand_full, depth_hand_full, T_g2b
+            )
+            rgb_tp_200, pcd_tp_200 = pre_tp.process(
+                rgb_tp_full, depth_tp_full
+            )
+
+            # ---------- build obs + forward ----------
+            obs = _build_observation(
+                rgb_tp_200, pcd_tp_200,
+                rgb_hand_200, pcd_hand_200,
+                ee_pos, ee_rot, gripper_command_state,
+            )
+            t0 = time.perf_counter()
+            action = policy.forward(obs)
+            forward_ms = (time.perf_counter() - t0) * 1000.0
+            forward_count += 1
+            if forward_count <= 5:
+                logger.info(
+                    f"  forward[{forward_count}] {forward_ms:.1f}ms  "
+                    f"traj[0]={action.trajectory[0]}  gripper={action.gripper:.2f}"
+                )
+
+            # ---------- execute first pose only (MPC) ----------
+            target_xyz = action.trajectory[0, :3].astype(np.float64)
+            target_euler = action.trajectory[0, 3:6].astype(np.float64)
+            target_rot = euler_xyz_to_matrix(target_euler)
+
+            # Optional safety clip — keep targets inside the recorded workspace.
+            lo = np.array(cfg.deploy.workspace_lo, dtype=np.float64)
+            hi = np.array(cfg.deploy.workspace_hi, dtype=np.float64)
+            target_xyz = np.clip(target_xyz, lo, hi)
+
+            try:
+                tracker.set_cartesian_reference(Affine(target_xyz, target_rot))
+            except Exception as exc:
+                logger.error(f"  set_cartesian_reference failed: {exc}")
+                enabled = False
+
+            # ---------- gripper command on state change ----------
+            cmd_state = 1.0 if action.gripper >= 0.5 else 0.0
+            if gripper is not None and cmd_state != gripper_command_state:
+                width = (cfg.gripper.open_width_m if cmd_state == 1.0
+                         else cfg.gripper.close_width_m)
+                logger.info(f"  gripper → {'OPEN' if cmd_state == 1.0 else 'CLOSE'}")
+                gripper.move_width(width, wait=False)
+                gripper_command_state = cmd_state
+
+            rate.finish_tick()
 
     except KeyboardInterrupt:
         logger.info("Interrupted — stopping.")
     finally:
+        tracker.stop()
         try:
             cam_hand.close()
         except Exception:
