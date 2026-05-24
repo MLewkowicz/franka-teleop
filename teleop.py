@@ -73,12 +73,15 @@ def run_teleop(cfg: DictConfig):
         rotation_enabled=True,
     )
 
+    record_mode = str(tc.get("record", "joints"))
+    record_cameras = record_mode == "all"
+
     cameras = {}
     pointcloud_camera = None
-    if pointcloud_enabled or any(
+    if pointcloud_enabled or (record_cameras and any(
         cfg.get("cameras", {}).get(n, {}).get("enabled", False)
         for n in ("third_person", "hand")
-    ):
+    )):
         try:
             from clear_franka.camera import enabled_camera_names, get_camera_config, make_zed_camera
 
@@ -125,11 +128,10 @@ def run_teleop(cfg: DictConfig):
         metadata={
             "linear_scale": tc.linear_scale,
             "angular_scale": tc.angular_scale,
-            "period": tc.period,
             "gripper_enabled": bool(gc.get("enabled", False)),
             **extrinsics_metadata,
         },
-        cameras=cameras,
+        cameras=cameras if record_cameras else {},
         record_svo=bool(recorder_cfg.get("record_svo", False)),
         svo_compression=str(recorder_cfg.get("svo_compression", "H264")),
     )
@@ -139,17 +141,15 @@ def run_teleop(cfg: DictConfig):
     if gc.get("enabled", False):
         try:
             gripper = RobotiqGripperProxy(
-                server_host=gc.get("host", cfg.zero_franky.ip),
-                server_port=int(gc.get("port", cfg.zero_franky.port)),
-                com_port=gc.get("com_port", "auto"),
-                device_id=int(gc.get("device_id", 9)),
-                connection_type=gc.get("connection_type", "RTU"),
-                tcp_host=gc.get("tcp_host", "127.0.0.1"),
-                tcp_port=int(gc.get("tcp_port", 54321)),
-                auto_activate=bool(gc.get("activate_on_start", True)),
+                server_host=gc.host,
+                server_port=int(gc.port),
+                com_port=gc.com_port,
+                device_id=int(gc.device_id),
+                connection_type=gc.connection_type,
+                tcp_host=gc.tcp_host,
+                tcp_port=int(gc.tcp_port),
+                auto_activate=bool(gc.activate_on_start),
             )
-            if gc.get("activate_on_start", True):
-                print("Robotiq gripper activated.")
             print("Robotiq gripper proxy ready.")
         except Exception as e:
             print(f"  [gripper] Failed to initialize: {e}")
@@ -219,6 +219,8 @@ def run_teleop(cfg: DictConfig):
         stack.callback(loop_rate.newline)
         while True:
             robot.recover_from_errors()
+            # Drain any motions that might be left over
+            robot.join_motion(2)
 
             if reset_pending:
                 reset_pending = False

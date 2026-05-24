@@ -13,12 +13,12 @@ data_dir: ./data
 teleop:
   linear_scale: 0.1
   angular_scale: 0.5
-  period: 0.001
   global_frame: true
   translational_stiffness: 100.0
   rotational_stiffness: 5.0
   nullspace_stiffness: 2.0
   reset_joint_config: [-0.06217873,  0.11705305, -0.5995304 , -2.72505689,  1.98229098, 1.78315043,  0.44959301]
+  record: joints                # joints = joint data only; all = joint data + cameras
   spacemouse:
     control_rate: 120
     smoothing_factor: 0.3
@@ -98,8 +98,6 @@ replay:
   # [50, 50, 50, 50, 20, 20, 10] is a reasonable starting point; tune per arm.
   joint_stiffness: [80.0, 80.0, 80.0, 80.0, 30.0, 30.0, 15.0]
   # Pre-positioning move to the first joint configuration of the episode.
-  preposition_dynamics_factor: 0.1  # fraction of max velocity/accel/jerk
-  preposition_settle_s: 0.5         # pause after preposition before streaming
   record: false                     # save measured robot state as a new episode
 
 deploy:

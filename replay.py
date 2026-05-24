@@ -84,17 +84,15 @@ def run_replay(cfg: DictConfig):
             from clear_franka.robotiq_net_proxy import RobotiqGripperProxy
 
             gripper = RobotiqGripperProxy(
-                server_host=gc.get("host", cfg.zero_franky.ip),
-                server_port=int(gc.get("port", cfg.zero_franky.port)),
-                com_port=gc.get("com_port", "auto"),
-                device_id=int(gc.get("device_id", 9)),
-                connection_type=gc.get("connection_type", "RTU"),
-                tcp_host=gc.get("tcp_host", "127.0.0.1"),
-                tcp_port=int(gc.get("tcp_port", 54321)),
-                auto_activate=bool(gc.get("activate_on_start", True)),
+                server_host=gc.host,
+                server_port=int(gc.port),
+                com_port=gc.com_port,
+                device_id=int(gc.device_id),
+                connection_type=gc.connection_type,
+                tcp_host=gc.tcp_host,
+                tcp_port=int(gc.tcp_port),
+                auto_activate=bool(gc.activate_on_start),
             )
-            if gc.get("activate_on_start", True):
-                print("  Robotiq gripper activated.")
         except Exception as e:
             print(f"  [gripper] Failed to initialize: {e}")
             gripper = None
