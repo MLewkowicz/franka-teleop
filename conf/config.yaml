@@ -3,7 +3,7 @@ mode: teleop  # teleop or replay
 zero_franky:
   ip: "172.16.0.1"
   port: 18812
-  pub_port: null
+  pub_port: 18813
 
 robot:
   ip: "172.16.0.2"
@@ -51,7 +51,6 @@ gripper:
   connection_type: RTU    # RTU | RTU_VIA_TCP
   tcp_host: "127.0.0.1"
   tcp_port: 54321
-  activate_on_start: true
   initial_open: true
   open_width_m: 0.085
   close_width_m: 0.0
@@ -68,7 +67,7 @@ visualization:
     pointclouds:
       third_person:
         enabled: false
-        extrinsics_path: ./data/extrinsics_third_person.json
+        extrinsics_path: "/home/clear/franka-teleop/data/extrinsics_third_person.json"
         frame_name: /third_person_zed
         update_hz: 5.0
         stride: 4
@@ -77,7 +76,7 @@ visualization:
         point_size: 0.01
       hand:
         enabled: false
-        extrinsics_path: ./data/extrinsics_hand.json
+        extrinsics_path: "/home/clear/franka-teleop/data/extrinsics_hand.json"
         # Child of the Franka end-effector/flange frame in the viser URDF.
         frame_name: /cortado/fr3_link8/hand_zed
         update_hz: 5.0
@@ -103,11 +102,11 @@ replay:
 deploy:
   # 3D Diffuser Actor MPC deployment (deploy_diffuser_actor.py).
   # Resolve these paths to the actual files on the robot machine before launching.
-  checkpoint: ???                                 # path to last.pth / best.pth from train_diffuser_actor.py
-  policy_config: ./conf/deploy_policy.yaml        # mirrors LangSteer/conf/policy/diffuser_actor_primitive_object.yaml
-  langsteer_path: ${oc.env:LANGSTEER_PATH,~/Documents/michal/LangSteer}
-  extrinsics_hand: ./data/extrinsics_hand.json
-  extrinsics_third_person: ./data/extrinsics_third_person.json
+  checkpoint: "/home/clear/franka-teleop/checkpoints/diffuser_actor_wine_glass.pth"                                 # path to last.pth / best.pth from train_diffuser_actor.py
+  policy_config: "/home/clear/LangSteer/conf/deploy_policy.yaml"        # mirrors LangSteer/conf/policy/diffuser_actor_primitive_object.yaml
+  langsteer_path: "/home/clear/LangSteer"
+  extrinsics_hand: "/home/clear/franka-teleop/data/extrinsics_hand.json"
+  extrinsics_third_person: "/home/clear/franka-teleop/data/extrinsics_third_person.json"
   control_hz: 10                                  # MPC tick rate — DiffuserActor forward is ~50-100ms on a 5090
   # Workspace safety box (base frame, metres). Cartesian targets are clipped here.
   # Sized from the recorded teleop's ee_pos range with a small buffer; tighten before serious runs.

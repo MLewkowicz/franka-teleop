@@ -7,6 +7,22 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 
+def pack_Rp(R: np.ndarray, p: np.ndarray) -> np.ndarray:
+    """Pack rotation matrix R and position p into a 4x4 homogeneous transform.
+
+    Supports batched inputs: R can be (N, 3, 3) and p can be (N, 3), broadcasting
+    as expected. For single inputs returns a (4, 4) array.
+    """
+    Rv = np.atleast_2d(R)
+    Rb = Rv[None, :, :] if Rv.ndim == 2 else Rv
+    pb = np.atleast_2d(p)
+    num_results = max(Rb.shape[0], pb.shape[0])
+    T = np.tile(np.eye(4)[None, ...], (num_results, 1, 1))
+    T[..., :3, :3] = Rb
+    T[..., :3, 3] = pb
+    return T.squeeze() if Rv.ndim == 2 else T
+
+
 def make_transform(rotation: np.ndarray, translation: np.ndarray) -> np.ndarray:
     T = np.eye(4)
     T[:3, :3] = rotation

@@ -1,10 +1,11 @@
 """Deploy a trained 3D Diffuser Actor checkpoint on the real Franka.
 
-MPC-style: every tick, grab two ZED frames + the current end-effector pose,
-build a `core.types.Observation`, call `policy.forward(obs)` which returns a
-20-step absolute trajectory, send only the *first* pose to the Cartesian
-impedance controller, then loop. The gripper command is issued whenever the
-policy's predicted gripper bit flips relative to what we last commanded.
+MPC-style: an inference worker continuously grabs two ZED frames + the current
+end-effector pose, builds a `core.types.Observation`, and calls
+`policy.forward(obs)` to produce an absolute trajectory. The main loop streams
+the freshest trajectory suffix to the Cartesian impedance controller while the
+next inference pass is already running. The gripper command is issued when the
+executed trajectory step flips relative to what we last commanded.
 
 Stage transitions (grasp → place → done) are driven by SpaceMouse buttons:
     LEFT  short tap   → toggle ENABLED (closed-loop control on/off)
@@ -22,9 +23,12 @@ Launch:
 
 from __future__ import annotations
 
+import contextlib
+from dataclasses import dataclass
 import logging
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -33,6 +37,35 @@ import numpy as np
 from omegaconf import DictConfig, OmegaConf
 
 logger = logging.getLogger("deploy_diffuser_actor")
+
+
+@dataclass
+class InferencePlan:
+    sequence: int
+    stage_idx: int
+    epoch: int
+    created_at: float
+    obs_started_at: float
+    trajectory: np.ndarray
+    gripper: np.ndarray
+
+
+class LatestPlanSlot:
+    """Single-slot handoff from the inference worker to the executor loop."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._plan: InferencePlan | None = None
+
+    def publish(self, plan: InferencePlan) -> None:
+        with self._lock:
+            self._plan = plan
+
+    def latest_after(self, sequence: int) -> InferencePlan | None:
+        with self._lock:
+            if self._plan is None or self._plan.sequence <= sequence:
+                return None
+            return self._plan
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +166,151 @@ def _build_observation(rgb_tp_200, pcd_tp_200, rgb_hand_200, pcd_hand_200,
     )
 
 
+def _read_ee_pose_from_state(state: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    O_T_EE = np.asarray(state["O_T_EE"], dtype=np.float64).reshape(4, 4)
+    ee_pos = O_T_EE[:3, 3].copy()
+    ee_rot = O_T_EE[:3, :3].copy()
+    return ee_pos, ee_rot, O_T_EE
+
+
+def _make_T_gripper_to_base(ee_pos: np.ndarray, ee_rot: np.ndarray) -> np.ndarray:
+    T_g2b = np.eye(4)
+    T_g2b[:3, :3] = ee_rot
+    T_g2b[:3, 3] = ee_pos
+    return T_g2b
+
+
+def _update_visualizer_robot_state(visualizer, state: dict | None) -> None:
+    if visualizer is None or state is None:
+        return
+
+    joint_pos = np.asarray(state["q"], dtype=float) if "q" in state else None
+    visualizer.update(joint_pos)
+    if "O_T_EE" in state:
+        visualizer.update_eef_frame(np.asarray(state["O_T_EE"], dtype=float).reshape(4, 4))
+
+
+def _extract_gripper_plan(action, horizon: int) -> np.ndarray:
+    trajectory = np.asarray(action.trajectory)
+    if trajectory.ndim == 2 and trajectory.shape[1] >= 7:
+        return trajectory[:horizon, 6].astype(np.float64)
+    return np.full(horizon, float(action.gripper), dtype=np.float64)
+
+
+def _plan_start_index(
+    plan: InferencePlan,
+    current_ee_pos: np.ndarray,
+    control_dt: float,
+    now: float,
+) -> int:
+    horizon = len(plan.trajectory)
+    if horizon <= 1:
+        return 0
+
+    distances = np.linalg.norm(plan.trajectory[:, :3] - current_ee_pos[None, :], axis=1)
+    closest_next = int(np.argmin(distances)) + 1
+    latency_skip = int(max(0.0, now - plan.obs_started_at) / control_dt)
+    return min(max(1, closest_next, latency_skip), horizon - 1)
+
+
+def _advance_plan_index(
+    plan: InferencePlan,
+    active_index: int,
+    current_ee_pos: np.ndarray,
+    lookahead_steps: int = 1,
+    search_window: int = 5,
+) -> int:
+    horizon = len(plan.trajectory)
+    if horizon <= 1:
+        return 0
+
+    active_index = int(np.clip(active_index, 0, horizon - 1))
+    search_end = min(horizon, active_index + max(1, int(search_window)))
+    local_xyz = plan.trajectory[active_index:search_end, :3]
+    if len(local_xyz) == 0:
+        return horizon - 1
+
+    distances = np.linalg.norm(local_xyz - current_ee_pos[None, :], axis=1)
+    closest = active_index + int(np.argmin(distances))
+    return min(max(active_index, closest + int(lookahead_steps)), horizon - 1)
+
+
+def _start_inference_worker(
+    *,
+    policy,
+    policy_lock: threading.Lock,
+    robot,
+    cam_hand,
+    cam_tp,
+    pre_hand,
+    pre_tp,
+    latest_plan: LatestPlanSlot,
+    enabled_event: threading.Event,
+    stop_event: threading.Event,
+    stage_state: dict[str, int],
+) -> threading.Thread:
+    def worker() -> None:
+        sequence = 0
+        while not stop_event.is_set():
+            if not enabled_event.wait(0.05):
+                continue
+
+            try:
+                obs_started_at = time.monotonic()
+                state = robot.wait_for_state(timeout=1.0)
+                ee_pos, ee_rot, _O_T_EE = _read_ee_pose_from_state(state)
+                T_g2b = _make_T_gripper_to_base(ee_pos, ee_rot)
+
+                hand_frame = cam_hand.grab_frame()
+                tp_frame = cam_tp.grab_frame()
+                if hand_frame is None or tp_frame is None:
+                    logger.warning("Camera grab failed — skipping inference")
+                    continue
+                rgb_hand_full, depth_hand_full = hand_frame
+                rgb_tp_full, depth_tp_full = tp_frame
+
+                rgb_hand_200, pcd_hand_200 = pre_hand.process(
+                    rgb_hand_full, depth_hand_full, T_g2b
+                )
+                rgb_tp_200, pcd_tp_200 = pre_tp.process(
+                    rgb_tp_full, depth_tp_full
+                )
+
+                obs = _build_observation(
+                    rgb_tp_200, pcd_tp_200,
+                    rgb_hand_200, pcd_hand_200,
+                    ee_pos, ee_rot, stage_state["gripper_cmd"],
+                )
+                with policy_lock:
+                    stage_idx = stage_state["idx"]
+                    epoch = stage_state["epoch"]
+                    action = policy.forward(obs)
+
+                trajectory = np.asarray(action.trajectory, dtype=np.float64).copy()
+                horizon = trajectory.shape[0]
+                if not enabled_event.is_set():
+                    continue
+                latest_plan.publish(InferencePlan(
+                    sequence=sequence,
+                    stage_idx=stage_idx,
+                    epoch=epoch,
+                    created_at=time.monotonic(),
+                    obs_started_at=obs_started_at,
+                    trajectory=trajectory,
+                    gripper=_extract_gripper_plan(action, horizon),
+                ))
+                sequence += 1
+            except Exception as e:
+                print(e)
+                logger.exception("Inference worker failed")
+                stop_event.set()
+                break
+
+    thread = threading.Thread(target=worker, name="diffuser-inference", daemon=True)
+    thread.start()
+    return thread
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -142,13 +320,6 @@ def main(cfg: DictConfig) -> int:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(name)s %(levelname)s: %(message)s")
 
-    if "deploy" not in cfg:
-        raise RuntimeError(
-            "conf/config.yaml is missing the `deploy:` section. Add it (see "
-            "conf/deploy_example.yaml in this branch) or pass deploy.* overrides "
-            "on the CLI."
-        )
-
     _wire_langsteer(cfg.deploy.langsteer_path)
 
     # Late imports — zero_franky and the policy depend on host-side venvs.
@@ -156,7 +327,9 @@ def main(cfg: DictConfig) -> int:
     from franky import Affine, JointMotion, JointState
     from clear_franka.utils import LoopRatePrinter
     from clear_franka.diffuser_actor_io import euler_xyz_to_matrix
+    from clear_franka.geometry import pack_Rp
     from clear_franka.robotiq_net_proxy import RobotiqGripperProxy
+    from clear_franka.visualization import CortadoViserVisualizer
     from threed_mouse import ThreeDMouse
 
     from clear_franka.franka import DEFAULT_LOWER_JOINT_LIMITS, DEFAULT_UPPER_JOINT_LIMITS
@@ -175,27 +348,40 @@ def main(cfg: DictConfig) -> int:
     logger.info(f"[stage 0] {stages[stage_idx]['label']}")
 
     # ----- cameras -----
+    # make_zed_camera() returns an already-opened ZedCamera (it calls
+    # zed.open() inside __init__). We use synchronous grab_frame() per tick,
+    # so we deliberately do NOT call .run() — that would start a background
+    # capture thread and grab_frame() warns it must not run concurrently with
+    # it (see camera.py:237 docstring).
     cam_hand, cam_tp, pre_hand, pre_tp = _setup_cameras(cfg)
-    cam_hand.start()
-    cam_tp.start()
 
     # ----- gripper (init pattern mirrors teleop.py:184-200) -----
     gc = cfg.gripper
     gripper = None
     if gc.get("enabled", False):
         gripper = RobotiqGripperProxy(
-            server_host=gc.get("host", cfg.zero_franky.ip),
-            server_port=int(gc.get("port", cfg.zero_franky.port)),
-            com_port=gc.get("com_port", "auto"),
-            device_id=int(gc.get("device_id", 9)),
-            connection_type=gc.get("connection_type", "RTU"),
-            tcp_host=gc.get("tcp_host", "127.0.0.1"),
-            tcp_port=int(gc.get("tcp_port", 54321)),
-            auto_activate=bool(gc.get("activate_on_start", True)),
+            server_host=gc.host,
+            server_port=int(gc.port),
+            com_port=gc.com_port,
+            device_id=int(gc.device_id),
+            connection_type=gc.connection_type,
+            tcp_host=gc.tcp_host,
+            tcp_port=int(gc.tcp_port),
+            auto_activate=bool(gc.activate_on_start),
         )
         # Default open at start (matches training: episodes begin with gripper open).
         gripper.move_width(gc.open_width_m, wait=False)
-    gripper_command_state = 1.0  # 1 = open, 0 = closed (matches training format)
+
+    # ----- visualization -----
+    vc = cfg.get("visualization", {}).get("viser", {})
+    visualizer = CortadoViserVisualizer(
+        host=vc.get("host", "0.0.0.0"),
+        port=int(vc.get("port", 8080)),
+    )
+    visualizer.update_gripper_width(
+        cfg.gripper.open_width_m,
+        max_width_m=cfg.gripper.max_width_m,
+    )
 
     # ----- robot -----
     setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port,
@@ -205,10 +391,9 @@ def main(cfg: DictConfig) -> int:
     reset_joint_config = np.asarray(cfg.teleop.reset_joint_config, dtype=float)
     logger.info(f"Resetting to start config {reset_joint_config}")
     robot.move(JointMotion(JointState(reset_joint_config),
-                            dynamics_factor=0.2,
-                            asynchronous=False))
+                            relative_dynamics_factor=0.2),
+               asynchronous=False)
 
-    # SpaceMouse for the two buttons.
     mouse = None
     try:
         mouse = ThreeDMouse(control_rate=cfg.teleop.spacemouse.control_rate)
@@ -219,6 +404,13 @@ def main(cfg: DictConfig) -> int:
 
     enabled = False
     rate = LoopRatePrinter()
+    control_hz = float(cfg.deploy.get("control_hz", 10.0))
+    control_dt = 1.0 / control_hz
+    policy_lock = threading.Lock()
+    latest_plan = LatestPlanSlot()
+    enabled_event = threading.Event()
+    stop_event = threading.Event()
+    stage_state: dict = {"idx": stage_idx, "epoch": 0, "gripper_cmd": 1.0}
 
     with contextlib.ExitStack() as stack:
         stack.enter_context(cam_hand)
@@ -227,133 +419,164 @@ def main(cfg: DictConfig) -> int:
             stack.enter_context(gripper)
         if mouse is not None:
             stack.callback(mouse.close)
-        with robot.start_cartesian_impedance_session(
+        stack.callback(rate.newline)
+        tracker = stack.enter_context(robot.start_cartesian_impedance_session(
             period=0.001,
             translational_stiffness=cfg.teleop.translational_stiffness,
             rotational_stiffness=cfg.teleop.rotational_stiffness,
-            nullspace_stiffness=cfg.teleop.nullspace_stiffness,
+            nullspace_stiffness=0.0,
             lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
             upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
-        ) as tracker:
-            try:
-                prev_left = 0
-                prev_right = 0
-                forward_count = 0
+        ))
+        robot.start_state_stream(timeout_ms=250)
+        stack.callback(robot.stop_state_stream)
+        inference_thread = _start_inference_worker(
+            policy=policy,
+            policy_lock=policy_lock,
+            robot=robot,
+            cam_hand=cam_hand,
+            cam_tp=cam_tp,
+            pre_hand=pre_hand,
+            pre_tp=pre_tp,
+            latest_plan=latest_plan,
+            enabled_event=enabled_event,
+            stop_event=stop_event,
+            stage_state=stage_state,
+        )
+        stack.callback(lambda: (stop_event.set(), enabled_event.set(), inference_thread.join(timeout=1.0)))
 
-        while True:
+        prev_left = 0
+        prev_right = 0
+        active_plan: InferencePlan | None = None
+        active_index = 0
+        consumed_sequence = -1
+        next_tick = time.monotonic()
+
+        while not stop_event.is_set():
             rate.start_tick()
-
-                # ---------- button polling ----------
-                if mouse is not None:
-                    sample = mouse.get_controller_state()
-                    if sample is not None:
-                        buttons = np.asarray(sample.buttons, dtype=int)
-                        left = int(buttons[0]) if len(buttons) > 0 else 0
-                        right = int(buttons[1]) if len(buttons) > 1 else 0
-                        if left and not prev_left:
-                            enabled = not enabled
-                            logger.info(f"  {'ENABLED' if enabled else 'DISABLED'}")
-                        if right and not prev_right:
-                            stage_idx += 1
-                            if stage_idx >= len(stages):
-                                logger.info("  All stages done — exiting.")
-                                break
+            # ---------- button polling ----------
+            if mouse is not None:
+                sample = mouse.get_controller_state()
+                if sample is not None:
+                    buttons = np.asarray(sample.buttons, dtype=int)
+                    left = int(buttons[0]) if len(buttons) > 0 else 0
+                    right = int(buttons[1]) if len(buttons) > 1 else 0
+                    if left and not prev_left:
+                        enabled = not enabled
+                        active_plan = None
+                        visualizer.clear_plan_waypoints()
+                        stage_state["epoch"] += 1
+                        if enabled:
+                            enabled_event.set()
+                        else:
+                            enabled_event.clear()
+                        logger.info(f"  {'ENABLED' if enabled else 'DISABLED'}")
+                    if right and not prev_right:
+                        stage_idx += 1
+                        if stage_idx >= len(stages):
+                            logger.info("  All stages done — exiting.")
+                            break
+                        enabled_event.clear()
+                        active_plan = None
+                        visualizer.clear_plan_waypoints()
+                        with policy_lock:
                             policy.set_primitive(stages[stage_idx]["primitive"])
                             policy.set_object(stages[stage_idx]["object"])
                             policy.reset()
-                            logger.info(f"[stage {stage_idx}] {stages[stage_idx]['label']}")
-                        prev_left = left
-                        prev_right = right
+                            stage_state["idx"] = stage_idx
+                            stage_state["epoch"] += 1
+                        if enabled:
+                            enabled_event.set()
+                        logger.info(f"[stage {stage_idx}] {stages[stage_idx]['label']}")
+                    prev_left = left
+                    prev_right = right
+
+            viz_state = robot.latest_state
+            _update_visualizer_robot_state(visualizer, viz_state)
 
             if not enabled:
                 rate.finish_tick()
+                next_tick += control_dt
+                sleep_time = next_tick - time.monotonic()
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                else:
+                    next_tick = time.monotonic()
                 continue
 
-            # ---------- read robot state ----------
-            teleop_state = robot.get_last_teleop_state()
-            O_T_EE = np.asarray(teleop_state["O_T_EE"], dtype=np.float64).reshape(4, 4)
-            ee_pos = O_T_EE[:3, 3].copy()
-            ee_rot = O_T_EE[:3, :3].copy()
-            T_g2b = np.eye(4)
-            T_g2b[:3, :3] = ee_rot
-            T_g2b[:3, 3] = ee_pos
+            # ---------- adopt latest completed plan ----------
+            current_epoch = stage_state["epoch"]
+            plan = latest_plan.latest_after(consumed_sequence)
+            if plan is not None:
+                consumed_sequence = plan.sequence
+                if plan.stage_idx == stage_idx and plan.epoch == current_epoch:
+                    state = robot.latest_state
+                    if state is None:
+                        state = rate.time_call("state_wait", robot.wait_for_state, 1.0)
+                    ee_pos, _ee_rot, _O_T_EE = _read_ee_pose_from_state(state)
+                    min_dist = float(np.min(
+                        np.linalg.norm(plan.trajectory[:, :3] - ee_pos[None, :], axis=1)
+                    ))
+                    if min_dist > 0.03:
+                        logger.info(
+                            "  skipping plan %d: nearest waypoint %.1f cm from EE",
+                            plan.sequence, min_dist * 100.0,
+                        )
+                    else:
+                        active_plan = plan
+                        active_index = _plan_start_index(
+                            plan, ee_pos, control_dt, time.monotonic()
+                        )
+                        visualizer.update_plan_waypoints(plan.trajectory, active_index)
+                        logger.info(
+                            "  adopted plan %d idx=%d/%d age=%.0fms infer=%.0fms",
+                            plan.sequence,
+                            active_index,
+                            len(plan.trajectory),
+                            (time.monotonic() - plan.created_at) * 1000.0,
+                            (plan.created_at - plan.obs_started_at) * 1000.0,
+                        )
 
-            # ---------- grab cameras ----------
-            hand_frame = cam_hand.grab_frame()
-            tp_frame = cam_tp.grab_frame()
-            if hand_frame is None or tp_frame is None:
-                logger.warning("Camera grab failed — skipping tick")
-                rate.finish_tick()
-                continue
-            rgb_hand_full, depth_hand_full = hand_frame
-            rgb_tp_full, depth_tp_full = tp_frame
+            # ---------- execute the active plan suffix ----------
+            if active_plan is not None and active_index < len(active_plan.trajectory):
+                state = robot.latest_state
+                if state is None:
+                    state = rate.time_call("state_wait", robot.wait_for_state, 1.0)
+                ee_pos, _ee_rot, _O_T_EE = _read_ee_pose_from_state(state)
+                active_index = _advance_plan_index(active_plan, active_index, ee_pos)
+                waypoint = active_plan.trajectory[active_index]
+                target_xyz = waypoint[:3].astype(np.float64)
+                target_euler = waypoint[3:6].astype(np.float64)
+                target_rot = euler_xyz_to_matrix(target_euler)
+                visualizer.update_plan_waypoints(active_plan.trajectory, active_index)
 
-            rgb_hand_200, pcd_hand_200 = pre_hand.process(
-                rgb_hand_full, depth_hand_full, T_g2b
-            )
-            rgb_tp_200, pcd_tp_200 = pre_tp.process(
-                rgb_tp_full, depth_tp_full
-            )
+                # Optional safety clip — keep targets inside the recorded workspace.
+                lo = np.array(cfg.deploy.workspace_lo, dtype=np.float64)
+                hi = np.array(cfg.deploy.workspace_hi, dtype=np.float64)
+                target_xyz = np.clip(target_xyz, lo, hi)
 
-            # ---------- build obs + forward ----------
-            obs = _build_observation(
-                rgb_tp_200, pcd_tp_200,
-                rgb_hand_200, pcd_hand_200,
-                ee_pos, ee_rot, gripper_command_state,
-            )
-            t0 = time.perf_counter()
-            action = policy.forward(obs)
-            forward_ms = (time.perf_counter() - t0) * 1000.0
-            forward_count += 1
-            if forward_count <= 5:
-                logger.info(
-                    f"  forward[{forward_count}] {forward_ms:.1f}ms  "
-                    f"traj[0]={action.trajectory[0]}  gripper={action.gripper:.2f}"
-                )
+                tracker.set_cartesian_reference(Affine(pack_Rp(target_rot, target_xyz)))
 
-            # ---------- execute first pose only (MPC) ----------
-            target_xyz = action.trajectory[0, :3].astype(np.float64)
-            target_euler = action.trajectory[0, 3:6].astype(np.float64)
-            target_rot = euler_xyz_to_matrix(target_euler)
+                cmd_state = 1.0 if active_plan.gripper[active_index] >= 0.5 else 0.0
+                if gripper is not None and cmd_state != stage_state["gripper_cmd"]:
+                    width = (cfg.gripper.open_width_m if cmd_state == 1.0
+                             else cfg.gripper.close_width_m)
+                    logger.info(f"  gripper → {'OPEN' if cmd_state == 1.0 else 'CLOSE'}")
+                    gripper.move_width(width, wait=False)
+                    visualizer.update_gripper_width(width, max_width_m=cfg.gripper.max_width_m)
+                    stage_state["gripper_cmd"] = cmd_state
 
-            # Optional safety clip — keep targets inside the recorded workspace.
-            lo = np.array(cfg.deploy.workspace_lo, dtype=np.float64)
-            hi = np.array(cfg.deploy.workspace_hi, dtype=np.float64)
-            target_xyz = np.clip(target_xyz, lo, hi)
-
-            try:
-                tracker.set_cartesian_reference(Affine(target_xyz, target_rot))
-            except Exception as exc:
-                logger.error(f"  set_cartesian_reference failed: {exc}")
-                enabled = False
-
-            # ---------- gripper command on state change ----------
-            cmd_state = 1.0 if action.gripper >= 0.5 else 0.0
-            if gripper is not None and cmd_state != gripper_command_state:
-                width = (cfg.gripper.open_width_m if cmd_state == 1.0
-                         else cfg.gripper.close_width_m)
-                logger.info(f"  gripper → {'OPEN' if cmd_state == 1.0 else 'CLOSE'}")
-                gripper.move_width(width, wait=False)
-                gripper_command_state = cmd_state
+            elif active_plan is not None:
+                visualizer.clear_plan_waypoints()
+                active_plan = None
 
             rate.finish_tick()
-
-        except KeyboardInterrupt:
-            logger.info("Interrupted — stopping.")
-        finally:
-            try:
-                cam_hand.close()
-            except Exception:
-                pass
-            try:
-                cam_tp.close()
-            except Exception:
-                pass
-            if gripper is not None:
-                try:
-                    gripper.disconnect()
-                except Exception:
-                    pass
+            next_tick += control_dt
+            sleep_time = next_tick - time.monotonic()
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            else:
+                next_tick = time.monotonic()
 
     return 0
 

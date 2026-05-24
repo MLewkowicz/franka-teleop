@@ -176,12 +176,16 @@ class CortadoViserVisualizer:
             load_meshes=True,
         )
         self.urdf.show_visual = True
+        self._root_node_name = root_node_name
 
         self.actuated_joint_names = list(self.urdf.get_actuated_joint_names())
         self._cfg = np.zeros(len(self.actuated_joint_names), dtype=float)
         self._arm_joint_indices = self._resolve_arm_joint_indices()
         self._gripper_joint_index = self._resolve_optional_joint_index(DEFAULT_GRIPPER_JOINT_NAME)
         self.urdf.update_cfg(self._cfg)
+        self._plan_line_handle = None
+        self._plan_point_handle = None
+        self._plan_frame_handles = []
 
         url_host = "localhost" if host in {"0.0.0.0", "::"} else host
         print(f"  [viser] Cortado URDF loaded from {urdf_path}")
@@ -330,3 +334,91 @@ class CortadoViserVisualizer:
         handle.wxyz = viser.transforms.SO3.from_matrix(T[:3, :3]).wxyz
         handle.position = T[:3, 3]
 
+    def clear_plan_waypoints(self) -> None:
+        for handle in (self._plan_line_handle, self._plan_point_handle):
+            if handle is not None:
+                handle.remove()
+        self._plan_line_handle = None
+        self._plan_point_handle = None
+
+        for handle in self._plan_frame_handles:
+            handle.remove()
+        self._plan_frame_handles = []
+
+    def update_plan_waypoints(
+        self,
+        trajectory: np.ndarray | None,
+        active_index: int = 0,
+        name: str = "/diffuser_plan",
+        point_size: float = 0.0009,
+        line_width: float = 1.0,
+        axes_length: float = 0.008,
+        axes_radius: float = 0.0015,
+    ) -> None:
+        import viser.transforms
+
+        if trajectory is None:
+            self.clear_plan_waypoints()
+            return
+
+        trajectory = np.asarray(trajectory, dtype=float)
+        if trajectory.ndim != 2 or trajectory.shape[1] < 3:
+            raise ValueError(f"Expected trajectory shape (N, >=3), got {trajectory.shape}")
+        if len(trajectory) == 0:
+            self.clear_plan_waypoints()
+            return
+
+        active_index = int(np.clip(active_index, 0, len(trajectory) - 1))
+        T_base_to_root = self.urdf_model.get_transform("fr3_link0")
+        R_base_to_root = T_base_to_root[:3, :3]
+        points = (R_base_to_root @ trajectory[:, :3].T).T + T_base_to_root[:3, 3]
+
+        colors = np.full((len(points), 3), (80, 160, 255), dtype=np.uint8)
+        colors[:active_index] = (145, 145, 145)
+        colors[active_index] = (255, 210, 60)
+
+        if self._plan_point_handle is not None:
+            self._plan_point_handle.remove()
+        self._plan_point_handle = self.server.scene.add_point_cloud(
+            name=f"{name}/waypoints",
+            points=points.astype(np.float32),
+            colors=colors,
+            point_size=point_size,
+            point_shape="circle",
+        )
+
+        if self._plan_line_handle is not None:
+            self._plan_line_handle.remove()
+        if len(points) > 1:
+            segments = np.stack([points[:-1], points[1:]], axis=1).astype(np.float32)
+            segment_colors = np.stack([colors[:-1], colors[1:]], axis=1)
+            self._plan_line_handle = self.server.scene.add_line_segments(
+                name=f"{name}/segments",
+                points=segments,
+                colors=segment_colors,
+                line_width=line_width,
+            )
+        else:
+            self._plan_line_handle = None
+
+        for handle in self._plan_frame_handles:
+            handle.remove()
+        self._plan_frame_handles = []
+        if trajectory.shape[1] < 6:
+            return
+
+        from scipy.spatial.transform import Rotation as R
+
+        rotations = R.from_euler("XYZ", trajectory[:, 3:6]).as_matrix()
+        for i, (point, rot_base) in enumerate(zip(points, rotations)):
+            T = np.eye(4)
+            T[:3, :3] = R_base_to_root @ rot_base
+            T[:3, 3] = point
+            handle = self.server.scene.add_frame(
+                f"{name}/frame_{i:02d}",
+                axes_length=axes_length * (1.35 if i == active_index else 1.0),
+                axes_radius=axes_radius,
+            )
+            handle.wxyz = viser.transforms.SO3.from_matrix(T[:3, :3]).wxyz
+            handle.position = T[:3, 3]
+            self._plan_frame_handles.append(handle)
