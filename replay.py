@@ -91,7 +91,7 @@ def run_replay(cfg: DictConfig):
                 connection_type=gc.connection_type,
                 tcp_host=gc.tcp_host,
                 tcp_port=int(gc.tcp_port),
-                auto_activate=bool(gc.activate_on_start),
+                auto_activate=True,
             )
         except Exception as e:
             print(f"  [gripper] Failed to initialize: {e}")

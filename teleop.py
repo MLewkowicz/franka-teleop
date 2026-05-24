@@ -148,7 +148,7 @@ def run_teleop(cfg: DictConfig):
                 connection_type=gc.connection_type,
                 tcp_host=gc.tcp_host,
                 tcp_port=int(gc.tcp_port),
-                auto_activate=bool(gc.activate_on_start),
+                auto_activate=True,
             )
             print("Robotiq gripper proxy ready.")
         except Exception as e:
