@@ -391,7 +391,7 @@ def main(cfg: DictConfig) -> int:
     reset_joint_config = np.asarray(cfg.teleop.reset_joint_config, dtype=float)
     logger.info(f"Resetting to start config {reset_joint_config}")
     robot.move(JointMotion(JointState(reset_joint_config),
-                            relative_dynamics_factor=0.2),
+                            relative_dynamics_factor=0.1),
                asynchronous=False)
 
     mouse = None

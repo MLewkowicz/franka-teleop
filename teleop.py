@@ -227,7 +227,7 @@ def run_teleop(cfg: DictConfig):
                 print("  Resetting to start config (release LEFT to stop)...")
                 robot.move(JointMotion(
                     JointState(reset_joint_config),
-                    relative_dynamics_factor=float(tc.get("reset_dynamics_factor", 0.1)),
+                    relative_dynamics_factor=0.1,
                 ), asynchronous=True)
                 motion_done = threading.Event()
                 threading.Thread(
