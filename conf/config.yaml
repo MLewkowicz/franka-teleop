@@ -26,6 +26,14 @@ teleop:
     translation_deadband: 0.08
     rotation_deadband: 0.08
 
+demonstrate:
+  joint_stiffness: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  joint_friction:
+    enabled: true
+    coulomb: [0.5, 0.4, 0.5, 0.4, 0.4, 0.4, 0.2]
+    viscous: [0.08, 0.05, 0.08, 0.05, 0.08, 0.08, 0.05]
+  button_debounce_s: 0.35
+
 cameras:
   third_person:
     name: third_person

@@ -21,6 +21,9 @@ def main(cfg: DictConfig):
     if cfg.mode == "teleop":
         from teleop import run_teleop
         run_teleop(cfg)
+    elif cfg.mode == "demonstrate":
+        from demonstrate import run_demonstrate
+        run_demonstrate(cfg)
     elif cfg.mode == "replay":
         from replay import run_replay
         run_replay(cfg)
