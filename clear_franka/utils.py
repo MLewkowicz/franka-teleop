@@ -1,4 +1,5 @@
 import select
+import subprocess
 import sys
 import time
 from contextlib import contextmanager
@@ -24,6 +25,17 @@ def wait_for_enter(timeout_s: float) -> bool:
         return False
     sys.stdin.readline()
     return True
+
+
+def announce(text: str) -> None:
+    try:
+        subprocess.Popen(
+            ["espeak", text],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        print(f"  [voice] {text}")
 
 
 class LoopRatePrinter:

@@ -23,6 +23,14 @@ _GRIPPER_TCP_VISER_PATH = (
     "/robotiq_arg2f_base_link/robotiq_arg2f_tcp"
 )
 
+
+def _hand_camera_frame_path(name: str) -> str:
+    """Resolve a hand-camera frame name under the gripper TCP frame."""
+    name = str(name)
+    if name == _GRIPPER_TCP_VISER_PATH or name.startswith(f"{_GRIPPER_TCP_VISER_PATH}/"):
+        return name
+    return f"{_GRIPPER_TCP_VISER_PATH}/{name.strip('/')}"
+
 ROBOT_XACRO_ARGS = {
     "robot_name": "cortado",
     "wrist_camera": "true",
@@ -242,7 +250,7 @@ class CortadoViserVisualizer:
         T_cam2base: np.ndarray,
         axes_length: float = 0.08,
         axes_radius: float = 0.003,
-    ) -> None:
+    ) -> str:
         import viser.transforms
 
         T_cam2base = np.asarray(T_cam2base, dtype=float)
@@ -258,10 +266,11 @@ class CortadoViserVisualizer:
         )
         frame.wxyz = viser.transforms.SO3.from_matrix(T_cam2root[:3, :3]).wxyz
         frame.position = T_cam2root[:3, 3]
+        return name
 
-    def add_camera_frame_from_extrinsics(self, name: str, extrinsics_path: str | Path) -> None:
+    def add_camera_frame_from_extrinsics(self, name: str, extrinsics_path: str | Path) -> str:
         T_cam2base = load_T_cam2base(extrinsics_path)
-        self.add_camera_frame(name, T_cam2base)
+        return self.add_camera_frame(name, T_cam2base)
 
     def add_hand_camera_frame(
         self,
@@ -269,24 +278,26 @@ class CortadoViserVisualizer:
         T_cam2gripper: np.ndarray,
         axes_length: float = 0.08,
         axes_radius: float = 0.003,
-    ) -> None:
+    ) -> str:
         import viser.transforms
 
         T_cam2gripper = np.asarray(T_cam2gripper, dtype=float)
         if T_cam2gripper.shape != (4, 4):
             raise ValueError(f"Expected a 4x4 camera transform, got {T_cam2gripper.shape}")
 
+        frame_name = _hand_camera_frame_path(name)
         frame = self.server.scene.add_frame(
-            f"{_GRIPPER_TCP_VISER_PATH}/{name}",
+            frame_name,
             axes_length=axes_length,
             axes_radius=axes_radius,
         )
         frame.wxyz = viser.transforms.SO3.from_matrix(T_cam2gripper[:3, :3]).wxyz
         frame.position = T_cam2gripper[:3, 3]
+        return frame_name
 
-    def add_hand_camera_frame_from_extrinsics(self, name: str, extrinsics_path: str | Path) -> None:
+    def add_hand_camera_frame_from_extrinsics(self, name: str, extrinsics_path: str | Path) -> str:
         T_cam2gripper = load_T_cam2gripper(extrinsics_path)
-        self.add_hand_camera_frame(name, T_cam2gripper)
+        return self.add_hand_camera_frame(name, T_cam2gripper)
 
     def update_pointcloud(
         self,

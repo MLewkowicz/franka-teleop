@@ -67,31 +67,30 @@ gripper:
   force: 255
 
 visualization:
-  viser:
-    enabled: false
-    host: "0.0.0.0"
-    port: 8080
-    update_hz: 30.0
-    pointclouds:
-      third_person:
-        enabled: false
-        extrinsics_path: "/home/clear/franka-teleop/data/extrinsics_third_person.json"
-        frame_name: /third_person_zed
-        update_hz: 5.0
-        stride: 4
-        max_points: 100000
-        max_distance_m: 3.0
-        point_size: 0.01
-      hand:
-        enabled: false
-        extrinsics_path: "/home/clear/franka-teleop/data/extrinsics_hand.json"
-        # Child of the Franka end-effector/flange frame in the viser URDF.
-        frame_name: /cortado/fr3_link8/hand_zed
-        update_hz: 5.0
-        stride: 4
-        max_points: 100000
-        max_distance_m: 3.0
-        point_size: 0.01
+  enabled: false
+  host: "0.0.0.0"
+  port: 8080
+  update_hz: 30.0
+  pointclouds:
+    third_person:
+      enabled: false
+      extrinsics_path: "/home/clear/franka-teleop/data/extrinsics_third_person.json"
+      frame_name: /third_person_zed
+      update_hz: 5.0
+      stride: 4
+      max_points: 100000
+      max_distance_m: 3.0
+      point_size: 0.01
+    hand:
+      enabled: false
+      extrinsics_path: "/home/clear/franka-teleop/data/extrinsics_hand.json"
+      # Child of the Franka end-effector/flange frame in the viser URDF.
+      frame_name: /cortado/fr3_link8/hand_zed
+      update_hz: 5.0
+      stride: 4
+      max_points: 100000
+      max_distance_m: 3.0
+      point_size: 0.01
 
 recorder:
   record_svo: false           # true = native ZED SVO2 files; false = HDF5 frames
@@ -126,12 +125,6 @@ calibration:
   min_charuco_corners: 12             # require for capture if fewer corners
   reprojection_error_max_px: 1.5      # mean reprojection error threshold
   board_position_std_max_mm: 5.0      # per-axis std of recovered board origin
-
-  kinesthetic:
-    # Low joint impedance so the operator can backdrive the arm by hand.
-    # Franka's built-in gravity comp keeps the arm afloat; the tracker just
-    # damps oscillation. Bump these up if the arm drifts under load.
-    joint_stiffness: [5.0, 5.0, 5.0, 5.0, 3.0, 3.0, 2.0]
 
   board:
     # Physical printed ChArUco board. Must match what is mounted to the gripper.

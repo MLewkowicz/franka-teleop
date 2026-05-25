@@ -9,7 +9,6 @@ Press Ctrl-C to stop.
 """
 
 import contextlib
-import threading
 import time
 
 import numpy as np
@@ -23,7 +22,11 @@ from clear_franka.recorder import TrajectoryRecorder
 from clear_franka.robotiq_net_proxy import RobotiqGripperProxy
 from clear_franka.utils import LoopRatePrinter
 
-from clear_franka.franka import DEFAULT_LOWER_JOINT_LIMITS, DEFAULT_UPPER_JOINT_LIMITS
+from clear_franka.franka import (
+    DEFAULT_LOWER_JOINT_LIMITS,
+    DEFAULT_UPPER_JOINT_LIMITS,
+    stop_tracker_motion,
+)
 
 RESET_LONG_PRESS_S = 0.8
 
@@ -37,7 +40,7 @@ def run_teleop(cfg: DictConfig):
     sc = tc.spacemouse
     reset_joint_config = np.asarray(tc.reset_joint_config, dtype=float)
     gc = cfg.get("gripper", {})
-    vc = cfg.get("visualization", {}).get("viser", {})
+    vc = cfg.get("visualization", {})
     pointcloud_cfg = vc.get("pointclouds", {})
     pointcloud_source = next(
         (name for name in ("third_person", "hand") if pointcloud_cfg.get(name, {}).get("enabled", False)),
@@ -157,45 +160,42 @@ def run_teleop(cfg: DictConfig):
 
     visualizer = None
     camera_frame_added = False
+    pointcloud_frame_name = None
     if vc.get("enabled", False):
-        try:
-            from clear_franka.visualization import CortadoViserVisualizer
+        from clear_franka.visualization import CortadoViserVisualizer
 
-            visualizer = CortadoViserVisualizer(
-                host=vc.get("host", "0.0.0.0"),
-                port=int(vc.get("port", 8080)),
+        visualizer = CortadoViserVisualizer(
+            host=vc.get("host", "0.0.0.0"),
+            port=int(vc.get("port", 8080)),
+        )
+        visualizer.update_gripper_width(
+            gc.get("open_width_m", 0.085) if gripper_open else gc.get("close_width_m", 0.0),
+            max_width_m=gc.get("max_width_m", 0.085),
+        )
+        if pointcloud_enabled and pointcloud_camera is not None:
+            frame_name = pc.get(
+                "frame_name",
+                "hand_zed" if pointcloud_source == "hand" else "/third_person_zed",
             )
-            visualizer.update_gripper_width(
-                gc.get("open_width_m", 0.085) if gripper_open else gc.get("close_width_m", 0.0),
-                max_width_m=gc.get("max_width_m", 0.085),
-            )
-            if pointcloud_enabled and pointcloud_camera is not None:
-                frame_name = pc.get("frame_name", "/third_person_zed")
-                if pointcloud_source == "hand":
-                    visualizer.add_hand_camera_frame_from_extrinsics(
-                        frame_name,
-                        pc.get("extrinsics_path", "./data/extrinsics_hand.json"),
-                    )
-                else:
-                    visualizer.add_camera_frame_from_extrinsics(
-                        frame_name,
-                        pc.get("extrinsics_path", "./data/extrinsics_third_person.json"),
-                    )
-                camera_frame_added = True
-                pointcloud_camera.start_pointcloud_stream(
-                    update_hz=float(pc.get("update_hz", 5.0)),
-                    stride=int(pc.get("stride", 4)),
-                    max_points=int(pc.get("max_points", 100_000)),
-                    max_distance_m=float(pc.get("max_distance_m", 3.0)),
+            if pointcloud_source == "hand":
+                pointcloud_frame_name = visualizer.add_hand_camera_frame_from_extrinsics(
+                    frame_name,
+                    pc.get("extrinsics_path", "./data/extrinsics_hand.json"),
                 )
-                print(f"  [viser] {pointcloud_source} ZED point cloud enabled.")
-        except Exception as e:
-            print(f"  [viser] Failed to initialize: {e}")
-            if vc.get("required", False):
-                raise
-            print("  Continuing without viser.")
-            visualizer = None
-            pointcloud_enabled = False
+            else:
+                pointcloud_frame_name = visualizer.add_camera_frame_from_extrinsics(
+                    frame_name,
+                    pc.get("extrinsics_path", "./data/extrinsics_third_person.json"),
+                )
+            camera_frame_added = True
+            pointcloud_camera.start_pointcloud_stream(
+                update_hz=float(pc.get("update_hz", 5.0)),
+                stride=int(pc.get("stride", 4)),
+                max_points=int(pc.get("max_points", 100_000)),
+                max_distance_m=float(pc.get("max_distance_m", 3.0)),
+            )
+            print(f"  [viser] {pointcloud_source} ZED point cloud enabled.")
+
 
     print("SpaceMouse teleop ready.")
     print("  Tap LEFT to toggle motion on/off.")
@@ -209,6 +209,7 @@ def run_teleop(cfg: DictConfig):
 
     loop_rate = LoopRatePrinter()
     reset_pending = False
+    suppress_left_until_release = False
     with contextlib.ExitStack() as stack:
         for cam in cameras.values():
             stack.enter_context(cam)
@@ -229,13 +230,8 @@ def run_teleop(cfg: DictConfig):
                     JointState(reset_joint_config),
                     relative_dynamics_factor=0.1,
                 ), asynchronous=True)
-                motion_done = threading.Event()
-                threading.Thread(
-                    target=lambda: (robot.join_motion(), motion_done.set()),
-                    daemon=True,
-                ).start()
                 stopped_early = False
-                while not motion_done.is_set():
+                while not robot.join_motion(0.01):
                     sample = mouse.get_controller_state()
                     if sample is not None:
                         buttons = np.asarray(sample.buttons, dtype=int)
@@ -246,9 +242,10 @@ def run_teleop(cfg: DictConfig):
                         robot.move(JointStopMotion())
                         stopped_early = True
                         break
-                    time.sleep(0.01)
-                motion_done.wait()
+                if stopped_early:
+                    robot.join_motion(2)
                 print("  Reset stopped." if stopped_early else "  Reset complete.")
+                suppress_left_until_release = True
 
             enabled = False
             prev_button = 0
@@ -258,14 +255,15 @@ def run_teleop(cfg: DictConfig):
             left_press_time = None
             left_used_in_record = False
 
-            with robot.start_cartesian_impedance_session(
+            session = robot.start_cartesian_impedance_session(
                 period=0.001,
                 translational_stiffness=tc.translational_stiffness,
                 rotational_stiffness=tc.rotational_stiffness,
                 nullspace_stiffness=tc.nullspace_stiffness,
                 lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
                 upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
-            ) as session:
+            )
+            try:
                 try:
                     teleop_state = robot.get_last_teleop_state()
                     initial_pose = np.asarray(teleop_state["O_T_EE"], dtype=float)
@@ -282,6 +280,11 @@ def run_teleop(cfg: DictConfig):
                         buttons = np.asarray(sample.buttons, dtype=int)
                         button = int(buttons[0]) if len(buttons) > 0 else 0
                         right_button = int(buttons[1]) if len(buttons) > 1 else 0
+                        if suppress_left_until_release:
+                            if button:
+                                button = 0
+                            else:
+                                suppress_left_until_release = False
                         record_button = button and right_button
 
                         # Track left-alone press start for long-press detection
@@ -360,12 +363,8 @@ def run_teleop(cfg: DictConfig):
                                     points, colors, timestamp = latest_pointcloud
                                     if timestamp != last_pointcloud_timestamp:
                                         visualizer.update_pointcloud(
-                                            pc.get(
-                                                "frame_name",
-                                                "/cortado/fr3_link8/hand_zed"
-                                                if pointcloud_source == "hand"
-                                                else "/third_person_zed",
-                                            ),
+                                            pointcloud_frame_name
+                                            or pc.get("frame_name", "/third_person_zed"),
                                             points,
                                             colors,
                                             point_size=float(pc.get("point_size", 0.01)),
@@ -417,3 +416,5 @@ def run_teleop(cfg: DictConfig):
                     loop_rate.newline()
                     print(f"\n  Controller faulted: {e}")
                     print("  Recovering... tap button to re-enable.")
+            finally:
+                stop_tracker_motion(robot, session, join_timeout=1.0, idle_timeout_s=2.0)
