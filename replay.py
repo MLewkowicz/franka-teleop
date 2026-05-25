@@ -31,6 +31,117 @@ def load_episode(path: Path) -> dict:
     return data
 
 
+def prompt_reverse_reset() -> bool:
+    try:
+        answer = input("  Play trajectory in reverse to reset robot? [Y/n] ").strip().lower()
+    except EOFError:
+        print("  Reverse reset skipped (no input available).")
+        return False
+    return answer in ("", "y", "yes")
+
+
+def play_joint_trajectory(
+    *,
+    robot: Robot,
+    rc: DictConfig,
+    gc,
+    stiffness: np.ndarray,
+    timestamps: np.ndarray,
+    joint_pos: np.ndarray,
+    joint_vel: np.ndarray,
+    has_joint_vel: bool,
+    gripper,
+    gripper_open_data,
+    recorder=None,
+    gripper_open_for_record=None,
+    complete_message: str = "Replay complete.",
+):
+    n_steps = len(timestamps)
+
+    with robot.start_joint_impedance_session(
+        period=rc.period,
+        stiffness=stiffness.tolist(),
+        lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
+        upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
+    ) as session:
+        step = 0
+        replay_start = None
+        last_gripper_open = None
+
+        while True:
+            if replay_start is None:
+                replay_start = time.monotonic()
+
+            elapsed = (time.monotonic() - replay_start) * rc.speed
+
+            while step < n_steps - 1 and timestamps[step + 1] <= elapsed:
+                step += 1
+
+            if step >= n_steps - 1:
+                print(f"  {complete_message}")
+                session.set_joint_reference(joint_pos[-1].tolist())
+                break
+
+            q = joint_pos[step]
+            if has_joint_vel:
+                dq = joint_vel[step] * rc.speed
+                session.set_joint_reference(q.tolist(), velocity=dq.tolist())
+            else:
+                session.set_joint_reference(q.tolist())
+
+            if gripper is not None and np.isfinite(gripper_open_data[step]):
+                current_gripper_open = bool(round(float(gripper_open_data[step])))
+                if current_gripper_open != last_gripper_open:
+                    target_width = (
+                        gc.get("open_width_m", 0.085)
+                        if current_gripper_open
+                        else gc.get("close_width_m", 0.0)
+                    )
+                    try:
+                        gripper.move_width(
+                            target_width,
+                            speed=int(gc.get("speed", 255)),
+                            force=int(gc.get("force", 255)),
+                            wait=False,
+                            max_width_m=gc.get("max_width_m", 0.085),
+                        )
+                        last_gripper_open = current_gripper_open
+                        gripper_open_for_record = current_gripper_open
+                    except Exception as e:
+                        print(f"\n  [gripper] move failed: {e}")
+
+            if recorder is not None:
+                teleop_state = robot.get_last_teleop_state()
+                measured_pose = np.asarray(teleop_state["O_T_EE"], dtype=float).reshape(4, 4)
+                recorder.step(
+                    ee_pos=measured_pose[:3, 3],
+                    ee_rot=measured_pose[:3, :3],
+                    cmd_linear_vel=np.zeros(3),
+                    cmd_angular_vel=np.zeros(3),
+                    buttons=0,
+                    enabled=True,
+                    joint_pos=np.asarray(teleop_state["q"], dtype=float),
+                    joint_vel=np.asarray(teleop_state["dq"], dtype=float),
+                    gripper_open=gripper_open_for_record,
+                    robot_abs_time=float(teleop_state["abs_time"]),
+                )
+
+            time.sleep(rc.period)
+
+    return gripper_open_for_record
+
+
+def play_with_recovery(**kwargs):
+    robot = kwargs["robot"]
+    while True:
+        robot.recover_from_errors()
+        try:
+            return play_joint_trajectory(**kwargs)
+        except RuntimeError as e:
+            print(f"\n  Controller faulted: {e}")
+            print("  Recovering and retrying...")
+
+
 def run_replay(cfg: DictConfig):
     rc = cfg.replay
     gc = cfg.get("gripper", {})
@@ -100,6 +211,7 @@ def run_replay(cfg: DictConfig):
     print(f"  Pre-positioning to start configuration...")
     robot.move(JointMotion(
         JointState(joint_pos[0]),
+        relative_dynamics_factor=0.1,
     ))
 
     gripper_open_for_record = None
@@ -127,7 +239,7 @@ def run_replay(cfg: DictConfig):
             cameras[name] = make_zed_camera(cfg, name)
             cameras[name].run()
 
-        vc = cfg.get("visualization", {}).get("viser", {})
+        vc = cfg.get("visualization", {})
         extrinsics_metadata = {}
         for cam_name in cameras:
             ext_path = vc.get("pointclouds", {}).get(cam_name, {}).get(
@@ -153,85 +265,47 @@ def run_replay(cfg: DictConfig):
         recorder.start()
 
     try:
-        while True:
-            robot.recover_from_errors()
+        gripper_open_for_record = play_with_recovery(
+            robot=robot,
+            rc=rc,
+            gc=gc,
+            stiffness=stiffness,
+            timestamps=timestamps,
+            joint_pos=joint_pos,
+            joint_vel=joint_vel,
+            has_joint_vel=has_joint_vel,
+            gripper=gripper,
+            gripper_open_data=gripper_open_data,
+            recorder=recorder,
+            gripper_open_for_record=gripper_open_for_record,
+        )
+        if recorder is not None:
+            recorder.close()
+            recorder = None
 
-            try:
-                with robot.start_joint_impedance_session(
-                    period=rc.period,
-                    stiffness=stiffness.tolist(),
-                    lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
-                    upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
-                ) as session:
-                    step = 0
-                    replay_start = None
-                    last_gripper_open = None
-
-                    while True:
-                        if replay_start is None:
-                            replay_start = time.monotonic()
-
-                        elapsed = (time.monotonic() - replay_start) * rc.speed
-
-                        while step < n_steps - 1 and timestamps[step + 1] <= elapsed:
-                            step += 1
-
-                        if step >= n_steps - 1:
-                            print("  Replay complete.")
-                            session.set_joint_reference(joint_pos[-1].tolist())
-                            break
-
-                        q = joint_pos[step]
-                        if has_joint_vel:
-                            dq = joint_vel[step] * rc.speed
-                            session.set_joint_reference(q.tolist(), velocity=dq.tolist())
-                        else:
-                            session.set_joint_reference(q.tolist())
-
-                        if gripper is not None and np.isfinite(gripper_open_data[step]):
-                            current_gripper_open = bool(round(float(gripper_open_data[step])))
-                            if current_gripper_open != last_gripper_open:
-                                target_width = (
-                                    gc.get("open_width_m", 0.085)
-                                    if current_gripper_open
-                                    else gc.get("close_width_m", 0.0)
-                                )
-                                try:
-                                    gripper.move_width(
-                                        target_width,
-                                        speed=int(gc.get("speed", 255)),
-                                        force=int(gc.get("force", 255)),
-                                        wait=False,
-                                        max_width_m=gc.get("max_width_m", 0.085),
-                                    )
-                                    last_gripper_open = current_gripper_open
-                                    gripper_open_for_record = current_gripper_open
-                                except Exception as e:
-                                    print(f"\n  [gripper] move failed: {e}")
-
-                        if recorder is not None:
-                            teleop_state = robot.get_last_teleop_state()
-                            measured_pose = np.asarray(teleop_state["O_T_EE"], dtype=float).reshape(4, 4)
-                            recorder.step(
-                                ee_pos=measured_pose[:3, 3],
-                                ee_rot=measured_pose[:3, :3],
-                                cmd_linear_vel=np.zeros(3),
-                                cmd_angular_vel=np.zeros(3),
-                                buttons=0,
-                                enabled=True,
-                                joint_pos=np.asarray(teleop_state["q"], dtype=float),
-                                joint_vel=np.asarray(teleop_state["dq"], dtype=float),
-                                gripper_open=gripper_open_for_record,
-                                robot_abs_time=float(teleop_state["abs_time"]),
-                            )
-
-                        time.sleep(rc.period)
-
-                break
-
-            except RuntimeError as e:
-                print(f"\n  Controller faulted: {e}")
-                print("  Recovering and retrying...")
+        if prompt_reverse_reset():
+            reverse_timestamps = timestamps[-1] - timestamps[::-1]
+            reverse_joint_pos = joint_pos[::-1]
+            reverse_joint_vel = -joint_vel[::-1] if has_joint_vel else joint_vel[::-1]
+            reverse_gripper_open_data = (
+                gripper_open_data[::-1] if gripper_open_data is not None else gripper_open_data
+            )
+            play_with_recovery(
+                robot=robot,
+                rc=rc,
+                gc=gc,
+                stiffness=stiffness,
+                timestamps=reverse_timestamps,
+                joint_pos=reverse_joint_pos,
+                joint_vel=reverse_joint_vel,
+                has_joint_vel=has_joint_vel,
+                gripper=gripper,
+                gripper_open_data=reverse_gripper_open_data,
+                gripper_open_for_record=gripper_open_for_record,
+                complete_message="Reverse reset complete.",
+            )
+        else:
+            print("  Reverse reset skipped.")
 
     except KeyboardInterrupt:
         print("\n  Replay aborted.")
