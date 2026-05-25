@@ -119,6 +119,9 @@ deploy:
   # Sized from the recorded teleop's ee_pos range with a small buffer; tighten before serious runs.
   workspace_lo: [0.30, -0.35, 0.02]
   workspace_hi: [0.85,  0.20, 0.85]
+  translational_stiffness: 2000.0
+  rotational_stiffness: 50.0
+  nullspace_stiffness: 0.0
 
 calibration:
   camera_mount: third_person           # third_person | hand

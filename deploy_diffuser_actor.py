@@ -373,7 +373,7 @@ def main(cfg: DictConfig) -> int:
         gripper.move_width(gc.open_width_m, wait=False)
 
     # ----- visualization -----
-    vc = cfg.get("visualization", {}).get("viser", {})
+    vc = cfg.get("visualization", {})
     visualizer = CortadoViserVisualizer(
         host=vc.get("host", "0.0.0.0"),
         port=int(vc.get("port", 8080)),
@@ -422,9 +422,9 @@ def main(cfg: DictConfig) -> int:
         stack.callback(rate.newline)
         tracker = stack.enter_context(robot.start_cartesian_impedance_session(
             period=0.001,
-            translational_stiffness=cfg.teleop.translational_stiffness,
-            rotational_stiffness=cfg.teleop.rotational_stiffness,
-            nullspace_stiffness=0.0,
+            translational_stiffness=cfg.deploy.translational_stiffness,
+            rotational_stiffness=cfg.deploy.rotational_stiffness,
+            nullspace_stiffness=cfg.deploy.nullspace_stiffness,
             lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
             upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
         ))
