@@ -101,8 +101,7 @@ replay:
   speed: 1.0
   period: 0.001
   # Joint impedance gains. Stiffer = better tracking, less compliance.
-  # [50, 50, 50, 50, 20, 20, 10] is a reasonable starting point; tune per arm.
-  joint_stiffness: [80.0, 80.0, 80.0, 80.0, 30.0, 30.0, 15.0]
+  joint_stiffness: [320.0, 320.0, 320.0, 320.0, 120.0, 120.0, 60.0]
   # Pre-positioning move to the first joint configuration of the episode.
   record: false                     # save measured robot state as a new episode
 
