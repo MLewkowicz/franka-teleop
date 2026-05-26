@@ -22,7 +22,7 @@ primitive_vocab:
 object_vocab:
   glass: 0
 fps_subsampling_factor: 3
-gripper_loc_bounds: [[-0.3021, -0.2569, -0.2156], [0.3613, 0.3377, 0.1837]]
+gripper_loc_bounds: [[-0.228,-0.174,-0.278],[0.219,0.175,0.265]]
 rotation_parametrization: "6D"
 quaternion_format: "wxyz"
 diffusion_timesteps: 25
