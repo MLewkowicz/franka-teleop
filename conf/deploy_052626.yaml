@@ -27,7 +27,7 @@ rotation_parametrization: "6D"
 quaternion_format: "wxyz"
 diffusion_timesteps: 25
 nhist: 3
-relative: false
+relative: true
 lang_enhanced: true
 
 # Inference
