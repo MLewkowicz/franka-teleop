@@ -107,8 +107,7 @@ replay:
 
 deploy:
   # 3D Diffuser Actor MPC deployment (deploy_diffuser_actor.py).
-  # Resolve these paths to the actual files on the robot machine before launching.
-  policy_config: "/home/clear/LangSteer/conf/deploy_policy.yaml"        # mirrors LangSteer/conf/policy/diffuser_actor_primitive_object.yaml
+  policy_config: "/home/clear/franka-teleop/conf/deploy_052626.yaml"
   langsteer_path: "/home/clear/LangSteer"
   control_hz: 10                                  # Nominal DiffuserActor waypoint rate used to interpret action horizon timing.
   execution_hz: 100                              # Cartesian reference streaming rate; samples the retimed interpolation.
