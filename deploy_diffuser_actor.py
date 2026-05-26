@@ -192,30 +192,6 @@ def _extract_gripper_plan(action, horizon: int) -> np.ndarray:
     return np.full(horizon, float(action.gripper), dtype=np.float64)
 
 
-def _relative_action_trajectory_to_absolute(
-    trajectory: np.ndarray,
-    start_ee_pos: np.ndarray,
-    start_ee_rot: np.ndarray,
-) -> np.ndarray:
-    """Convert per-step deltas from the initial ee pose into absolute ee poses."""
-    from clear_franka.diffuser_actor_io import ee_rot_to_euler_xyz
-
-    absolute = np.asarray(trajectory, dtype=np.float64).copy()
-    if absolute.ndim != 2 or absolute.shape[1] < 6:
-        raise ValueError(
-            "DiffuserActor trajectory must have shape (horizon, >=6); "
-            f"got {absolute.shape}"
-        )
-
-    start_pose = np.concatenate([
-        np.asarray(start_ee_pos, dtype=np.float64),
-        np.asarray(ee_rot_to_euler_xyz(start_ee_rot), dtype=np.float64),
-    ])
-    absolute[:, :6] = start_pose[None, :] + absolute[:, :6]
-    absolute[:, 3:6] = (absolute[:, 3:6] + np.pi) % (2.0 * np.pi) - np.pi
-    return absolute
-
-
 def _plan_start_index(
     plan: InferencePlan,
     current_ee_pos: np.ndarray,
@@ -280,7 +256,6 @@ def _sample_cartesian_trajectory_positions(
 def _start_inference_worker(
     *,
     policy,
-    policy_relative: bool,
     policy_lock: threading.Lock,
     robot,
     cam_hand,
@@ -338,13 +313,9 @@ def _start_inference_worker(
                     action = policy.forward(obs)
                 forward_s = time.monotonic() - forward_started_at
 
+                # DiffuserActorBasePolicy.forward() already converts relative
+                # model outputs into absolute poses before returning Action.
                 trajectory = np.asarray(action.trajectory, dtype=np.float64).copy()
-                if policy_relative:
-                    trajectory = _relative_action_trajectory_to_absolute(
-                        trajectory,
-                        ee_pos,
-                        ee_rot,
-                    )
                 horizon = trajectory.shape[0]
                 if not enabled_event.is_set():
                     continue
@@ -404,7 +375,6 @@ def main(cfg: DictConfig) -> int:
 
     # ----- policy -----
     policy, policy_relative = _build_policy(cfg.deploy)
-    logger.info("Policy action mode: %s", "relative deltas" if policy_relative else "absolute poses")
 
     # Stage 0: grasp, Stage 1: place — primitive ids in the trained vocab.
     stages = [
@@ -504,7 +474,6 @@ def main(cfg: DictConfig) -> int:
         stack.callback(robot.stop_state_stream)
         inference_thread = _start_inference_worker(
             policy=policy,
-            policy_relative=policy_relative,
             policy_lock=policy_lock,
             robot=robot,
             cam_hand=cam_hand,
