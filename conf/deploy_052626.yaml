@@ -3,7 +3,7 @@
 # Any drift here vs the trainer config will cause silent shape/index errors.
 
 name: diffuser_actor
-ckpt_path: "/home/clear/franka-teleop/checkpoints/wine_052626.pth"
+ckpt_path: "/home/clear/franka-teleop/checkpoints/wine_052626_final.pth"
 device: "cuda"
 
 # Architecture — identical to the trained checkpoint.
