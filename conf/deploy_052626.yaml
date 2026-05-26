@@ -3,7 +3,7 @@
 # Any drift here vs the trainer config will cause silent shape/index errors.
 
 name: diffuser_actor
-ckpt_path: null   # populated via deploy.checkpoint on the CLI
+ckpt_path: "/home/clear/franka-teleop/checkpoints/best.pth"
 device: "cuda"
 
 # Architecture — identical to the trained checkpoint.

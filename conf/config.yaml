@@ -108,18 +108,16 @@ replay:
 deploy:
   # 3D Diffuser Actor MPC deployment (deploy_diffuser_actor.py).
   # Resolve these paths to the actual files on the robot machine before launching.
-  checkpoint: "/home/clear/franka-teleop/checkpoints/diffuser_actor_wine_glass.pth"                                 # path to last.pth / best.pth from train_diffuser_actor.py
   policy_config: "/home/clear/LangSteer/conf/deploy_policy.yaml"        # mirrors LangSteer/conf/policy/diffuser_actor_primitive_object.yaml
   langsteer_path: "/home/clear/LangSteer"
-  extrinsics_hand: "/home/clear/franka-teleop/data/extrinsics_hand.json"
-  extrinsics_third_person: "/home/clear/franka-teleop/data/extrinsics_third_person.json"
-  control_hz: 10                                  # MPC tick rate — DiffuserActor forward is ~50-100ms on a 5090
+  control_hz: 10                                  # Nominal DiffuserActor waypoint rate used to interpret action horizon timing.
+  execution_hz: 100                              # Cartesian reference streaming rate; samples the retimed interpolation.
   # Workspace safety box (base frame, metres). Cartesian targets are clipped here.
   # Sized from the recorded teleop's ee_pos range with a small buffer; tighten before serious runs.
   workspace_lo: [0.30, -0.35, 0.02]
   workspace_hi: [0.85,  0.20, 0.85]
-  translational_stiffness: 2000.0
-  rotational_stiffness: 50.0
+  translational_stiffness: 500.0
+  rotational_stiffness: 15.0
   nullspace_stiffness: 0.0
 
 calibration:

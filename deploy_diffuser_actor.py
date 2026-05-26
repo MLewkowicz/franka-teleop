@@ -94,17 +94,14 @@ def _build_policy(deploy_cfg: DictConfig):
 
     policy_cfg = OmegaConf.load(deploy_cfg.policy_config)
 
-    # Allow overrides on the CLI (e.g. deploy.policy.embedding_dim=192).
-    if "policy_overrides" in deploy_cfg and deploy_cfg.policy_overrides:
-        policy_cfg = OmegaConf.merge(policy_cfg,
-                                     OmegaConf.create(deploy_cfg.policy_overrides))
+    checkpoint = policy_cfg.get("ckpt_path")
 
     # The factory reads use_primitive_id / use_object_id from cfg, so make
     # sure the policy yaml has them.
     policy = build_diffuser_actor_policy(policy_cfg)
-    policy.load_checkpoint(deploy_cfg.checkpoint)
+    policy.load_checkpoint(checkpoint)
     policy.reset()
-    return policy
+    return policy, bool(policy_cfg.get("relative", False))
 
 
 # ---------------------------------------------------------------------------
