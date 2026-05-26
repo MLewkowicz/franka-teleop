@@ -1,23 +1,21 @@
 """Deploy a trained 3D Diffuser Actor checkpoint on the real Franka.
 
-MPC-style: an inference worker continuously grabs two ZED frames + the current
-end-effector pose, builds a `core.types.Observation`, and calls
-`policy.forward(obs)` to produce an absolute trajectory. The main loop streams
-the freshest trajectory suffix to the Cartesian impedance controller while the
-next inference pass is already running. The gripper command is issued when the
-executed trajectory step flips relative to what we last commanded.
+Chunked playback: an inference worker grabs two ZED frames + the current
+end-effector pose when the executor asks for a new plan, builds a
+`core.types.Observation`, and calls `policy.forward(obs)` to produce an
+absolute trajectory. The main loop executes that trajectory to completion
+before requesting another one. If execution stalls past a timeout, the executor
+abandons the old plan and pauses while the worker generates a replacement. The
+gripper command is issued when the executed trajectory step flips relative to
+what we last commanded.
 
 Stage transitions (grasp → place → done) are driven by SpaceMouse buttons:
     LEFT  short tap   → toggle ENABLED (closed-loop control on/off)
     RIGHT short tap   → advance stage (grasp → place → exit)
-    LEFT  long press  → reset to start joint config (same as teleop)
 
 Launch:
     uv run python deploy_diffuser_actor.py \\
-        deploy.checkpoint=/path/to/last.pth \\
         deploy.policy_config=/path/to/policy.yaml \\
-        deploy.extrinsics_hand=./data/extrinsics_hand.json \\
-        deploy.extrinsics_third_person=./data/extrinsics_third_person.json \\
         deploy.langsteer_path=$HOME/Documents/michal/LangSteer
 """
 
@@ -194,10 +192,34 @@ def _extract_gripper_plan(action, horizon: int) -> np.ndarray:
     return np.full(horizon, float(action.gripper), dtype=np.float64)
 
 
+def _relative_action_trajectory_to_absolute(
+    trajectory: np.ndarray,
+    start_ee_pos: np.ndarray,
+    start_ee_rot: np.ndarray,
+) -> np.ndarray:
+    """Convert per-step deltas from the initial ee pose into absolute ee poses."""
+    from clear_franka.diffuser_actor_io import ee_rot_to_euler_xyz
+
+    absolute = np.asarray(trajectory, dtype=np.float64).copy()
+    if absolute.ndim != 2 or absolute.shape[1] < 6:
+        raise ValueError(
+            "DiffuserActor trajectory must have shape (horizon, >=6); "
+            f"got {absolute.shape}"
+        )
+
+    start_pose = np.concatenate([
+        np.asarray(start_ee_pos, dtype=np.float64),
+        np.asarray(ee_rot_to_euler_xyz(start_ee_rot), dtype=np.float64),
+    ])
+    absolute[:, :6] = start_pose[None, :] + absolute[:, :6]
+    absolute[:, 3:6] = (absolute[:, 3:6] + np.pi) % (2.0 * np.pi) - np.pi
+    return absolute
+
+
 def _plan_start_index(
     plan: InferencePlan,
     current_ee_pos: np.ndarray,
-    control_dt: float,
+    plan_dt: float,
     now: float,
 ) -> int:
     horizon = len(plan.trajectory)
@@ -206,35 +228,59 @@ def _plan_start_index(
 
     distances = np.linalg.norm(plan.trajectory[:, :3] - current_ee_pos[None, :], axis=1)
     closest_next = int(np.argmin(distances)) + 1
-    latency_skip = int(max(0.0, now - plan.obs_started_at) / control_dt)
+    latency_skip = int(max(0.0, now - plan.obs_started_at) / plan_dt)
     return min(max(1, closest_next, latency_skip), horizon - 1)
 
 
-def _advance_plan_index(
+def _make_cartesian_trajectory_for_plan(
     plan: InferencePlan,
-    active_index: int,
-    current_ee_pos: np.ndarray,
-    lookahead_steps: int = 1,
-    search_window: int = 5,
-) -> int:
-    horizon = len(plan.trajectory)
-    if horizon <= 1:
-        return 0
+    start_index: int,
+    plan_dt: float,
+    euler_to_matrix_fn,
+    *,
+    max_linear_vel: float,
+    max_angular_vel: float,
+    min_segment_dt: float,
+):
+    from clear_franka.cartesian_trajectory import CartesianTrajectory
 
-    active_index = int(np.clip(active_index, 0, horizon - 1))
-    search_end = min(horizon, active_index + max(1, int(search_window)))
-    local_xyz = plan.trajectory[active_index:search_end, :3]
-    if len(local_xyz) == 0:
-        return horizon - 1
+    suffix = plan.trajectory[start_index:, :6]
+    if len(suffix) == 1:
+        suffix = np.vstack([suffix, suffix])
+    times = np.arange(len(suffix), dtype=np.float64) * float(plan_dt)
+    trajectory = CartesianTrajectory.from_euler_xyz(
+        suffix,
+        times,
+        euler_to_matrix_fn=euler_to_matrix_fn,
+        smooth_orientation=True,
+    )
+    return trajectory.retime(
+        max_linear_vel=max_linear_vel,
+        max_angular_vel=max_angular_vel,
+        min_segment_dt=min_segment_dt,
+    )
 
-    distances = np.linalg.norm(local_xyz - current_ee_pos[None, :], axis=1)
-    closest = active_index + int(np.argmin(distances))
-    return min(max(active_index, closest + int(lookahead_steps)), horizon - 1)
+
+def _sample_cartesian_trajectory_positions(
+    trajectory,
+    dt: float,
+    max_samples: int = 500,
+) -> np.ndarray:
+    duration = float(trajectory.duration)
+    if duration <= 0.0:
+        position, _rotation = trajectory.interpolate(0.0)
+        return position.reshape(1, 3)
+
+    num_samples = max(int(np.ceil(duration / float(dt))) + 1, 2)
+    num_samples = min(num_samples, int(max_samples))
+    times = np.linspace(0.0, duration, num_samples)
+    return np.stack([trajectory.interpolate(t)[0] for t in times], axis=0)
 
 
 def _start_inference_worker(
     *,
     policy,
+    policy_relative: bool,
     policy_lock: threading.Lock,
     robot,
     cam_hand,
@@ -243,6 +289,7 @@ def _start_inference_worker(
     pre_tp,
     latest_plan: LatestPlanSlot,
     enabled_event: threading.Event,
+    request_event: threading.Event,
     stop_event: threading.Event,
     stage_state: dict[str, int],
 ) -> threading.Thread:
@@ -250,6 +297,11 @@ def _start_inference_worker(
         sequence = 0
         while not stop_event.is_set():
             if not enabled_event.wait(0.05):
+                continue
+            if not request_event.wait(0.05):
+                continue
+            request_event.clear()
+            if not enabled_event.is_set():
                 continue
 
             try:
@@ -262,6 +314,7 @@ def _start_inference_worker(
                 tp_frame = cam_tp.grab_frame()
                 if hand_frame is None or tp_frame is None:
                     logger.warning("Camera grab failed — skipping inference")
+                    request_event.set()
                     continue
                 rgb_hand_full, depth_hand_full = hand_frame
                 rgb_tp_full, depth_tp_full = tp_frame
@@ -278,16 +331,24 @@ def _start_inference_worker(
                     rgb_hand_200, pcd_hand_200,
                     ee_pos, ee_rot, stage_state["gripper_cmd"],
                 )
+                forward_started_at = time.monotonic()
                 with policy_lock:
                     stage_idx = stage_state["idx"]
                     epoch = stage_state["epoch"]
                     action = policy.forward(obs)
+                forward_s = time.monotonic() - forward_started_at
 
                 trajectory = np.asarray(action.trajectory, dtype=np.float64).copy()
+                if policy_relative:
+                    trajectory = _relative_action_trajectory_to_absolute(
+                        trajectory,
+                        ee_pos,
+                        ee_rot,
+                    )
                 horizon = trajectory.shape[0]
                 if not enabled_event.is_set():
                     continue
-                latest_plan.publish(InferencePlan(
+                plan = InferencePlan(
                     sequence=sequence,
                     stage_idx=stage_idx,
                     epoch=epoch,
@@ -295,7 +356,17 @@ def _start_inference_worker(
                     obs_started_at=obs_started_at,
                     trajectory=trajectory,
                     gripper=_extract_gripper_plan(action, horizon),
-                ))
+                )
+                latest_plan.publish(plan)
+                logger.info(
+                    "  published plan %d horizon=%d forward=%.2fs total=%.2fs first=%s last=%s",
+                    plan.sequence,
+                    horizon,
+                    forward_s,
+                    plan.created_at - obs_started_at,
+                    np.array2string(plan.trajectory[0, :3], precision=3),
+                    np.array2string(plan.trajectory[-1, :3], precision=3),
+                )
                 sequence += 1
             except Exception as e:
                 print(e)
@@ -332,7 +403,8 @@ def main(cfg: DictConfig) -> int:
     from clear_franka.franka import DEFAULT_LOWER_JOINT_LIMITS, DEFAULT_UPPER_JOINT_LIMITS
 
     # ----- policy -----
-    policy = _build_policy(cfg.deploy)
+    policy, policy_relative = _build_policy(cfg.deploy)
+    logger.info("Policy action mode: %s", "relative deltas" if policy_relative else "absolute poses")
 
     # Stage 0: grasp, Stage 1: place — primitive ids in the trained vocab.
     stages = [
@@ -401,11 +473,14 @@ def main(cfg: DictConfig) -> int:
 
     enabled = False
     rate = LoopRatePrinter()
-    control_hz = float(cfg.deploy.get("control_hz", 10.0))
-    control_dt = 1.0 / control_hz
+    plan_hz = float(cfg.deploy.get("control_hz", 10.0))
+    execution_hz = float(cfg.deploy.get("execution_hz", 100.0))
+    plan_dt = 1.0 / plan_hz
+    execution_dt = 1.0 / execution_hz
     policy_lock = threading.Lock()
     latest_plan = LatestPlanSlot()
     enabled_event = threading.Event()
+    request_event = threading.Event()
     stop_event = threading.Event()
     stage_state: dict = {"idx": stage_idx, "epoch": 0, "gripper_cmd": 1.0}
 
@@ -429,6 +504,7 @@ def main(cfg: DictConfig) -> int:
         stack.callback(robot.stop_state_stream)
         inference_thread = _start_inference_worker(
             policy=policy,
+            policy_relative=policy_relative,
             policy_lock=policy_lock,
             robot=robot,
             cam_hand=cam_hand,
@@ -437,6 +513,7 @@ def main(cfg: DictConfig) -> int:
             pre_tp=pre_tp,
             latest_plan=latest_plan,
             enabled_event=enabled_event,
+            request_event=request_event,
             stop_event=stop_event,
             stage_state=stage_state,
         )
@@ -445,9 +522,21 @@ def main(cfg: DictConfig) -> int:
         prev_left = 0
         prev_right = 0
         active_plan: InferencePlan | None = None
+        active_cartesian_trajectory = None
+        active_plan_index_offset = 0
         active_index = 0
+        active_plan_started_at = 0.0
         consumed_sequence = -1
+        waiting_for_plan = False
         next_tick = time.monotonic()
+        last_viz_update = 0.0
+        viz_dt = 1.0 / 5.0
+        plan_timeout_s = 10.0
+        plan_completion_tolerance_m = 0.015
+        plan_hard_skip_m = 0.12
+        plan_max_linear_vel_m_s = 0.10
+        plan_max_angular_vel_rad_s = 0.75
+        plan_timeout_grace_s = 2.0
 
         while not stop_event.is_set():
             rate.start_tick()
@@ -461,12 +550,19 @@ def main(cfg: DictConfig) -> int:
                     if left and not prev_left:
                         enabled = not enabled
                         active_plan = None
+                        active_cartesian_trajectory = None
+                        active_plan_index_offset = 0
+                        active_plan_started_at = 0.0
+                        waiting_for_plan = False
                         visualizer.clear_plan_waypoints()
                         stage_state["epoch"] += 1
                         if enabled:
                             enabled_event.set()
+                            request_event.set()
+                            waiting_for_plan = True
                         else:
                             enabled_event.clear()
+                            request_event.clear()
                         logger.info(f"  {'ENABLED' if enabled else 'DISABLED'}")
                     if right and not prev_right:
                         stage_idx += 1
@@ -474,7 +570,12 @@ def main(cfg: DictConfig) -> int:
                             logger.info("  All stages done — exiting.")
                             break
                         enabled_event.clear()
+                        request_event.clear()
                         active_plan = None
+                        active_cartesian_trajectory = None
+                        active_plan_index_offset = 0
+                        active_plan_started_at = 0.0
+                        waiting_for_plan = False
                         visualizer.clear_plan_waypoints()
                         with policy_lock:
                             policy.set_primitive(stages[stage_idx]["primitive"])
@@ -484,16 +585,20 @@ def main(cfg: DictConfig) -> int:
                             stage_state["epoch"] += 1
                         if enabled:
                             enabled_event.set()
+                            request_event.set()
+                            waiting_for_plan = True
                         logger.info(f"[stage {stage_idx}] {stages[stage_idx]['label']}")
                     prev_left = left
                     prev_right = right
 
-            viz_state = robot.latest_state
-            _update_visualizer_robot_state(visualizer, viz_state)
+            now = time.monotonic()
+            if now - last_viz_update >= viz_dt:
+                _update_visualizer_robot_state(visualizer, robot.latest_state)
+                last_viz_update = now
 
             if not enabled:
                 rate.finish_tick()
-                next_tick += control_dt
+                next_tick += execution_dt
                 sleep_time = next_tick - time.monotonic()
                 if sleep_time > 0:
                     time.sleep(sleep_time)
@@ -501,10 +606,14 @@ def main(cfg: DictConfig) -> int:
                     next_tick = time.monotonic()
                 continue
 
+            if active_plan is None and not waiting_for_plan:
+                request_event.set()
+                waiting_for_plan = True
+
             # ---------- adopt latest completed plan ----------
             current_epoch = stage_state["epoch"]
             plan = latest_plan.latest_after(consumed_sequence)
-            if plan is not None:
+            if plan is not None and active_plan is None:
                 consumed_sequence = plan.sequence
                 if plan.stage_idx == stage_idx and plan.epoch == current_epoch:
                     state = robot.latest_state
@@ -514,17 +623,46 @@ def main(cfg: DictConfig) -> int:
                     min_dist = float(np.min(
                         np.linalg.norm(plan.trajectory[:, :3] - ee_pos[None, :], axis=1)
                     ))
-                    if min_dist > 0.03:
+                    if min_dist > plan_hard_skip_m:
+                        visualizer.update_plan_waypoints(plan.trajectory, 0)
                         logger.info(
-                            "  skipping plan %d: nearest waypoint %.1f cm from EE",
-                            plan.sequence, min_dist * 100.0,
+                            "  skipping plan %d: nearest waypoint %.1f cm from EE; "
+                            "ee=%s first=%s last=%s",
+                            plan.sequence,
+                            min_dist * 100.0,
+                            np.array2string(ee_pos, precision=3),
+                            np.array2string(plan.trajectory[0, :3], precision=3),
+                            np.array2string(plan.trajectory[-1, :3], precision=3),
                         )
+                        request_event.set()
                     else:
                         active_plan = plan
+                        waiting_for_plan = False
+                        adopted_at = time.monotonic()
                         active_index = _plan_start_index(
-                            plan, ee_pos, control_dt, time.monotonic()
+                            plan,
+                            ee_pos,
+                            plan_dt,
+                            adopted_at,
                         )
+                        active_plan_index_offset = active_index
+                        active_cartesian_trajectory = _make_cartesian_trajectory_for_plan(
+                            plan,
+                            active_index,
+                            plan_dt,
+                            euler_xyz_to_matrix,
+                            max_linear_vel=plan_max_linear_vel_m_s,
+                            max_angular_vel=plan_max_angular_vel_rad_s,
+                            min_segment_dt=execution_dt,
+                        )
+                        active_plan_started_at = adopted_at
                         visualizer.update_plan_waypoints(plan.trajectory, active_index)
+                        visualizer.update_interpolated_plan_path(
+                            _sample_cartesian_trajectory_positions(
+                                active_cartesian_trajectory,
+                                execution_dt,
+                            )
+                        )
                         logger.info(
                             "  adopted plan %d idx=%d/%d age=%.0fms infer=%.0fms",
                             plan.sequence,
@@ -533,6 +671,8 @@ def main(cfg: DictConfig) -> int:
                             (time.monotonic() - plan.created_at) * 1000.0,
                             (plan.created_at - plan.obs_started_at) * 1000.0,
                         )
+                else:
+                    request_event.set()
 
             # ---------- execute the active plan suffix ----------
             if active_plan is not None and active_index < len(active_plan.trajectory):
@@ -540,11 +680,15 @@ def main(cfg: DictConfig) -> int:
                 if state is None:
                     state = rate.time_call("state_wait", robot.wait_for_state, 1.0)
                 ee_pos, _ee_rot, _O_T_EE = _read_ee_pose_from_state(state)
-                active_index = _advance_plan_index(active_plan, active_index, ee_pos)
-                waypoint = active_plan.trajectory[active_index]
-                target_xyz = waypoint[:3].astype(np.float64)
-                target_euler = waypoint[3:6].astype(np.float64)
-                target_rot = euler_xyz_to_matrix(target_euler)
+                assert active_cartesian_trajectory is not None
+
+                elapsed = time.monotonic() - active_plan_started_at
+                local_index = active_cartesian_trajectory.waypoint_index_at(elapsed)
+                active_index = min(
+                    active_plan_index_offset + local_index,
+                    len(active_plan.trajectory) - 1,
+                )
+                target_xyz, target_rot = active_cartesian_trajectory.interpolate(elapsed)
                 visualizer.update_plan_waypoints(active_plan.trajectory, active_index)
 
                 # Optional safety clip — keep targets inside the recorded workspace.
@@ -563,12 +707,49 @@ def main(cfg: DictConfig) -> int:
                     visualizer.update_gripper_width(width, max_width_m=cfg.gripper.max_width_m)
                     stage_state["gripper_cmd"] = cmd_state
 
+                final_dist = float(np.linalg.norm(
+                    active_plan.trajectory[-1, :3] - ee_pos
+                ))
+                active_plan_timeout_s = max(
+                    plan_timeout_s,
+                    active_cartesian_trajectory.duration + plan_timeout_grace_s,
+                )
+                if (
+                    active_index >= len(active_plan.trajectory) - 1
+                    and final_dist <= plan_completion_tolerance_m
+                ):
+                    logger.info("  completed plan %d", active_plan.sequence)
+                    visualizer.clear_plan_waypoints()
+                    active_plan = None
+                    active_cartesian_trajectory = None
+                    active_plan_index_offset = 0
+                    active_plan_started_at = 0.0
+                    request_event.set()
+                    waiting_for_plan = True
+                elif time.monotonic() - active_plan_started_at > active_plan_timeout_s:
+                    logger.info(
+                        "  plan %d timed out after %.1fs at idx=%d/%d; requesting replacement",
+                        active_plan.sequence,
+                        active_plan_timeout_s,
+                        active_index,
+                        len(active_plan.trajectory),
+                    )
+                    visualizer.clear_plan_waypoints()
+                    active_plan = None
+                    active_cartesian_trajectory = None
+                    active_plan_index_offset = 0
+                    active_plan_started_at = 0.0
+                    request_event.set()
+                    waiting_for_plan = True
+
             elif active_plan is not None:
                 visualizer.clear_plan_waypoints()
                 active_plan = None
+                active_cartesian_trajectory = None
+                active_plan_index_offset = 0
 
             rate.finish_tick()
-            next_tick += control_dt
+            next_tick += execution_dt
             sleep_time = next_tick - time.monotonic()
             if sleep_time > 0:
                 time.sleep(sleep_time)
