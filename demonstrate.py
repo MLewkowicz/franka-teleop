@@ -101,7 +101,7 @@ def _setup_cameras(cfg: DictConfig, record_cameras: bool, pointcloud_enabled: bo
 def _metadata_for_cameras(cameras: dict, cfg: DictConfig, vc) -> dict:
     metadata = {}
     for cam_name in cameras:
-        ext_path = vc.get("pointclouds", {}).get(cam_name, {}).get(
+        ext_path = cfg.get("cameras", {}).get(cam_name, {}).get(
             "extrinsics_path",
             f"./data/extrinsics_{cam_name}.json",
         )
@@ -196,12 +196,15 @@ def run_demonstrate(cfg: DictConfig):
             if pointcloud_source == "hand":
                 pointcloud_frame_name = visualizer.add_hand_camera_frame_from_extrinsics(
                     frame_name,
-                    pc.get("extrinsics_path", "./data/extrinsics_hand.json"),
+                    cfg.cameras.hand.get("extrinsics_path", "./data/extrinsics_hand.json"),
                 )
             else:
                 pointcloud_frame_name = visualizer.add_camera_frame_from_extrinsics(
                     frame_name,
-                    pc.get("extrinsics_path", "./data/extrinsics_third_person.json"),
+                    cfg.cameras.third_person.get(
+                        "extrinsics_path",
+                        "./data/extrinsics_third_person.json",
+                    ),
                 )
             pointcloud_camera.start_pointcloud_stream(
                 update_hz=float(pc.get("update_hz", 5.0)),

@@ -117,8 +117,8 @@ def run_teleop(cfg: DictConfig):
 
     extrinsics_metadata = {}
     for cam_name in cameras:
-        cam_pc_cfg = vc.get("pointclouds", {}).get(cam_name, {})
-        ext_path = cam_pc_cfg.get("extrinsics_path", f"./data/extrinsics_{cam_name}.json")
+        cam_cfg = cfg.get("cameras", {}).get(cam_name, {})
+        ext_path = cam_cfg.get("extrinsics_path")
         try:
             with open(ext_path) as f:
                 extrinsics_metadata[f"extrinsics_{cam_name}"] = f.read()
@@ -180,12 +180,14 @@ def run_teleop(cfg: DictConfig):
             if pointcloud_source == "hand":
                 pointcloud_frame_name = visualizer.add_hand_camera_frame_from_extrinsics(
                     frame_name,
-                    pc.get("extrinsics_path", "./data/extrinsics_hand.json"),
+                    cfg.cameras.hand.get("extrinsics_path")
                 )
             else:
                 pointcloud_frame_name = visualizer.add_camera_frame_from_extrinsics(
                     frame_name,
-                    pc.get("extrinsics_path", "./data/extrinsics_third_person.json"),
+                    cfg.cameras.third_person.get(
+                        "extrinsics_path"
+                    ),
                 )
             camera_frame_added = True
             pointcloud_camera.start_pointcloud_stream(

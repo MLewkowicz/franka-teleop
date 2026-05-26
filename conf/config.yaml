@@ -42,6 +42,7 @@ cameras:
     resolution: HD720
     fps: 30
     depth_mode: NEURAL
+    extrinsics_path: "/home/clear/franka-teleop/data/extrinsics_third_person.json"
   hand:
     name: hand
     enabled: true
@@ -49,6 +50,7 @@ cameras:
     resolution: HD720
     fps: 30
     depth_mode: NEURAL
+    extrinsics_path: "/home/clear/franka-teleop/data/extrinsics_hand.json"
 
 gripper:
   enabled: true
@@ -74,7 +76,6 @@ visualization:
   pointclouds:
     third_person:
       enabled: false
-      extrinsics_path: "/home/clear/franka-teleop/data/extrinsics_third_person.json"
       frame_name: /third_person_zed
       update_hz: 5.0
       stride: 4
@@ -83,7 +84,6 @@ visualization:
       point_size: 0.01
     hand:
       enabled: false
-      extrinsics_path: "/home/clear/franka-teleop/data/extrinsics_hand.json"
       # Child of the Franka end-effector/flange frame in the viser URDF.
       frame_name: /cortado/fr3_link8/hand_zed
       update_hz: 5.0

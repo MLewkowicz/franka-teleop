@@ -127,8 +127,8 @@ def _setup_cameras(cfg: DictConfig):
     cam_hand = make_zed_camera(cfg, "hand")
     cam_tp = make_zed_camera(cfg, "third_person")
 
-    hand_ext = load_extrinsics_json(cfg.deploy.extrinsics_hand)
-    tp_ext = load_extrinsics_json(cfg.deploy.extrinsics_third_person)
+    hand_ext = load_extrinsics_json(cfg.cameras.hand.extrinsics_path)
+    tp_ext = load_extrinsics_json(cfg.cameras.third_person.extrinsics_path)
     pre_hand = CameraPreprocessor(hand_ext, mount="hand")
     pre_tp = CameraPreprocessor(tp_ext, mount="third_person")
     return cam_hand, cam_tp, pre_hand, pre_tp
