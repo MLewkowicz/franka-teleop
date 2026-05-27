@@ -101,7 +101,7 @@ replay:
   speed: 1.0
   period: 0.001
   # Joint impedance gains. Stiffer = better tracking, less compliance.
-  joint_stiffness: [320.0, 320.0, 320.0, 320.0, 120.0, 120.0, 60.0]
+  joint_stiffness: [320.0, 320.0, 320.0, 320.0, 120.0, 120.0, 30.0]
   # Pre-positioning move to the first joint configuration of the episode.
   record: false                     # save measured robot state as a new episode
 
@@ -111,6 +111,8 @@ deploy:
   langsteer_path: "/home/clear/LangSteer"
   control_hz: 10                                  # Nominal DiffuserActor waypoint rate used to interpret action horizon timing.
   execution_hz: 100                              # Cartesian reference streaming rate; samples the retimed interpolation.
+  max_linear_vel_m_s: 0.03                      # Open-loop retime speed limit for Cartesian translation.
+  max_angular_vel_rad_s: 0.25                   # Open-loop retime speed limit for Cartesian orientation.
   # Workspace safety box (base frame, metres). Cartesian targets are clipped here.
   # Sized from the recorded teleop's ee_pos range with a small buffer; tighten before serious runs.
   workspace_lo: [0.30, -0.35, 0.02]

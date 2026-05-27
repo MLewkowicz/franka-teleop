@@ -3,11 +3,10 @@
 Chunked playback: an inference worker grabs two ZED frames + the current
 end-effector pose when the executor asks for a new plan, builds a
 `core.types.Observation`, and calls `policy.forward(obs)` to produce an
-absolute trajectory. The main loop executes that trajectory to completion
-before requesting another one. If execution stalls past a timeout, the executor
-abandons the old plan and pauses while the worker generates a replacement. The
-gripper command is issued when the executed trajectory step flips relative to
-what we last commanded.
+absolute trajectory. The main loop plays the retimed trajectory open-loop by
+elapsed time before requesting another one; it does not check whether the robot
+has reached each waypoint. The gripper command is issued when the executed
+trajectory step flips relative to what we last commanded.
 
 Stage transitions (grasp → place → done) are driven by SpaceMouse buttons:
     LEFT  short tap   → toggle ENABLED (closed-loop control on/off)
@@ -192,22 +191,6 @@ def _extract_gripper_plan(action, horizon: int) -> np.ndarray:
     return np.full(horizon, float(action.gripper), dtype=np.float64)
 
 
-def _plan_start_index(
-    plan: InferencePlan,
-    current_ee_pos: np.ndarray,
-    plan_dt: float,
-    now: float,
-) -> int:
-    horizon = len(plan.trajectory)
-    if horizon <= 1:
-        return 0
-
-    distances = np.linalg.norm(plan.trajectory[:, :3] - current_ee_pos[None, :], axis=1)
-    closest_next = int(np.argmin(distances)) + 1
-    latency_skip = int(max(0.0, now - plan.obs_started_at) / plan_dt)
-    return min(max(1, closest_next, latency_skip), horizon - 1)
-
-
 def _make_cartesian_trajectory_for_plan(
     plan: InferencePlan,
     start_index: int,
@@ -330,13 +313,14 @@ def _start_inference_worker(
                 )
                 latest_plan.publish(plan)
                 logger.info(
-                    "  published plan %d horizon=%d forward=%.2fs total=%.2fs first=%s last=%s",
+                    "  published plan %d horizon=%d forward=%.2fs total=%.2fs first=%s last=%s gripper=%s",
                     plan.sequence,
                     horizon,
                     forward_s,
                     plan.created_at - obs_started_at,
                     np.array2string(plan.trajectory[0, :3], precision=3),
                     np.array2string(plan.trajectory[-1, :3], precision=3),
+                    np.array2string((plan.gripper > 0.0).astype(np.float64), precision=0),
                 )
                 sequence += 1
             except Exception as e:
@@ -501,11 +485,14 @@ def main(cfg: DictConfig) -> int:
         last_viz_update = 0.0
         viz_dt = 1.0 / 5.0
         plan_timeout_s = 10.0
-        plan_completion_tolerance_m = 0.015
-        plan_hard_skip_m = 0.12
-        plan_max_linear_vel_m_s = 0.10
-        plan_max_angular_vel_rad_s = 0.75
+        plan_max_linear_vel_m_s = float(cfg.deploy.get("max_linear_vel_m_s", 0.03))
+        plan_max_angular_vel_rad_s = float(cfg.deploy.get("max_angular_vel_rad_s", 0.25))
         plan_timeout_grace_s = 2.0
+        logger.info(
+            "Open-loop retime limits: %.3f m/s linear, %.3f rad/s angular",
+            plan_max_linear_vel_m_s,
+            plan_max_angular_vel_rad_s,
+        )
 
         while not stop_event.is_set():
             rate.start_tick()
@@ -585,80 +572,60 @@ def main(cfg: DictConfig) -> int:
             if plan is not None and active_plan is None:
                 consumed_sequence = plan.sequence
                 if plan.stage_idx == stage_idx and plan.epoch == current_epoch:
-                    state = robot.latest_state
-                    if state is None:
-                        state = rate.time_call("state_wait", robot.wait_for_state, 1.0)
-                    ee_pos, _ee_rot, _O_T_EE = _read_ee_pose_from_state(state)
-                    min_dist = float(np.min(
-                        np.linalg.norm(plan.trajectory[:, :3] - ee_pos[None, :], axis=1)
-                    ))
-                    if min_dist > plan_hard_skip_m:
-                        visualizer.update_plan_waypoints(plan.trajectory, 0)
-                        logger.info(
-                            "  skipping plan %d: nearest waypoint %.1f cm from EE; "
-                            "ee=%s first=%s last=%s",
-                            plan.sequence,
-                            min_dist * 100.0,
-                            np.array2string(ee_pos, precision=3),
-                            np.array2string(plan.trajectory[0, :3], precision=3),
-                            np.array2string(plan.trajectory[-1, :3], precision=3),
+                    active_plan = plan
+                    waiting_for_plan = False
+                    adopted_at = time.monotonic()
+                    active_index = 0
+                    active_plan_index_offset = active_index
+                    active_cartesian_trajectory = _make_cartesian_trajectory_for_plan(
+                        plan,
+                        active_index,
+                        plan_dt,
+                        euler_xyz_to_matrix,
+                        max_linear_vel=plan_max_linear_vel_m_s,
+                        max_angular_vel=plan_max_angular_vel_rad_s,
+                        min_segment_dt=execution_dt,
+                    )
+                    active_plan_started_at = adopted_at
+                    visualizer.update_plan_waypoints(
+                        plan.trajectory,
+                        active_index,
+                        gripper=plan.gripper,
+                    )
+                    visualizer.update_interpolated_plan_path(
+                        _sample_cartesian_trajectory_positions(
+                            active_cartesian_trajectory,
+                            execution_dt,
                         )
-                        request_event.set()
-                    else:
-                        active_plan = plan
-                        waiting_for_plan = False
-                        adopted_at = time.monotonic()
-                        active_index = _plan_start_index(
-                            plan,
-                            ee_pos,
-                            plan_dt,
-                            adopted_at,
-                        )
-                        active_plan_index_offset = active_index
-                        active_cartesian_trajectory = _make_cartesian_trajectory_for_plan(
-                            plan,
-                            active_index,
-                            plan_dt,
-                            euler_xyz_to_matrix,
-                            max_linear_vel=plan_max_linear_vel_m_s,
-                            max_angular_vel=plan_max_angular_vel_rad_s,
-                            min_segment_dt=execution_dt,
-                        )
-                        active_plan_started_at = adopted_at
-                        visualizer.update_plan_waypoints(plan.trajectory, active_index)
-                        visualizer.update_interpolated_plan_path(
-                            _sample_cartesian_trajectory_positions(
-                                active_cartesian_trajectory,
-                                execution_dt,
-                            )
-                        )
-                        logger.info(
-                            "  adopted plan %d idx=%d/%d age=%.0fms infer=%.0fms",
-                            plan.sequence,
-                            active_index,
-                            len(plan.trajectory),
-                            (time.monotonic() - plan.created_at) * 1000.0,
-                            (plan.created_at - plan.obs_started_at) * 1000.0,
-                        )
+                    )
+                    logger.info(
+                        "  adopted plan %d open-loop idx=%d/%d age=%.0fms infer=%.0fms",
+                        plan.sequence,
+                        active_index,
+                        len(plan.trajectory),
+                        (time.monotonic() - plan.created_at) * 1000.0,
+                        (plan.created_at - plan.obs_started_at) * 1000.0,
+                    )
                 else:
                     request_event.set()
 
             # ---------- execute the active plan suffix ----------
             if active_plan is not None and active_index < len(active_plan.trajectory):
-                state = robot.latest_state
-                if state is None:
-                    state = rate.time_call("state_wait", robot.wait_for_state, 1.0)
-                ee_pos, _ee_rot, _O_T_EE = _read_ee_pose_from_state(state)
                 assert active_cartesian_trajectory is not None
 
                 elapsed = time.monotonic() - active_plan_started_at
                 local_index = active_cartesian_trajectory.waypoint_index_at(elapsed)
+                previous_index = active_index
                 active_index = min(
                     active_plan_index_offset + local_index,
                     len(active_plan.trajectory) - 1,
                 )
                 target_xyz, target_rot = active_cartesian_trajectory.interpolate(elapsed)
-                visualizer.update_plan_waypoints(active_plan.trajectory, active_index)
+                visualizer.update_plan_waypoints(
+                    active_plan.trajectory,
+                    active_index,
+                    gripper=active_plan.gripper,
+                )
 
                 # Optional safety clip — keep targets inside the recorded workspace.
                 lo = np.array(cfg.deploy.workspace_lo, dtype=np.float64)
@@ -667,26 +634,24 @@ def main(cfg: DictConfig) -> int:
 
                 tracker.set_cartesian_reference(Affine(pack_Rp(target_rot, target_xyz)))
 
-                cmd_state = 1.0 if active_plan.gripper[active_index] >= 0.5 else 0.0
-                if gripper is not None and cmd_state != stage_state["gripper_cmd"]:
+                start_idx = min(previous_index, active_index)
+                end_idx = max(previous_index, active_index)
+                crossed_cmds = (active_plan.gripper[start_idx:end_idx + 1] > 0.0).astype(np.float64)
+                cmd_state = float(crossed_cmds[-1])
+                if cmd_state != stage_state["gripper_cmd"]:
                     width = (cfg.gripper.open_width_m if cmd_state == 1.0
                              else cfg.gripper.close_width_m)
                     logger.info(f"  gripper → {'OPEN' if cmd_state == 1.0 else 'CLOSE'}")
-                    gripper.move_width(width, wait=False)
+                    if gripper is not None:
+                        gripper.move_width(width, wait=False)
                     visualizer.update_gripper_width(width, max_width_m=cfg.gripper.max_width_m)
                     stage_state["gripper_cmd"] = cmd_state
 
-                final_dist = float(np.linalg.norm(
-                    active_plan.trajectory[-1, :3] - ee_pos
-                ))
                 active_plan_timeout_s = max(
                     plan_timeout_s,
                     active_cartesian_trajectory.duration + plan_timeout_grace_s,
                 )
-                if (
-                    active_index >= len(active_plan.trajectory) - 1
-                    and final_dist <= plan_completion_tolerance_m
-                ):
+                if elapsed >= active_cartesian_trajectory.duration:
                     logger.info("  completed plan %d", active_plan.sequence)
                     visualizer.clear_plan_waypoints()
                     active_plan = None
