@@ -27,6 +27,9 @@ def main(cfg: DictConfig):
     elif cfg.mode == "replay":
         from replay import run_replay
         run_replay(cfg)
+    elif cfg.mode == "replay_ff":
+        from replay_ff import run_replay
+        run_replay(cfg)
     elif cfg.mode == "calibrate":
         from calibrate_extrinsics import run_calibration
         run_calibration(cfg)
