@@ -172,6 +172,7 @@ def run_teleop(cfg: DictConfig):
             gc.get("open_width_m", 0.085) if gripper_open else gc.get("close_width_m", 0.0),
             max_width_m=gc.get("max_width_m", 0.085),
         )
+        visualizer.enable_workspace_box_editor()
         if pointcloud_enabled and pointcloud_camera is not None:
             frame_name = pc.get(
                 "frame_name",

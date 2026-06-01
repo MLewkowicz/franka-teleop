@@ -10,6 +10,7 @@ from urllib.parse import unquote, urlparse
 import numpy as np
 
 from clear_franka.geometry import load_T_cam2base, load_T_cam2gripper
+from clear_franka.workspace_boxes import WorkspaceBoxEditor
 
 
 DEFAULT_ARM_JOINT_NAMES = tuple(f"fr3_joint{i}" for i in range(1, 8))
@@ -193,7 +194,9 @@ class CortadoViserVisualizer:
         self.urdf.update_cfg(self._cfg)
         self._plan_line_handle = None
         self._plan_point_handle = None
+        self._interpolated_plan_line_handle = None
         self._plan_frame_handles = []
+        self.workspace_box_editor: WorkspaceBoxEditor | None = None
 
         url_host = "localhost" if host in {"0.0.0.0", "::"} else host
         print(f"  [viser] Cortado URDF loaded from {urdf_path}")
@@ -243,6 +246,20 @@ class CortadoViserVisualizer:
         closed_fraction = 1.0 - opening_width_m / float(max_width_m)
         self._cfg[self._gripper_joint_index] = closed_fraction * DEFAULT_GRIPPER_JOINT_CLOSED
         self.urdf.update_cfg(self._cfg)
+
+    def enable_workspace_box_editor(
+        self,
+        json_path: str | Path = "data/workspace_boxes.json",
+        **kwargs,
+    ) -> WorkspaceBoxEditor:
+        self.workspace_box_editor = WorkspaceBoxEditor(self, json_path=json_path, **kwargs)
+        print(f"  [viser] Workspace box editor saving to {self.workspace_box_editor.path}")
+        return self.workspace_box_editor
+
+    def get_workspace_boxes(self) -> list[dict]:
+        if self.workspace_box_editor is None:
+            return []
+        return self.workspace_box_editor.boxes
 
     def add_camera_frame(
         self,
@@ -346,28 +363,65 @@ class CortadoViserVisualizer:
         handle.position = T[:3, 3]
 
     def clear_plan_waypoints(self) -> None:
-        for handle in (self._plan_line_handle, self._plan_point_handle):
+        for handle in (
+            self._plan_line_handle,
+            self._plan_point_handle,
+            self._interpolated_plan_line_handle,
+        ):
             if handle is not None:
                 handle.remove()
         self._plan_line_handle = None
         self._plan_point_handle = None
+        self._interpolated_plan_line_handle = None
 
         for handle in self._plan_frame_handles:
             handle.remove()
         self._plan_frame_handles = []
 
+    def update_interpolated_plan_path(
+        self,
+        positions: np.ndarray | None,
+        name: str = "/diffuser_plan/interpolated",
+        color: tuple[int, int, int] = (255, 95, 70),
+        line_width: float = 2.0,
+    ) -> None:
+        if self._interpolated_plan_line_handle is not None:
+            self._interpolated_plan_line_handle.remove()
+            self._interpolated_plan_line_handle = None
+
+        if positions is None:
+            return
+
+        positions = np.asarray(positions, dtype=float)
+        if positions.ndim != 2 or positions.shape[1] != 3:
+            raise ValueError(f"Expected positions shape (N, 3), got {positions.shape}")
+        if len(positions) < 2:
+            return
+
+        T_base_to_root = self.urdf_model.get_transform("fr3_link0")
+        R_base_to_root = T_base_to_root[:3, :3]
+        points = (R_base_to_root @ positions.T).T + T_base_to_root[:3, 3]
+        segments = np.stack([points[:-1], points[1:]], axis=1).astype(np.float32)
+        colors = np.full((len(segments), 2, 3), color, dtype=np.uint8)
+        self._interpolated_plan_line_handle = self.server.scene.add_line_segments(
+            name=name,
+            points=segments,
+            colors=colors,
+            line_width=line_width,
+        )
+
     def update_plan_waypoints(
         self,
         trajectory: np.ndarray | None,
         active_index: int = 0,
+        gripper: np.ndarray | None = None,
         name: str = "/diffuser_plan",
         point_size: float = 0.0009,
         line_width: float = 1.0,
         axes_length: float = 0.008,
         axes_radius: float = 0.0015,
+        show_axes: bool = False,
     ) -> None:
-        import viser.transforms
-
         if trajectory is None:
             self.clear_plan_waypoints()
             return
@@ -384,9 +438,29 @@ class CortadoViserVisualizer:
         R_base_to_root = T_base_to_root[:3, :3]
         points = (R_base_to_root @ trajectory[:, :3].T).T + T_base_to_root[:3, 3]
 
-        colors = np.full((len(points), 3), (80, 160, 255), dtype=np.uint8)
-        colors[:active_index] = (145, 145, 145)
-        colors[active_index] = (255, 210, 60)
+        if gripper is None:
+            gripper_cmd = np.ones(len(points), dtype=bool)
+        else:
+            gripper_cmd = np.asarray(gripper, dtype=float).reshape(-1)[:len(points)] > 0.0
+            if len(gripper_cmd) == 0:
+                gripper_cmd = np.ones(len(points), dtype=bool)
+            if len(gripper_cmd) < len(points):
+                gripper_cmd = np.pad(
+                    gripper_cmd,
+                    (0, len(points) - len(gripper_cmd)),
+                    mode="edge",
+                )
+        colors = np.where(
+            gripper_cmd[:, None],
+            np.array([80, 160, 255], dtype=np.uint8),
+            np.array([255, 95, 70], dtype=np.uint8),
+        )
+        colors[:active_index] = (colors[:active_index].astype(np.float32) * 0.45).astype(np.uint8)
+        colors[active_index] = np.minimum(
+            colors[active_index].astype(np.uint16)
+            + np.array([55, 55, 55], dtype=np.uint16),
+            255,
+        ).astype(np.uint8)
 
         if self._plan_point_handle is not None:
             self._plan_point_handle.remove()
@@ -415,9 +489,10 @@ class CortadoViserVisualizer:
         for handle in self._plan_frame_handles:
             handle.remove()
         self._plan_frame_handles = []
-        if trajectory.shape[1] < 6:
+        if not show_axes or trajectory.shape[1] < 6:
             return
 
+        import viser.transforms
         from scipy.spatial.transform import Rotation as R
 
         rotations = R.from_euler("XYZ", trajectory[:, 3:6]).as_matrix()
