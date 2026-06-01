@@ -1090,10 +1090,8 @@ def main(cfg: DictConfig) -> int:
             period=0.001,
             translational_stiffness=cfg.deploy.translational_stiffness,
             rotational_stiffness=cfg.deploy.rotational_stiffness,
-            nullspace_stiffness=cfg.deploy.nullspace_stiffness,
-            nullspace_target=_ns_target,
             nullspace_tasks=[
-                PostureTask([0.120437, -0.797005, -0.427542, -2.740433, 2.785569, 2.719076, 2.955555], stiffness=2.0),
+                PostureTask(_ns_target, stiffness=cfg.deploy.nullspace_stiffness),
                 ManipulabilityTask(gain=5.0, max_torque=1.0),
             ],
             lower_joint_limits=_lower_lim,
