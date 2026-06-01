@@ -1,0 +1,377 @@
+"""Demonstration episode preprocessing — trim leading idle, smooth, retime.
+
+Shared `preprocess_episode()` is called from two places:
+  * inline in `demonstrate.py` immediately after recording stops, so a processed
+    copy lands in `data/processed/` without a manual step;
+  * by the standalone CLI `preprocess_demonstrations.py` for batch re-runs.
+
+Pipeline (each step gated by `cfg.preprocess.<step>.enabled`):
+  1. trim   → drops leading/trailing stationary segments (`Trajectory.trim`)
+  2. retime → TOPPRA: time-optimal traversal under (max_vel, max_accel).
+              Runs on the SPARSE trimmed waypoints (~hundreds) — well-conditioned.
+              Running it AFTER Ruckig (~17k dense waypoints) made TOPPRA's
+              reachability solver fail with FailUncontrollable.
+  3. smooth → Ruckig: dense, jerk-bounded trajectory at fixed dt. Operates on
+              the (possibly retimed) waypoints from step 2 and absorbs any
+              remaining jitter through its bounded-jerk profile.
+
+Aligned non-joint fields (ee_pos, ee_rot, gripper_open, …) are first sliced to
+the trim window, then re-sampled at the final post-smooth/retime timestamps:
+linear for vectors, slerp for rotations, nearest-neighbour for binary signals.
+
+`toppra` and `ruckig` are imported lazily here (not at module load) so a missing
+dependency only fails the steps that actually need it.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+from typing import Any
+
+import h5py
+import numpy as np
+from omegaconf import DictConfig, OmegaConf
+from scipy.spatial.transform import Rotation, Slerp
+
+from clear_franka.joint_trajectory import Trajectory
+
+logger = logging.getLogger(__name__)
+
+
+PREPROCESSING_VERSION = 1
+
+# Datasets that must be re-sampled at the new timestamps. Each entry maps the
+# h5 dataset name → interpolation kind ("linear" | "slerp" | "nearest").
+_RESAMPLE_KIND = {
+    "ee_pos": "linear",
+    "ee_rot": "slerp",
+    "cmd_linear_vel": "linear",
+    "cmd_angular_vel": "linear",
+    "robot_abs_time": "linear",
+    "gripper_open": "nearest",
+    "buttons": "nearest",
+    "enabled": "nearest",
+}
+
+
+def preprocess_episode(
+    raw_h5_path: Path | str,
+    out_h5_path: Path | str,
+    params: DictConfig | dict[str, Any],
+) -> bool:
+    """Read a raw demonstration episode, apply the preprocessing pipeline, write it.
+
+    Returns True on success. Returns False on a *handled* failure (e.g. the
+    episode is too short to trim, Ruckig is not installed, the velocity bound
+    is violated). The raw file is never modified, so on False the caller can
+    safely fall back to the raw episode.
+
+    Raises only on programmer error (bad config schema). Missing optional deps
+    (`toppra`, `ruckig`) surface as False with a logged error, not an exception.
+    """
+    raw_h5_path = Path(raw_h5_path)
+    out_h5_path = Path(out_h5_path)
+
+    if isinstance(params, DictConfig):
+        params_dict = OmegaConf.to_container(params, resolve=True)
+    else:
+        params_dict = dict(params)
+
+    if not raw_h5_path.exists():
+        logger.error("preprocess: raw episode does not exist: %s", raw_h5_path)
+        return False
+
+    try:
+        raw = _load_episode(raw_h5_path)
+    except Exception as exc:
+        logger.error("preprocess: failed to load %s: %s", raw_h5_path, exc)
+        return False
+
+    if raw["joint_pos"].shape[0] < 2:
+        logger.error("preprocess: episode too short (%d samples)", raw["joint_pos"].shape[0])
+        return False
+
+    if np.isnan(raw["joint_pos"]).any():
+        logger.error("preprocess: joint_pos contains NaN — refusing to process %s", raw_h5_path)
+        return False
+
+    # --- 1. trim ----------------------------------------------------------
+    timestamps_in = raw["timestamps"].astype(np.float64)
+    joint_pos_in = raw["joint_pos"].astype(np.float64)
+    trim_cfg = params_dict.get("trim", {})
+    if trim_cfg.get("enabled", True):
+        traj = Trajectory(joint_pos_in, timestamps_in)
+        try:
+            trimmed = traj.trim(
+                time_window=float(trim_cfg.get("time_window", 0.3)),
+                threshold=float(trim_cfg.get("threshold", 0.01)),
+            )
+        except AssertionError as exc:
+            logger.error("preprocess: trim failed: %s", exc)
+            return False
+        # Trajectory.trim slices the original arrays [lo:hi+1], so trimmed.waypts_time
+        # values are exact members of timestamps_in. Recover the slice indices.
+        lo = int(np.searchsorted(timestamps_in, trimmed.waypts_time[0], side="left"))
+        hi_excl = int(np.searchsorted(timestamps_in, trimmed.waypts_time[-1], side="right"))
+    else:
+        lo = 0
+        hi_excl = timestamps_in.shape[0]
+
+    sliced = {k: v[lo:hi_excl] for k, v in raw.items() if isinstance(v, np.ndarray)}
+    # Rebase timestamps so the trimmed segment starts at 0. Other aligned arrays
+    # carry absolute robot time and shouldn't be rebased.
+    times_trim = sliced["timestamps"] - sliced["timestamps"][0]
+    joint_pos_trim = sliced["joint_pos"]
+    trimmed_traj = Trajectory(joint_pos_trim, times_trim)
+
+    logger.info(
+        "preprocess: trim dropped %d leading + %d trailing samples (kept %d / %d, %.2fs)",
+        lo,
+        timestamps_in.shape[0] - hi_excl,
+        hi_excl - lo,
+        timestamps_in.shape[0],
+        float(times_trim[-1]),
+    )
+
+    if trimmed_traj.num_waypts < 4:
+        logger.error("preprocess: too few samples after trim (%d) — refusing to smooth", trimmed_traj.num_waypts)
+        return False
+
+    # --- 2. retime (TOPPRA) -----------------------------------------------
+    # Run BEFORE smooth so TOPPRA operates on the sparse trimmed waypoints
+    # (hundreds). Running it on Ruckig's dense 1 kHz output (~17k samples)
+    # makes its reachability solver fail with FailUncontrollable.
+    smooth_cfg = params_dict.get("smooth", {})
+    retime_cfg = params_dict.get("retime", {})
+    current = trimmed_traj
+    if retime_cfg.get("enabled", False):
+        # Reuse smooth's velocity/accel limits unless overridden in the retime block.
+        max_vel = np.asarray(
+            retime_cfg.get("max_joint_vel", smooth_cfg.get("max_joint_vel")),
+            dtype=np.float64,
+        )
+        max_accel = np.asarray(
+            retime_cfg.get("max_joint_accel", smooth_cfg.get("max_joint_accel")),
+            dtype=np.float64,
+        )
+        try:
+            current = current.retime(
+                max_vel=max_vel,
+                max_accel=max_accel,
+                sample_uniform=bool(retime_cfg.get("sample_uniform", False)),
+            )
+        except ImportError as exc:
+            logger.error("preprocess: toppra not installed: %s", exc)
+            return False
+        except Exception as exc:
+            logger.error("preprocess: retime() failed: %s", exc)
+            return False
+
+    # --- 3. smooth (Ruckig) -----------------------------------------------
+    # Operates on the (possibly retimed) waypoints. Ruckig's bounded-jerk
+    # profile absorbs residual jitter and emits a dense control-rate stream.
+    if smooth_cfg.get("enabled", True):
+        try:
+            current = current.smooth(
+                max_vel=np.asarray(smooth_cfg["max_joint_vel"], dtype=np.float64),
+                max_accel=np.asarray(smooth_cfg["max_joint_accel"], dtype=np.float64),
+                max_jerk=np.asarray(smooth_cfg["max_joint_jerk"], dtype=np.float64),
+                dt=float(smooth_cfg.get("dt", 0.001)),
+            )
+        except ImportError as exc:
+            logger.error("preprocess: ruckig not installed: %s", exc)
+            return False
+        except Exception as exc:
+            logger.error("preprocess: smooth() failed: %s", exc)
+            return False
+
+    # Final joint trajectory and (rebased-to-zero) timestamps.
+    joint_pos_out = np.asarray(current.waypts, dtype=np.float64)
+    times_out = np.asarray(current.waypts_time, dtype=np.float64)
+    times_out = times_out - times_out[0]
+    if times_out[-1] <= 0:
+        logger.error("preprocess: degenerate output duration %.6f", float(times_out[-1]))
+        return False
+
+    # Velocity-bound assertion (post-smooth). Allow 5% slack for numerical diff.
+    if smooth_cfg.get("enabled", True):
+        max_vel_cfg = np.asarray(smooth_cfg["max_joint_vel"], dtype=np.float64)
+        joint_vel_check = np.diff(joint_pos_out, axis=0) / np.maximum(np.diff(times_out)[:, None], 1e-9)
+        peak = np.abs(joint_vel_check).max(axis=0)
+        if np.any(peak > max_vel_cfg * 1.05):
+            logger.error(
+                "preprocess: smoothed joint velocity exceeds 1.05× cap: peak=%s cap=%s",
+                np.array2string(peak, precision=3),
+                np.array2string(max_vel_cfg, precision=3),
+            )
+            return False
+
+    # --- 4. resample aligned fields at the new timestamps -----------------
+    resampled = _resample_aligned_fields(
+        sliced,
+        source_times=times_trim,
+        target_times=times_out,
+    )
+
+    # Recompute joint_vel from the smoothed joint_pos rather than re-sampling the
+    # noisy recorded velocities (np.gradient gives a centred difference).
+    if joint_pos_out.shape[0] >= 2:
+        joint_vel_out = np.gradient(joint_pos_out, times_out, axis=0)
+    else:
+        joint_vel_out = np.zeros_like(joint_pos_out)
+
+    out_arrays: dict[str, np.ndarray] = {
+        "timestamps": times_out,
+        "joint_pos": joint_pos_out,
+        "joint_vel": joint_vel_out,
+    }
+    out_arrays.update(resampled)
+
+    # --- 5. write out -----------------------------------------------------
+    out_h5_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _write_episode(
+            out_h5_path,
+            arrays=out_arrays,
+            raw_attrs=raw["_attrs"],
+            raw_camera_group=raw.get("_camera_timestamps"),
+            preprocessing_params=params_dict,
+            raw_basename=raw_h5_path.name,
+        )
+    except Exception as exc:
+        logger.error("preprocess: write %s failed: %s", out_h5_path, exc)
+        return False
+
+    logger.info(
+        "preprocess: wrote %s (%d samples, %.2fs)",
+        out_h5_path,
+        joint_pos_out.shape[0],
+        float(times_out[-1]),
+    )
+    return True
+
+
+# ---------------------------------------------------------------------------
+# h5 I/O
+# ---------------------------------------------------------------------------
+
+def _load_episode(path: Path) -> dict[str, Any]:
+    """Load every top-level dataset + attrs + the (optional) camera_timestamps group.
+
+    Returns a dict with numpy arrays for each dataset plus `_attrs` (dict) and
+    `_camera_timestamps` (dict[str, ndarray] | None). Datasets whose names start
+    with underscore are reserved for these meta entries.
+    """
+    out: dict[str, Any] = {}
+    with h5py.File(path, "r") as f:
+        for name, item in f.items():
+            if isinstance(item, h5py.Dataset):
+                out[name] = item[()]
+            elif isinstance(item, h5py.Group) and name == "camera_timestamps":
+                out["_camera_timestamps"] = {k: v[()] for k, v in item.items()}
+        out["_attrs"] = {k: f.attrs[k] for k in f.attrs}
+    return out
+
+
+def _write_episode(
+    path: Path,
+    *,
+    arrays: dict[str, np.ndarray],
+    raw_attrs: dict[str, Any],
+    raw_camera_group: dict[str, np.ndarray] | None,
+    preprocessing_params: dict[str, Any],
+    raw_basename: str,
+) -> None:
+    with h5py.File(path, "w") as f:
+        for key, arr in arrays.items():
+            f.create_dataset(key, data=arr, compression="gzip", compression_opts=1)
+        # Camera-timestamps group is preserved verbatim. Demos are joints-only by
+        # design, so this branch is usually inert; kept for robustness in case a
+        # future workflow attaches cameras to demonstrate.
+        if raw_camera_group:
+            group = f.create_group("camera_timestamps")
+            for name, ts in raw_camera_group.items():
+                group.create_dataset(name, data=ts, compression="gzip", compression_opts=1)
+        for k, v in raw_attrs.items():
+            f.attrs[k] = v
+        # Overwrite duration / num_steps with the post-pipeline values.
+        f.attrs["num_steps"] = int(arrays["joint_pos"].shape[0])
+        f.attrs["duration_s"] = float(arrays["timestamps"][-1])
+        f.attrs["preprocessing_version"] = int(PREPROCESSING_VERSION)
+        f.attrs["preprocessing_params"] = json.dumps(preprocessing_params)
+        f.attrs["raw_episode"] = raw_basename
+
+
+# ---------------------------------------------------------------------------
+# Resampling
+# ---------------------------------------------------------------------------
+
+def _resample_aligned_fields(
+    sliced: dict[str, np.ndarray],
+    *,
+    source_times: np.ndarray,
+    target_times: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Re-sample non-joint aligned arrays from `source_times` onto `target_times`.
+
+    `source_times` is the trimmed-and-rebased timeline of the original 1 kHz
+    samples; `target_times` is the (possibly denser, possibly retimed) post-
+    pipeline timeline that the joint trajectory now lives on.
+
+    Kinds:
+      * "linear" — np.interp per axis
+      * "slerp"  — scipy Slerp on 3×3 rotation matrices
+      * "nearest" — step interpolation, preserves binary semantics for
+                    gripper_open / buttons / enabled
+    """
+    out: dict[str, np.ndarray] = {}
+    # Clamp target times into the source range so interpolators don't extrapolate.
+    # If Ruckig overshoots the input duration slightly, the tail samples just
+    # repeat the final source value, which is the desired "hold-at-end" behaviour.
+    target_clamped = np.clip(target_times, source_times[0], source_times[-1])
+
+    for name, kind in _RESAMPLE_KIND.items():
+        if name not in sliced:
+            continue
+        arr = sliced[name]
+        if kind == "linear":
+            out[name] = _interp_linear(arr, source_times, target_clamped)
+        elif kind == "slerp":
+            out[name] = _interp_slerp(arr, source_times, target_clamped)
+        elif kind == "nearest":
+            out[name] = _interp_nearest(arr, source_times, target_clamped)
+    return out
+
+
+def _interp_linear(arr: np.ndarray, src_t: np.ndarray, dst_t: np.ndarray) -> np.ndarray:
+    if arr.ndim == 1:
+        return np.interp(dst_t, src_t, arr).astype(arr.dtype, copy=False)
+    flat = arr.reshape(arr.shape[0], -1)
+    out = np.empty((dst_t.shape[0], flat.shape[1]), dtype=arr.dtype)
+    for j in range(flat.shape[1]):
+        out[:, j] = np.interp(dst_t, src_t, flat[:, j])
+    return out.reshape((dst_t.shape[0],) + arr.shape[1:])
+
+
+def _interp_slerp(arr: np.ndarray, src_t: np.ndarray, dst_t: np.ndarray) -> np.ndarray:
+    """3×3 rotation matrices → Slerp → 3×3."""
+    if arr.ndim != 3 or arr.shape[1:] != (3, 3):
+        # Fall back to linear if shape doesn't match expectations.
+        return _interp_linear(arr, src_t, dst_t)
+    rotations = Rotation.from_matrix(arr)
+    slerp = Slerp(src_t, rotations)
+    return slerp(dst_t).as_matrix().astype(arr.dtype, copy=False)
+
+
+def _interp_nearest(arr: np.ndarray, src_t: np.ndarray, dst_t: np.ndarray) -> np.ndarray:
+    """Step-style nearest-neighbour lookup. Preserves binary signal integrity."""
+    # `searchsorted` gives the insertion index; pick whichever neighbour is closer.
+    idx = np.searchsorted(src_t, dst_t, side="left")
+    idx = np.clip(idx, 0, src_t.shape[0] - 1)
+    # For each target point, check whether idx-1 is closer than idx.
+    left = np.clip(idx - 1, 0, src_t.shape[0] - 1)
+    pick_left = (dst_t - src_t[left]) < (src_t[idx] - dst_t)
+    chosen = np.where(pick_left, left, idx)
+    return arr[chosen]
