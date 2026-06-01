@@ -90,36 +90,6 @@ class LatestPlanSlot:
                 return None
             return self._plan
 
-
-@dataclass
-class InferencePlan:
-    sequence: int
-    stage_idx: int
-    epoch: int
-    created_at: float
-    obs_started_at: float
-    trajectory: np.ndarray
-    gripper: np.ndarray
-
-
-class LatestPlanSlot:
-    """Single-slot handoff from the inference worker to the executor loop."""
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._plan: InferencePlan | None = None
-
-    def publish(self, plan: InferencePlan) -> None:
-        with self._lock:
-            self._plan = plan
-
-    def latest_after(self, sequence: int) -> InferencePlan | None:
-        with self._lock:
-            if self._plan is None or self._plan.sequence <= sequence:
-                return None
-            return self._plan
-
-
 # ---------------------------------------------------------------------------
 # Sys.path wiring — LangSteer is installed on the robot machine and provides
 # the policy/model code; we add it to PYTHONPATH before importing the policy.
