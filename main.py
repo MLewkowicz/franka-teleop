@@ -11,18 +11,24 @@ Usage:
 import hydra
 from omegaconf import DictConfig
 
-from net_franky import setup_net_franky
+from zero_franky import setup_zero_franky
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="config")
 def main(cfg: DictConfig):
-    setup_net_franky(cfg.net_franky.ip, cfg.net_franky.port)
+    setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port, pub_port=cfg.zero_franky.pub_port)
 
     if cfg.mode == "teleop":
         from teleop import run_teleop
         run_teleop(cfg)
+    elif cfg.mode == "demonstrate":
+        from demonstrate import run_demonstrate
+        run_demonstrate(cfg)
     elif cfg.mode == "replay":
         from replay import run_replay
+        run_replay(cfg)
+    elif cfg.mode == "replay_ff":
+        from replay_ff import run_replay
         run_replay(cfg)
     elif cfg.mode == "calibrate":
         from calibrate_extrinsics import run_calibration

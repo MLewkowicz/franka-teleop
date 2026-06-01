@@ -11,7 +11,7 @@ and the ChArUco board is fixed in the robot base/world. The same capture
 flow solves ``T_cam2gripper`` and writes both ``T_cam2gripper`` and its
 inverse ``T_gripper2cam``.
 
-Manual capture uses low Cartesian impedance + live camera preview. The
+Manual capture uses low joint impedance + live camera preview. The
 operator physically guides the arm to each pose and presses SPACE to capture.
 
 Output: a JSON file with the recovered transform(s), intrinsics snapshot,
@@ -21,29 +21,27 @@ and quality statistics.
 import datetime
 import json
 import logging
-import threading
-import time
 from pathlib import Path
 
 import cv2
 import numpy as np
+import viser
 from omegaconf import DictConfig
 from scipy.spatial.transform import Rotation as R
 
-from net_franky.franky import JointImpedanceTracker, Robot
+from zero_franky import Robot
+from zero_franky.tracker_policies import hold_current_joint
 
-from clear_franka.camera import ZedCamera, get_camera_config, make_zed_camera
+from clear_franka.camera import ZedCamera, get_camera_config
 from clear_franka.geometry import (
     average_transforms as _average_transforms,
     invert_transform as _invert_transform,
     make_transform as _make_transform,
 )
-from clear_franka.utils import prompt_yes_no, wait_for_enter
-
+from clear_franka.visualization import CortadoViserVisualizer
 logger = logging.getLogger(__name__)
 
-DEFAULT_LOWER_JOINT_LIMITS = [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973]
-DEFAULT_UPPER_JOINT_LIMITS = [2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973]
+from clear_franka.franka import DEFAULT_LOWER_JOINT_LIMITS, DEFAULT_UPPER_JOINT_LIMITS, joint_friction_kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -304,76 +302,40 @@ def _iqr_inlier_mask(errors, k=1.5):
     return errors <= q3 + k * (q3 - q1)
 
 
-# ---------------------------------------------------------------------------
-# Capture: kinesthetic manual
-# ---------------------------------------------------------------------------
+def _add_capture_frame(visualizer: CortadoViserVisualizer,
+                       O_T_EE: np.ndarray, index: int) -> None:
+    """Show the EE pose at capture time as a persistent frame in the viser scene."""
+    T = visualizer.urdf_model.get_transform("fr3_link0")
+    pos = (T[:3, :3] @ O_T_EE[:3, 3] + T[:3, 3]).astype(np.float32)
+    rot = T[:3, :3] @ O_T_EE[:3, :3]
+    handle = visualizer.server.scene.add_frame(
+        f"/captures/pose_{index:02d}",
+        axes_length=0.05,
+        axes_radius=0.004,
+    )
+    handle.wxyz = viser.transforms.SO3.from_matrix(rot).wxyz
+    handle.position = pos
 
 
-def _run_calibration_pointcloud_viewer(
-    cfg: DictConfig,
-    camera_mount: str,
-    extrinsics_path: Path,
-    robot,
-) -> None:
-    vc = cfg.get("visualization", {}).get("viser", {})
-    pc = vc.get("pointclouds", {}).get(camera_mount, {})
-    if not pc:
-        print(f"  [viser] No visualization.viser.pointclouds.{camera_mount} config found.")
-        return
-
-    camera = make_zed_camera(cfg, camera_mount)
+def _update_visualizer_state(visualizer: CortadoViserVisualizer, robot: Robot) -> None:
     try:
-        camera.run()
-
-        from clear_franka.visualization import CortadoViserVisualizer
-
-        visualizer = CortadoViserVisualizer(
-            host=vc.get("host", "0.0.0.0"),
-            port=int(vc.get("port", 8080)),
-        )
-        try:
-            visualizer.update(np.asarray(robot.current_joint_positions, dtype=float))
-        except Exception as exc:
-            print(f"  [viser] Could not update robot state: {exc}")
-
-        if camera_mount == "hand":
-            frame_name = pc.get("frame_name", "hand_zed")
-            visualizer.add_hand_camera_frame_from_extrinsics(frame_name, extrinsics_path)
-        else:
-            frame_name = pc.get("frame_name", "/third_person_zed")
-            visualizer.add_camera_frame_from_extrinsics(frame_name, extrinsics_path)
-
-        camera.start_pointcloud_stream(
-            update_hz=float(pc.get("update_hz", 5.0)),
-            stride=int(pc.get("stride", 4)),
-            max_points=int(pc.get("max_points", 100_000)),
-            max_distance_m=float(pc.get("max_distance_m", 3.0)),
-        )
-        print(f"  [viser] {camera_mount} point cloud viewer running from {extrinsics_path}.")
-        print("  [viser] Press ENTER to stop.")
-
-        last_pointcloud_timestamp = None
-        while True:
-            latest_pointcloud = camera.get_latest_pointcloud()
-            if latest_pointcloud is not None:
-                points, colors, timestamp = latest_pointcloud
-                if timestamp != last_pointcloud_timestamp:
-                    visualizer.update_pointcloud(
-                        frame_name,
-                        points,
-                        colors,
-                        point_size=float(pc.get("point_size", 0.01)),
-                    )
-                    last_pointcloud_timestamp = timestamp
-            if wait_for_enter(0.05):
-                break
-            time.sleep(0.02)
-    finally:
-        camera.stop_pointcloud_stream()
-        camera.close()
+        state = robot.get_last_teleop_state()
+        if state is None:
+            return
+        if "q" in state:
+            visualizer.update(np.asarray(state["q"], dtype=float))
+        if "O_T_EE" in state:
+            T_ee = np.asarray(state["O_T_EE"], dtype=float)
+            if T_ee.ndim == 1:
+                T_ee = T_ee.reshape(4, 4)
+            visualizer.update_eef_frame(T_ee)
+    except Exception:
+        pass
 
 
-def _capture_kinesthetic(robot, camera, cal, detector, board, K, dist, debug_dir):
+def _capture_kinesthetic(robot, camera, joint_stiffnesses, cal, detector, board, K, dist, debug_dir,
+                         joint_friction=None,
+                         visualizer: CortadoViserVisualizer | None = None):
     """Low-impedance kinesthetic teaching with live camera preview.
 
     The arm becomes back-drivable via a low-stiffness joint impedance
@@ -385,94 +347,103 @@ def _capture_kinesthetic(robot, camera, cal, detector, board, K, dist, debug_dir
         ENTER — finish capture, proceed to hand-eye solve
         Q     — abort
     """
-    kin = cal.kinesthetic
-    stop_event = threading.Event()
-    tracker_error = [None]
 
-    def _hold_compliant():
+    with robot.start_joint_impedance_session(
+        hold_current_joint,
+        period=0.001,
+        stiffness=joint_stiffnesses,
+        lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
+        upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
+        **(joint_friction or {}),
+    ) as session:
+        print()
+        print("=" * 70)
+        print("KINESTHETIC CAPTURE — the arm is now compliant.")
+        if cal.get("camera_mount", "third_person") == "hand":
+            print("Fix the ChArUco board RIGIDLY in the robot base/world.")
+            print("Keep the hand camera pointed at the board while varying wrist pose.")
+        else:
+            print("Mount the ChArUco board RIGIDLY to the gripper.")
+        print("Physically guide the arm to each calibration pose, then press:")
+        print("  SPACE  → capture current frame + EE pose")
+        print("  ENTER  → finish (need >= 4 captures to solve)")
+        print("  Q      → abort without solving")
+        print("=" * 70)
+        print()
+
+        samples = []
+        frame_count = 0
         try:
-            with JointImpedanceTracker(
-                robot,
-                stiffness=[float(value) for value in kin.joint_stiffness],
-                lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
-                upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
-                period=0.001,
-            ) as tracker:
-                while not stop_event.is_set():
-                    q = robot.current_joint_positions
-                    tracker.set_target(q)
-        except Exception as e:  # noqa: BLE001
-            tracker_error[0] = e
+            while True:
+                frame_count += 1
+                if frame_count % 30 == 0:
+                    status = session.status()
+                    if not status.get("running", True):
+                        raise RuntimeError(f"Impedance tracker faulted: {status.get('error')}")
 
-    thread = threading.Thread(target=_hold_compliant, daemon=True)
-    thread.start()
+                if visualizer is not None:
+                    _update_visualizer_state(visualizer, robot)
 
-    print()
-    print("=" * 70)
-    print("KINESTHETIC CAPTURE — the arm is now compliant.")
-    if cal.get("camera_mount", "third_person") == "hand":
-        print("Fix the ChArUco board RIGIDLY in the robot base/world.")
-        print("Keep the hand camera pointed at the board while varying wrist pose.")
-    else:
-        print("Mount the ChArUco board RIGIDLY to the gripper.")
-    print("Physically guide the arm to each calibration pose, then press:")
-    print("  SPACE  → capture current frame + EE pose")
-    print("  ENTER  → finish (need >= 4 captures to solve)")
-    print("  Q      → abort without solving")
-    print("=" * 70)
-    print()
-
-    samples = []
-    try:
-        while True:
-            if tracker_error[0] is not None:
-                raise RuntimeError(f"Impedance tracker faulted: {tracker_error[0]}")
-
-            frame = camera.grab_frame()
-            if frame is None:
-                # tiny yield to keep the GUI responsive
-                cv2.waitKey(1)
-                continue
-            rgb, _ = frame
-
-            detection = _detect_board_pose(detector, board, rgb, K, dist, cal.min_charuco_corners)
-            preview = _annotate_preview(
-                rgb, detection, K, dist,
-                axis_length_m=cal.board.square_length_m * 2.0,
-                num_captured=len(samples),
-            )
-            cv2.imshow("Calibration preview", preview)
-            key = cv2.waitKey(1) & 0xFF
-
-            if key == ord(' '):
-                if detection is None:
-                    logger.warning("Capture rejected: board not detected.")
+                frame = camera.grab_frame()
+                if frame is None:
+                    # tiny yield to keep the GUI responsive
+                    cv2.waitKey(1)
                     continue
-                ee_pose = robot.current_cartesian_state.pose.end_effector_pose
-                R_gripper2base = np.array(ee_pose.matrix)[:3, :3]
-                t_gripper2base = np.array(ee_pose.translation)
-                samples.append({
-                    "R_gripper2base": R_gripper2base,
-                    "t_gripper2base": t_gripper2base,
-                    **detection,
-                })
-                logger.info("  captured sample %d (%d corners)", len(samples), detection["n_corners"])
-                if debug_dir is not None:
-                    _save_debug_image(
-                        debug_dir / f"manual_{len(samples):02d}_ok.png",
-                        rgb, detection, K, dist, board, cal.board.square_length_m,
-                    )
-            elif key in (13, 10):  # Enter
-                break
-            elif key == ord('q'):
-                samples = []
-                break
-    finally:
-        cv2.destroyAllWindows()
-        stop_event.set()
-        thread.join(timeout=2.0)
+                rgb, _ = frame
+
+                detection = _detect_board_pose(detector, board, rgb, K, dist, cal.min_charuco_corners)
+                preview = _annotate_preview(
+                    rgb, detection, K, dist,
+                    axis_length_m=cal.board.square_length_m * 2.0,
+                    num_captured=len(samples),
+                )
+                cv2.imshow("Calibration preview", preview)
+                key = cv2.waitKey(1) & 0xFF
+
+                if key == ord(' '):
+                    if detection is None:
+                        logger.warning("Capture rejected: board not detected.")
+                        continue
+                    state = robot.get_last_teleop_state()
+                    O_T_EE = np.asarray(state["O_T_EE"], dtype=float)
+                    R_gripper2base = O_T_EE[:3, :3].copy()
+                    t_gripper2base = O_T_EE[:3, 3].copy()
+                    samples.append({
+                        "R_gripper2base": R_gripper2base,
+                        "t_gripper2base": t_gripper2base,
+                        **detection,
+                    })
+                    logger.info("  captured sample %d (%d corners)", len(samples), detection["n_corners"])
+                    if visualizer is not None:
+                        _add_capture_frame(visualizer, O_T_EE, len(samples))
+                    if debug_dir is not None:
+                        _save_debug_image(
+                            debug_dir / f"manual_{len(samples):02d}_ok.png",
+                            rgb, detection, K, dist, board, cal.board.square_length_m,
+                        )
+                elif key in (13, 10):  # Enter
+                    break
+                elif key == ord('q'):
+                    samples = []
+                    break
+        finally:
+            cv2.destroyAllWindows()
 
     return samples
+
+
+def _demonstration_joint_friction_kwargs(cfg: DictConfig) -> dict:
+    """Resolve the same config-driven friction parameters used by demonstrate.py."""
+    kwargs = joint_friction_kwargs(cfg.demonstrate)
+    if kwargs:
+        logger.info(
+            "Using demonstrate.joint_friction for calibration: coulomb=%s viscous=%s",
+            kwargs["friction_coulomb"],
+            kwargs["friction_viscous"],
+        )
+    else:
+        logger.info("Joint friction compensation disabled for calibration.")
+    return kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -494,38 +465,50 @@ def run_calibration(cfg: DictConfig):
     debug_dir = Path(cfg.get("data_dir", "./data")) / f"calibration_debug_{camera_mount}"
     debug_dir.mkdir(parents=True, exist_ok=True)
 
+    # ------------------------------------------------------------------ visualizer
+    vc = cfg.get("visualization", {})
+    visualizer = CortadoViserVisualizer(
+        host=vc.get("host", "0.0.0.0"),
+        port=int(vc.get("port", 8080)),
+    )
+
     # ------------------------------------------------------------------ camera
     camera_cfg = get_camera_config(cfg, camera_mount)
-    camera = ZedCamera(
+    with ZedCamera(
         resolution="HD2K",
         fps=camera_cfg["fps"],
         depth_mode=camera_cfg["depth_mode"],
         serial_number=camera_cfg["serial_number"],
         camera_id=camera_cfg["name"],
-    )
-    K, dist = camera.get_intrinsics()
-    logger.info(
-        "Opened %s ZED serial=%s; intrinsics: fx=%.2f fy=%.2f cx=%.2f cy=%.2f",
-        camera_mount,
-        camera_cfg["serial_number"],
-        K[0, 0],
-        K[1, 1],
-        K[0, 2],
-        K[1, 2],
-    )
+    ) as camera:
+        K, dist = camera.get_intrinsics()
+        logger.info(
+            "Opened %s ZED serial=%s; intrinsics: fx=%.2f fy=%.2f cx=%.2f cy=%.2f",
+            camera_mount,
+            camera_cfg["serial_number"],
+            K[0, 0],
+            K[1, 1],
+            K[0, 2],
+            K[1, 2],
+        )
 
-    board, detector = _build_board(cal.board)
+        board, detector = _build_board(cal.board)
 
-    # ------------------------------------------------------------------- robot
-    logger.info("Connecting to Franka at %s ...", cfg.robot.ip)
-    robot = Robot(cfg.robot.ip)
-    robot.recover_from_errors()
+        # ------------------------------------------------------------------- robot
+        logger.info("Connecting to Franka at %s ...", cfg.robot.ip)
+        robot = Robot(cfg.robot.ip)
+        robot.recover_from_errors()
 
-    # ------------------------------------------------------------------- capture
-    try:
-        samples = _capture_kinesthetic(robot, camera, cal, detector, board, K, dist, debug_dir)
-    finally:
-        camera.close()
+        # ------------------------------------------------------------------- capture
+        joint_friction = _demonstration_joint_friction_kwargs(cfg)
+        samples = _capture_kinesthetic(
+            robot, camera,
+            [float(v) for v in cfg.demonstrate.joint_stiffness],
+            cal,
+            detector, board, K, dist, debug_dir,
+            joint_friction=joint_friction,
+            visualizer=visualizer,
+        )
 
     if len(samples) < 4:
         raise RuntimeError(
@@ -650,20 +633,3 @@ def run_calibration(cfg: DictConfig):
     with out_path.open("w") as f:
         json.dump(payload, f, indent=2)
     logger.info("Wrote %s", out_path)
-
-    try:
-        show_pointcloud = prompt_yes_no(
-            "View camera point cloud in viser with extrinsics applied?",
-            default=False,
-        )
-    except (EOFError, KeyboardInterrupt):
-        show_pointcloud = False
-        print()
-
-    if show_pointcloud:
-        try:
-            _run_calibration_pointcloud_viewer(cfg, camera_mount, out_path, robot)
-        except KeyboardInterrupt:
-            print()
-        except Exception as e:
-            print(f"  [viser] Point cloud viewer failed: {e}")

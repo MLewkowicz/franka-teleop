@@ -91,6 +91,35 @@ class LatestPlanSlot:
             return self._plan
 
 
+@dataclass
+class InferencePlan:
+    sequence: int
+    stage_idx: int
+    epoch: int
+    created_at: float
+    obs_started_at: float
+    trajectory: np.ndarray
+    gripper: np.ndarray
+
+
+class LatestPlanSlot:
+    """Single-slot handoff from the inference worker to the executor loop."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._plan: InferencePlan | None = None
+
+    def publish(self, plan: InferencePlan) -> None:
+        with self._lock:
+            self._plan = plan
+
+    def latest_after(self, sequence: int) -> InferencePlan | None:
+        with self._lock:
+            if self._plan is None or self._plan.sequence <= sequence:
+                return None
+            return self._plan
+
+
 # ---------------------------------------------------------------------------
 # Sys.path wiring — LangSteer is installed on the robot machine and provides
 # the policy/model code; we add it to PYTHONPATH before importing the policy.
@@ -966,6 +995,16 @@ def main(cfg: DictConfig) -> int:
         logger.warning(f"No SpaceMouse ({e}); buttons disabled — Ctrl-C to stop.")
 
     rate = LoopRatePrinter()
+    plan_hz = float(cfg.deploy.get("control_hz", 10.0))
+    execution_hz = float(cfg.deploy.get("execution_hz", 100.0))
+    plan_dt = 1.0 / plan_hz
+    execution_dt = 1.0 / execution_hz
+    policy_lock = threading.Lock()
+    latest_plan = LatestPlanSlot()
+    enabled_event = threading.Event()
+    request_event = threading.Event()
+    stop_event = threading.Event()
+    stage_state: dict = {"idx": stage_idx, "epoch": 0, "gripper_cmd": 1.0}
 
     # ----- teleop branch control objects (hybrid mode) -----
     sc = cfg.teleop.spacemouse
@@ -1054,7 +1093,7 @@ def main(cfg: DictConfig) -> int:
             nullspace_stiffness=cfg.deploy.nullspace_stiffness,
             nullspace_target=_ns_target,
             nullspace_tasks=[
-                PostureTask([0.120437, -0.797005, -0.427542, -2.740433, 2.785569, 2.719076, 2.955555], stiffness=2.0), 
+                PostureTask([0.120437, -0.797005, -0.427542, -2.740433, 2.785569, 2.719076, 2.955555], stiffness=2.0),
                 ManipulabilityTask(gain=5.0, max_torque=1.0),
             ],
             lower_joint_limits=_lower_lim,

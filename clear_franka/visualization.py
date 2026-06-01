@@ -10,6 +10,7 @@ from urllib.parse import unquote, urlparse
 import numpy as np
 
 from clear_franka.geometry import load_T_cam2base, load_T_cam2gripper
+from clear_franka.workspace_boxes import WorkspaceBoxEditor
 
 
 DEFAULT_ARM_JOINT_NAMES = tuple(f"fr3_joint{i}" for i in range(1, 8))
@@ -22,6 +23,14 @@ _GRIPPER_TCP_VISER_PATH = (
     "/fr3_link5/fr3_link6/fr3_link7/fr3_link8/coupling_link/base_link"
     "/robotiq_arg2f_base_link/robotiq_arg2f_tcp"
 )
+
+
+def _hand_camera_frame_path(name: str) -> str:
+    """Resolve a hand-camera frame name under the gripper TCP frame."""
+    name = str(name)
+    if name == _GRIPPER_TCP_VISER_PATH or name.startswith(f"{_GRIPPER_TCP_VISER_PATH}/"):
+        return name
+    return f"{_GRIPPER_TCP_VISER_PATH}/{name.strip('/')}"
 
 ROBOT_XACRO_ARGS = {
     "robot_name": "cortado",
@@ -176,12 +185,18 @@ class CortadoViserVisualizer:
             load_meshes=True,
         )
         self.urdf.show_visual = True
+        self._root_node_name = root_node_name
 
         self.actuated_joint_names = list(self.urdf.get_actuated_joint_names())
         self._cfg = np.zeros(len(self.actuated_joint_names), dtype=float)
         self._arm_joint_indices = self._resolve_arm_joint_indices()
         self._gripper_joint_index = self._resolve_optional_joint_index(DEFAULT_GRIPPER_JOINT_NAME)
         self.urdf.update_cfg(self._cfg)
+        self._plan_line_handle = None
+        self._plan_point_handle = None
+        self._interpolated_plan_line_handle = None
+        self._plan_frame_handles = []
+        self.workspace_box_editor: WorkspaceBoxEditor | None = None
 
         url_host = "localhost" if host in {"0.0.0.0", "::"} else host
         print(f"  [viser] Cortado URDF loaded from {urdf_path}")
@@ -232,13 +247,27 @@ class CortadoViserVisualizer:
         self._cfg[self._gripper_joint_index] = closed_fraction * DEFAULT_GRIPPER_JOINT_CLOSED
         self.urdf.update_cfg(self._cfg)
 
+    def enable_workspace_box_editor(
+        self,
+        json_path: str | Path = "data/workspace_boxes.json",
+        **kwargs,
+    ) -> WorkspaceBoxEditor:
+        self.workspace_box_editor = WorkspaceBoxEditor(self, json_path=json_path, **kwargs)
+        print(f"  [viser] Workspace box editor saving to {self.workspace_box_editor.path}")
+        return self.workspace_box_editor
+
+    def get_workspace_boxes(self) -> list[dict]:
+        if self.workspace_box_editor is None:
+            return []
+        return self.workspace_box_editor.boxes
+
     def add_camera_frame(
         self,
         name: str,
         T_cam2base: np.ndarray,
         axes_length: float = 0.08,
         axes_radius: float = 0.003,
-    ) -> None:
+    ) -> str:
         import viser.transforms
 
         T_cam2base = np.asarray(T_cam2base, dtype=float)
@@ -254,10 +283,11 @@ class CortadoViserVisualizer:
         )
         frame.wxyz = viser.transforms.SO3.from_matrix(T_cam2root[:3, :3]).wxyz
         frame.position = T_cam2root[:3, 3]
+        return name
 
-    def add_camera_frame_from_extrinsics(self, name: str, extrinsics_path: str | Path) -> None:
+    def add_camera_frame_from_extrinsics(self, name: str, extrinsics_path: str | Path) -> str:
         T_cam2base = load_T_cam2base(extrinsics_path)
-        self.add_camera_frame(name, T_cam2base)
+        return self.add_camera_frame(name, T_cam2base)
 
     def add_hand_camera_frame(
         self,
@@ -265,24 +295,26 @@ class CortadoViserVisualizer:
         T_cam2gripper: np.ndarray,
         axes_length: float = 0.08,
         axes_radius: float = 0.003,
-    ) -> None:
+    ) -> str:
         import viser.transforms
 
         T_cam2gripper = np.asarray(T_cam2gripper, dtype=float)
         if T_cam2gripper.shape != (4, 4):
             raise ValueError(f"Expected a 4x4 camera transform, got {T_cam2gripper.shape}")
 
+        frame_name = _hand_camera_frame_path(name)
         frame = self.server.scene.add_frame(
-            f"{_GRIPPER_TCP_VISER_PATH}/{name}",
+            frame_name,
             axes_length=axes_length,
             axes_radius=axes_radius,
         )
         frame.wxyz = viser.transforms.SO3.from_matrix(T_cam2gripper[:3, :3]).wxyz
         frame.position = T_cam2gripper[:3, 3]
+        return frame_name
 
-    def add_hand_camera_frame_from_extrinsics(self, name: str, extrinsics_path: str | Path) -> None:
+    def add_hand_camera_frame_from_extrinsics(self, name: str, extrinsics_path: str | Path) -> str:
         T_cam2gripper = load_T_cam2gripper(extrinsics_path)
-        self.add_hand_camera_frame(name, T_cam2gripper)
+        return self.add_hand_camera_frame(name, T_cam2gripper)
 
     def update_pointcloud(
         self,
@@ -330,3 +362,149 @@ class CortadoViserVisualizer:
         handle.wxyz = viser.transforms.SO3.from_matrix(T[:3, :3]).wxyz
         handle.position = T[:3, 3]
 
+    def clear_plan_waypoints(self) -> None:
+        for handle in (
+            self._plan_line_handle,
+            self._plan_point_handle,
+            self._interpolated_plan_line_handle,
+        ):
+            if handle is not None:
+                handle.remove()
+        self._plan_line_handle = None
+        self._plan_point_handle = None
+        self._interpolated_plan_line_handle = None
+
+        for handle in self._plan_frame_handles:
+            handle.remove()
+        self._plan_frame_handles = []
+
+    def update_interpolated_plan_path(
+        self,
+        positions: np.ndarray | None,
+        name: str = "/diffuser_plan/interpolated",
+        color: tuple[int, int, int] = (255, 95, 70),
+        line_width: float = 2.0,
+    ) -> None:
+        if self._interpolated_plan_line_handle is not None:
+            self._interpolated_plan_line_handle.remove()
+            self._interpolated_plan_line_handle = None
+
+        if positions is None:
+            return
+
+        positions = np.asarray(positions, dtype=float)
+        if positions.ndim != 2 or positions.shape[1] != 3:
+            raise ValueError(f"Expected positions shape (N, 3), got {positions.shape}")
+        if len(positions) < 2:
+            return
+
+        T_base_to_root = self.urdf_model.get_transform("fr3_link0")
+        R_base_to_root = T_base_to_root[:3, :3]
+        points = (R_base_to_root @ positions.T).T + T_base_to_root[:3, 3]
+        segments = np.stack([points[:-1], points[1:]], axis=1).astype(np.float32)
+        colors = np.full((len(segments), 2, 3), color, dtype=np.uint8)
+        self._interpolated_plan_line_handle = self.server.scene.add_line_segments(
+            name=name,
+            points=segments,
+            colors=colors,
+            line_width=line_width,
+        )
+
+    def update_plan_waypoints(
+        self,
+        trajectory: np.ndarray | None,
+        active_index: int = 0,
+        gripper: np.ndarray | None = None,
+        name: str = "/diffuser_plan",
+        point_size: float = 0.0009,
+        line_width: float = 1.0,
+        axes_length: float = 0.008,
+        axes_radius: float = 0.0015,
+        show_axes: bool = False,
+    ) -> None:
+        if trajectory is None:
+            self.clear_plan_waypoints()
+            return
+
+        trajectory = np.asarray(trajectory, dtype=float)
+        if trajectory.ndim != 2 or trajectory.shape[1] < 3:
+            raise ValueError(f"Expected trajectory shape (N, >=3), got {trajectory.shape}")
+        if len(trajectory) == 0:
+            self.clear_plan_waypoints()
+            return
+
+        active_index = int(np.clip(active_index, 0, len(trajectory) - 1))
+        T_base_to_root = self.urdf_model.get_transform("fr3_link0")
+        R_base_to_root = T_base_to_root[:3, :3]
+        points = (R_base_to_root @ trajectory[:, :3].T).T + T_base_to_root[:3, 3]
+
+        if gripper is None:
+            gripper_cmd = np.ones(len(points), dtype=bool)
+        else:
+            gripper_cmd = np.asarray(gripper, dtype=float).reshape(-1)[:len(points)] > 0.0
+            if len(gripper_cmd) == 0:
+                gripper_cmd = np.ones(len(points), dtype=bool)
+            if len(gripper_cmd) < len(points):
+                gripper_cmd = np.pad(
+                    gripper_cmd,
+                    (0, len(points) - len(gripper_cmd)),
+                    mode="edge",
+                )
+        colors = np.where(
+            gripper_cmd[:, None],
+            np.array([80, 160, 255], dtype=np.uint8),
+            np.array([255, 95, 70], dtype=np.uint8),
+        )
+        colors[:active_index] = (colors[:active_index].astype(np.float32) * 0.45).astype(np.uint8)
+        colors[active_index] = np.minimum(
+            colors[active_index].astype(np.uint16)
+            + np.array([55, 55, 55], dtype=np.uint16),
+            255,
+        ).astype(np.uint8)
+
+        if self._plan_point_handle is not None:
+            self._plan_point_handle.remove()
+        self._plan_point_handle = self.server.scene.add_point_cloud(
+            name=f"{name}/waypoints",
+            points=points.astype(np.float32),
+            colors=colors,
+            point_size=point_size,
+            point_shape="circle",
+        )
+
+        if self._plan_line_handle is not None:
+            self._plan_line_handle.remove()
+        if len(points) > 1:
+            segments = np.stack([points[:-1], points[1:]], axis=1).astype(np.float32)
+            segment_colors = np.stack([colors[:-1], colors[1:]], axis=1)
+            self._plan_line_handle = self.server.scene.add_line_segments(
+                name=f"{name}/segments",
+                points=segments,
+                colors=segment_colors,
+                line_width=line_width,
+            )
+        else:
+            self._plan_line_handle = None
+
+        for handle in self._plan_frame_handles:
+            handle.remove()
+        self._plan_frame_handles = []
+        if not show_axes or trajectory.shape[1] < 6:
+            return
+
+        import viser.transforms
+        from scipy.spatial.transform import Rotation as R
+
+        rotations = R.from_euler("XYZ", trajectory[:, 3:6]).as_matrix()
+        for i, (point, rot_base) in enumerate(zip(points, rotations)):
+            T = np.eye(4)
+            T[:3, :3] = R_base_to_root @ rot_base
+            T[:3, 3] = point
+            handle = self.server.scene.add_frame(
+                f"{name}/frame_{i:02d}",
+                axes_length=axes_length * (1.35 if i == active_index else 1.0),
+                axes_radius=axes_radius,
+            )
+            handle.wxyz = viser.transforms.SO3.from_matrix(T[:3, :3]).wxyz
+            handle.position = T[:3, 3]
+            self._plan_frame_handles.append(handle)
