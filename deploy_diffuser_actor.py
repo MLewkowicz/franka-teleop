@@ -90,6 +90,122 @@ class LatestPlanSlot:
                 return None
             return self._plan
 
+
+class DeployTrace:
+    """Sidecar recorder for a diffuser-actor deploy session.
+
+    Captures the two things a policy run produces that the executed-trajectory
+    episode (TrajectoryRecorder) does not:
+      1. every plan published by the inference worker (the raw policy output),
+      2. the Cartesian tracking error — commanded reference vs measured EE pose
+         — at each execution tick.
+    Written to a sidecar HDF5 next to the episode file: ``episode_<wall>_deploy.h5``.
+    Thread-safe: ``record_plan`` is called from the worker thread, ``record_error``
+    from the executor loop.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._t0 = 0.0
+        self._plans: list[dict] = []
+        self._err: list[dict] = []
+
+    def start(self) -> None:
+        """Anchor the relative time base (call alongside recorder.start())."""
+        self._t0 = time.monotonic()
+
+    def record_plan(self, plan: "InferencePlan") -> None:
+        with self._lock:
+            self._plans.append({
+                "sequence": int(plan.sequence),
+                "stage_idx": int(plan.stage_idx),
+                "epoch": int(plan.epoch),
+                "created_at": float(plan.created_at),
+                "obs_started_at": float(plan.obs_started_at),
+                "trajectory": np.asarray(plan.trajectory, dtype=np.float64).copy(),
+                "gripper": np.asarray(plan.gripper, dtype=np.float64).copy(),
+                "ee_pos_at_obs": np.asarray(plan.ee_pos_at_obs, dtype=np.float64).copy(),
+                "ee_euler_at_obs": np.asarray(plan.ee_euler_at_obs, dtype=np.float64).copy(),
+            })
+
+    def record_error(self, *, t, plan_sequence, active_index,
+                     target_pos, target_rot, measured_pos, measured_rot) -> None:
+        target_pos = np.asarray(target_pos, dtype=np.float64)
+        measured_pos = np.asarray(measured_pos, dtype=np.float64)
+        target_rot = np.asarray(target_rot, dtype=np.float64)
+        measured_rot = np.asarray(measured_rot, dtype=np.float64)
+        pos_err = target_pos - measured_pos
+        # Geodesic angle between commanded and measured orientation.
+        R_err = target_rot @ measured_rot.T
+        cos_angle = (np.trace(R_err) - 1.0) / 2.0
+        rot_err_rad = float(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
+        with self._lock:
+            self._err.append({
+                "t": float(t),
+                "plan_sequence": int(plan_sequence),
+                "active_index": int(active_index),
+                "target_pos": target_pos.copy(),
+                "measured_pos": measured_pos.copy(),
+                "pos_error": pos_err.copy(),
+                "pos_error_norm": float(np.linalg.norm(pos_err)),
+                "target_rot": target_rot.copy(),
+                "measured_rot": measured_rot.copy(),
+                "rot_error_rad": rot_err_rad,
+            })
+
+    def save(self, path) -> int:
+        """Write the sidecar HDF5. Returns the number of plans saved."""
+        import h5py
+
+        with self._lock:
+            plans = list(self._plans)
+            err = list(self._err)
+            t0 = self._t0
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with h5py.File(path, "w") as f:
+            f.attrs["num_plans"] = len(plans)
+            f.attrs["num_error_samples"] = len(err)
+
+            # ---- per-tick Cartesian tracking error ----
+            g = f.create_group("tracking_error")
+            if err:
+                def col(key):
+                    return np.stack([e[key] for e in err])
+                g.create_dataset("timestamps",
+                                 data=np.array([e["t"] - t0 for e in err], dtype=np.float64))
+                g.create_dataset("plan_sequence",
+                                 data=np.array([e["plan_sequence"] for e in err], dtype=np.int32))
+                g.create_dataset("active_index",
+                                 data=np.array([e["active_index"] for e in err], dtype=np.int32))
+                g.create_dataset("target_pos", data=col("target_pos"))
+                g.create_dataset("measured_pos", data=col("measured_pos"))
+                g.create_dataset("pos_error", data=col("pos_error"))
+                g.create_dataset("pos_error_norm",
+                                 data=np.array([e["pos_error_norm"] for e in err], dtype=np.float64))
+                g.create_dataset("target_rot", data=col("target_rot"))
+                g.create_dataset("measured_rot", data=col("measured_rot"))
+                g.create_dataset("rot_error_rad",
+                                 data=np.array([e["rot_error_rad"] for e in err], dtype=np.float64))
+
+            # ---- raw policy plans (one subgroup per published plan) ----
+            pg = f.create_group("plans")
+            for p in plans:
+                sub = pg.create_group(f"plan_{p['sequence']:04d}")
+                sub.attrs["sequence"] = p["sequence"]
+                sub.attrs["stage_idx"] = p["stage_idx"]
+                sub.attrs["epoch"] = p["epoch"]
+                sub.attrs["created_at_s"] = p["created_at"] - t0
+                sub.attrs["obs_started_at_s"] = p["obs_started_at"] - t0
+                sub.create_dataset("trajectory", data=p["trajectory"],
+                                   compression="gzip", compression_opts=1)
+                sub.create_dataset("gripper", data=p["gripper"],
+                                   compression="gzip", compression_opts=1)
+                sub.create_dataset("ee_pos_at_obs", data=p["ee_pos_at_obs"])
+                sub.create_dataset("ee_euler_at_obs", data=p["ee_euler_at_obs"])
+        return len(plans)
+
 # ---------------------------------------------------------------------------
 # Sys.path wiring — LangSteer is installed on the robot machine and provides
 # the policy/model code; we add it to PYTHONPATH before importing the policy.
@@ -689,6 +805,7 @@ def _start_inference_worker(
     outlier_eul_thresh_rad: float,
     steering=None,
     steer_stage_indices: set[int] | None = None,
+    deploy_trace: "DeployTrace | None" = None,
 ) -> threading.Thread:
     steer_stage_indices = steer_stage_indices or set()
     def worker() -> None:
@@ -794,6 +911,8 @@ def _start_inference_worker(
                     ee_euler_at_obs=np.asarray(ee_euler_at_obs, dtype=np.float64).copy(),
                 )
                 latest_plan.publish(plan)
+                if deploy_trace is not None:
+                    deploy_trace.record_plan(plan)
                 logger.info(
                     "  published plan %d horizon=%d forward=%.2fs total=%.2fs first=%s last=%s gripper=%s",
                     plan.sequence,
@@ -1013,6 +1132,7 @@ def main(cfg: DictConfig) -> int:
     # frames synchronously (no .run()), which would conflict with the recorder's
     # background camera capture. The joint trajectory is all replay needs.
     recorder = None
+    deploy_trace = None
     if bool(cfg.deploy.get("record_trajectory", False)):
         recorder = TrajectoryRecorder(
             save_dir=cfg.data_dir,
@@ -1023,6 +1143,9 @@ def main(cfg: DictConfig) -> int:
                 "gripper_enabled": gripper is not None,
             },
         )
+        # Companion trace: raw policy plans + per-tick Cartesian tracking error,
+        # written to episode_<wall>_deploy.h5 next to the executed trajectory.
+        deploy_trace = DeployTrace()
 
     with contextlib.ExitStack() as stack:
         stack.enter_context(cam_hand)
@@ -1100,6 +1223,15 @@ def main(cfg: DictConfig) -> int:
             recorder.start()
             logger.info("Recording trajectory to %s/episode_%s.h5",
                         cfg.data_dir, recorder._start_wall)
+            if deploy_trace is not None:
+                deploy_trace.start()
+                _trace_path = Path(cfg.data_dir) / f"episode_{recorder._start_wall}_deploy.h5"
+                stack.callback(
+                    lambda: logger.info(
+                        "Saved deploy trace (%d plans) to %s",
+                        deploy_trace.save(_trace_path), _trace_path,
+                    )
+                )
         inference_thread = _start_inference_worker(
             policy=policy,
             policy_lock=policy_lock,
@@ -1128,6 +1260,7 @@ def main(cfg: DictConfig) -> int:
             ),
             steering=steering,
             steer_stage_indices=steer_stage_indices,
+            deploy_trace=deploy_trace,
         )
         stack.callback(lambda: (stop_event.set(), enabled_event.set(), inference_thread.join(timeout=1.0)))
 
@@ -1447,6 +1580,17 @@ def main(cfg: DictConfig) -> int:
                 target_xyz = np.clip(target_xyz, lo, hi)
 
                 tracker.set_cartesian_reference(Affine(pack_Rp(target_rot, target_xyz)))
+
+                if deploy_trace is not None:
+                    deploy_trace.record_error(
+                        t=time.monotonic(),
+                        plan_sequence=active_plan.sequence,
+                        active_index=active_index,
+                        target_pos=target_xyz,
+                        target_rot=target_rot,
+                        measured_pos=ee_pos,
+                        measured_rot=_ee_rot,
+                    )
 
                 cmd_state = 1.0 if active_plan.gripper[active_index] >= 0.5 else 0.0
                 if gripper is not None and cmd_state != stage_state["gripper_cmd"]:
