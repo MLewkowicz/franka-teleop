@@ -327,6 +327,7 @@ preprocess:
   retime:
     enabled: true
     sample_uniform: true
+    path_tol: 0.005  # RDP joint-space tolerance (rad, L2); ~0.3° per joint
 
 calibration:
   camera_mount: third_person           # third_person | hand

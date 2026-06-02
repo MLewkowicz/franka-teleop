@@ -55,6 +55,7 @@ def _preprocess_kwargs(pre_cfg: DictConfig) -> dict:
         "trim_threshold": float(trim_cfg.get("threshold", 0.01)),
         "retime_enabled": bool(retime_cfg.get("enabled", False)),
         "retime_sample_uniform": bool(retime_cfg.get("sample_uniform", False)),
+        "retime_path_tol": retime_cfg.get("path_tol", None),
         "retime_max_joint_vel": retime_cfg.get("max_joint_vel", None),
         "retime_max_joint_accel": retime_cfg.get("max_joint_accel", None),
         "smooth_enabled": bool(smooth_cfg.get("enabled", True)),

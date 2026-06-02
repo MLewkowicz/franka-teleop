@@ -43,9 +43,9 @@ PREPROCESSING_VERSION = 1
 
 # Datasets that must be re-sampled at the new timestamps. Each entry maps the
 # h5 dataset name → interpolation kind ("linear" | "slerp" | "nearest").
+# ee_pos / ee_rot are intentionally absent: they are recomputed via FK from
+# the final smoothed joint_pos so they stay consistent with the joint data.
 _RESAMPLE_KIND = {
-    "ee_pos": "linear",
-    "ee_rot": "slerp",
     "cmd_linear_vel": "linear",
     "cmd_angular_vel": "linear",
     "robot_abs_time": "linear",
@@ -53,6 +53,9 @@ _RESAMPLE_KIND = {
     "buttons": "nearest",
     "enabled": "nearest",
 }
+
+
+from clear_franka.franka import fk_ee_poses
 
 
 def preprocess_episode(
@@ -64,6 +67,7 @@ def preprocess_episode(
     trim_threshold: float = 0.01,
     retime_enabled: bool = False,
     retime_sample_uniform: bool = False,
+    retime_path_tol: float | None = None,
     retime_max_joint_vel: np.ndarray | list[float] | None = None,
     retime_max_joint_accel: np.ndarray | list[float] | None = None,
     smooth_enabled: bool = True,
@@ -95,6 +99,7 @@ def preprocess_episode(
         trim_threshold=trim_threshold,
         retime_enabled=retime_enabled,
         retime_sample_uniform=retime_sample_uniform,
+        retime_path_tol=retime_path_tol,
         retime_max_joint_vel=retime_max_joint_vel,
         retime_max_joint_accel=retime_max_joint_accel,
         smooth_enabled=smooth_enabled,
@@ -134,6 +139,7 @@ def preprocess_episode_arrays(
     trim_threshold: float = 0.01,
     retime_enabled: bool = False,
     retime_sample_uniform: bool = False,
+    retime_path_tol: float | None = None,
     retime_max_joint_vel: np.ndarray | list[float] | None = None,
     retime_max_joint_accel: np.ndarray | list[float] | None = None,
     smooth_enabled: bool = True,
@@ -193,10 +199,12 @@ def preprocess_episode_arrays(
         return None
 
     # --- 2. retime (TOPPRA) -----------------------------------------------
-    # Run BEFORE smooth so TOPPRA operates on the sparse trimmed waypoints
-    # (hundreds). Running it on Ruckig's dense 1 kHz output (~17k samples)
-    # makes its reachability solver fail with FailUncontrollable.
+    # Run BEFORE smooth so TOPPRA operates on a sparse geometric path
+    # (tens to hundreds of waypoints). Running it on Ruckig's dense 1 kHz
+    # output (~17k samples) makes its reachability solver fail.
     current = trimmed_traj
+    sparse_source_times: np.ndarray | None = None
+    sparse_toppra_times: np.ndarray | None = None
     if retime_enabled:
         if retime_max_joint_vel is None and smooth_max_joint_vel is None:
             raise ValueError("retime_enabled=True requires retime_max_joint_vel or smooth_max_joint_vel")
@@ -210,11 +218,27 @@ def preprocess_episode_arrays(
             smooth_max_joint_accel if retime_max_joint_accel is None else retime_max_joint_accel,
             dtype=np.float64,
         )
-        current = current.retime(
+        if retime_path_tol is not None:
+            sparse = trimmed_traj.simplify(tol=float(retime_path_tol))
+            logger.info(
+                "preprocess: RDP simplified %d → %d waypoints (tol=%.4f rad)",
+                trimmed_traj.num_waypts, sparse.num_waypts, retime_path_tol,
+            )
+        else:
+            sparse = trimmed_traj
+
+        # Capture source times (in the trimmed timeline) before TOPPRA retimes.
+        # sparse_source_times[i] ↔ sparse_toppra_times[i]: same path index.
+        sparse_source_times = np.asarray(sparse.waypts_time, dtype=np.float64)
+
+        current = sparse.retime(
             max_vel=max_vel,
             max_accel=max_accel,
             sample_uniform=bool(retime_sample_uniform),
         )
+
+        # Capture retimed timestamps before Ruckig overwrites current.waypts_time.
+        sparse_toppra_times = np.asarray(current.waypts_time, dtype=np.float64)
 
     # --- 3. smooth (Ruckig) -----------------------------------------------
     # Operates on the (possibly retimed) waypoints. Ruckig's bounded-jerk
@@ -233,13 +257,22 @@ def preprocess_episode_arrays(
             dt=float(smooth_dt),
         )
 
-    # Final joint trajectory and (rebased-to-zero) timestamps.
+    # Final joint trajectory and timestamps.
     joint_pos_out = np.asarray(current.waypts, dtype=np.float64)
     times_out = np.asarray(current.waypts_time, dtype=np.float64)
     times_out = times_out - times_out[0]
     if times_out[-1] <= 0:
         logger.error("preprocess: degenerate output duration %.6f", float(times_out[-1]))
         return None
+
+    target_times = times_out
+    if sparse_source_times is not None and sparse_toppra_times is not None:
+        # Map each dense output time to its source time in the trimmed trajectory.
+        # The (sparse_toppra_times → sparse_source_times) mapping is monotone, so
+        # np.interp gives an exact, principled alignment without nearest-neighbour
+        # joint matching. For RDP: source times are exact members of times_trim.
+        target_times = np.interp(times_out, sparse_toppra_times, sparse_source_times)
+        target_times = np.clip(target_times, times_trim[0], times_trim[-1])
 
     # Velocity-bound assertion (post-smooth). Allow 5% slack for numerical diff.
     if smooth_enabled:
@@ -258,7 +291,7 @@ def preprocess_episode_arrays(
     resampled = _resample_aligned_fields(
         sliced,
         source_times=times_trim,
-        target_times=times_out,
+        target_times=target_times,
     )
 
     # Recompute joint_vel from the smoothed joint_pos rather than re-sampling the
@@ -267,6 +300,17 @@ def preprocess_episode_arrays(
         joint_vel_out = np.gradient(joint_pos_out, times_out, axis=0)
     else:
         joint_vel_out = np.zeros_like(joint_pos_out)
+
+    # --- 5. recompute ee_pos / ee_rot via FK on the smoothed joints ----------
+    # The recorded Cartesian values would be inconsistent with the smoothed
+    # joint positions; FK on joint_pos_out guarantees consistency.
+    if "ee_pos" in sliced or "ee_rot" in sliced:
+        fk_pos, fk_rot = fk_ee_poses(joint_pos_out)
+        if "ee_pos" in sliced:
+            resampled["ee_pos"] = fk_pos
+        if "ee_rot" in sliced:
+            resampled["ee_rot"] = fk_rot
+        logger.info("preprocess: recomputed ee_pos/ee_rot via FK (%d frames)", joint_pos_out.shape[0])
 
     out_arrays: dict[str, np.ndarray] = {
         "timestamps": times_out,

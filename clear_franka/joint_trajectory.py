@@ -4,6 +4,48 @@ from scipy.interpolate import make_interp_spline
 from typing import Tuple
 
 
+def _rdp_indices(waypts: np.ndarray, tol: float) -> np.ndarray:
+    """Iterative Ramer-Douglas-Peucker simplification in joint space.
+
+    Returns the indices of the waypoints to keep so that the maximum
+    perpendicular deviation from any original waypoint to the simplified
+    piecewise-linear path is below `tol` (L2 across joints).
+    """
+    n = len(waypts)
+    if n <= 2:
+        return np.arange(n)
+
+    keep = np.zeros(n, dtype=bool)
+    keep[0] = True
+    keep[-1] = True
+
+    stack = [(0, n - 1)]
+    while stack:
+        lo, hi = stack.pop()
+        if hi - lo <= 1:
+            continue
+
+        p_lo = waypts[lo]
+        chord = waypts[hi] - p_lo
+        chord_sq = float(np.dot(chord, chord))
+        diff = waypts[lo + 1 : hi] - p_lo
+
+        if chord_sq < 1e-24:
+            dists = np.linalg.norm(diff, axis=1)
+        else:
+            t = np.clip((diff @ chord) / chord_sq, 0.0, 1.0)
+            dists = np.linalg.norm(diff - t[:, None] * chord, axis=1)
+
+        pivot_rel = int(np.argmax(dists))
+        if dists[pivot_rel] > tol:
+            pivot = lo + 1 + pivot_rel
+            keep[pivot] = True
+            stack.append((lo, pivot))
+            stack.append((pivot, hi))
+
+    return np.where(keep)[0]
+
+
 @lru_cache(maxsize=64)
 def _compute_deform_H(n):
     """
@@ -212,8 +254,11 @@ class Trajectory(object):
         max_vel = np.asarray(max_vel)
         max_accel = np.asarray(max_accel)
 
-        # Path parameter for each waypoint
-        path = ta.SplineInterpolator(self.waypts_time, self.waypts, bc_type='clamped')
+        # TOPPRA expects a geometric path parameter, not the demonstrated time.
+        # Using timestamps here makes the retimer inherit the original timing and
+        # can make compute_trajectory fail on slow/noisy demonstrations.
+        path_param = np.linspace(0.0, 1.0, self.num_waypts)
+        path = ta.SplineInterpolator(path_param, self.waypts, bc_type='clamped')
 
         # Symmetric joint limits: (dof, 2) with [-limit, +limit]
         vlim = np.column_stack([-max_vel, max_vel])
@@ -228,8 +273,7 @@ class Trajectory(object):
         jnt_traj = instance.compute_trajectory(0, 0)
 
         if jnt_traj is None:
-            # Infeasible — return original timing
-            return Trajectory(self.waypts.copy(), np.array(self.waypts_time))
+            raise RuntimeError("TOPPRA failed to compute a feasible retimed trajectory")
 
         duration = jnt_traj.duration
 
@@ -301,6 +345,18 @@ class Trajectory(object):
             new_waypts = self._spline(uniform_times)
 
         return Trajectory(new_waypts, uniform_times)
+
+    def simplify(self, tol: float) -> "Trajectory":
+        """Simplify path using Ramer-Douglas-Peucker in joint space.
+
+        Keeps only the waypoints needed so the maximum perpendicular deviation
+        from any original waypoint to the simplified piecewise-linear path is
+        below `tol` radians (L2 across joints). Returned waypts_time values are
+        exact members of self.waypts_time, serving as source-time indices into
+        the original dense trajectory.
+        """
+        indices = _rdp_indices(self.waypts, tol)
+        return Trajectory(self.waypts[indices], self.waypts_time[indices])
 
     def smooth(self, max_vel: np.ndarray, max_accel: np.ndarray, max_jerk: np.ndarray,
                dt: float = 0.001) -> "Trajectory":
