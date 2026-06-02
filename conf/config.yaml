@@ -97,6 +97,8 @@ recorder:
   svo_compression: H265_LOSSLESS       # H264 | H265 | LOSSLESS | H264_LOSSLESS | H265_LOSSLESS
 
 replay:
+  tracker: joint                                # joint or cartesian
+  preprocess: true                              # run top-level preprocess pipeline on loaded episode before replay
   # max_linear_vel_m_s: 0.015
   max_linear_vel_m_s: 0.03                      # Open-loop retime speed limit for Cartesian translation.
   max_angular_vel_rad_s: 0.25                   # Open-loop retime speed limit for Cartesian orientation.
@@ -107,6 +109,10 @@ replay:
   period: 0.001
   # Joint impedance gains. Stiffer = better tracking, less compliance.
   joint_stiffness: [320.0, 320.0, 320.0, 320.0, 120.0, 120.0, 30.0]
+  translational_stiffness: 100.0                # Cartesian tracker translation stiffness.
+  rotational_stiffness: 5.0                     # Cartesian tracker rotation stiffness.
+  nullspace_stiffness: 2.0                      # Cartesian tracker posture-task stiffness.
+  # nullspace_target defaults to the first joint state in the replayed episode; set to "none" to disable.
   # Pre-positioning move to the first joint configuration of the episode.
   record: false                     # save measured robot state as a new episode
 

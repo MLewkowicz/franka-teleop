@@ -8,9 +8,13 @@ import numpy as np
 from omegaconf import DictConfig
 
 from zero_franky import Robot
-from franky import JointMotion, JointState
+from franky import Affine, JointMotion, JointState, ManipulabilityTask, PostureTask, Twist
 
+from clear_franka.cartesian_trajectory import CartesianTrajectory
 from clear_franka.franka import DEFAULT_LOWER_JOINT_LIMITS, DEFAULT_UPPER_JOINT_LIMITS
+from clear_franka.geometry import pack_Rp
+from clear_franka.joint_trajectory import Trajectory
+from clear_franka.preprocess import preprocess_episode_arrays
 
 
 def find_latest_episode(data_dir: str) -> Path:
@@ -54,9 +58,9 @@ def play_joint_trajectory(
     gripper_open_data,
     recorder=None,
     gripper_open_for_record=None,
-    complete_message: str = "Replay complete.",
 ):
     n_steps = len(timestamps)
+    trajectory = Trajectory(joint_pos, timestamps)
 
     with robot.start_joint_impedance_session(
         period=rc.period,
@@ -77,14 +81,15 @@ def play_joint_trajectory(
             while step < n_steps - 1 and timestamps[step + 1] <= elapsed:
                 step += 1
 
-            if step >= n_steps - 1:
-                print(f"  {complete_message}")
+            if elapsed >= timestamps[-1]:
+                print("  Replay complete.")
                 session.set_joint_reference(joint_pos[-1].tolist())
                 break
 
-            q = joint_pos[step]
+            q = trajectory.interpolate(elapsed).reshape(7)
             if has_joint_vel:
-                dq = joint_vel[step] * rc.speed
+                dq = np.asarray(trajectory._spline.derivative()(elapsed), dtype=float).reshape(7)
+                dq = dq * rc.speed
                 session.set_joint_reference(q.tolist(), velocity=dq.tolist())
             else:
                 session.set_joint_reference(q.tolist())
@@ -131,12 +136,124 @@ def play_joint_trajectory(
     return gripper_open_for_record
 
 
-def play_with_recovery(**kwargs):
+def play_cartesian_trajectory(
+    *,
+    robot: Robot,
+    cfg: DictConfig,
+    rc: DictConfig,
+    gc,
+    timestamps: np.ndarray,
+    ee_pos: np.ndarray,
+    ee_rot: np.ndarray,
+    joint_pos: np.ndarray,
+    gripper,
+    gripper_open_data,
+    recorder=None,
+    gripper_open_for_record=None,
+):
+    n_steps = len(timestamps)
+    trajectory = CartesianTrajectory(ee_pos, ee_rot, timestamps)
+    nullspace_target_cfg = rc.get("nullspace_target", None)
+    if nullspace_target_cfg is None:
+        nullspace_target = np.asarray(joint_pos[0], dtype=float)
+    elif str(nullspace_target_cfg).lower() == "none":
+        nullspace_target = None
+    else:
+        nullspace_target = np.asarray(nullspace_target_cfg, dtype=float)
+
+    with robot.start_cartesian_impedance_session(
+        period=rc.period,
+        translational_stiffness=float(
+            rc.get("translational_stiffness", cfg.teleop.translational_stiffness)
+        ),
+        rotational_stiffness=float(
+            rc.get("rotational_stiffness", cfg.teleop.rotational_stiffness)
+        ),
+        nullspace_tasks=[
+            PostureTask(
+                nullspace_target,
+                stiffness=float(
+                    rc.get("nullspace_stiffness", cfg.teleop.nullspace_stiffness)
+                ),
+            ),
+            ManipulabilityTask(gain=5.0, max_torque=1.0),
+        ],
+        lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
+        upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
+    ) as session:
+        step = 0
+        replay_start = None
+        last_gripper_open = None
+
+        while True:
+            if replay_start is None:
+                replay_start = time.monotonic()
+
+            elapsed = (time.monotonic() - replay_start) * rc.speed
+
+            while step < n_steps - 1 and timestamps[step + 1] <= elapsed:
+                step += 1
+
+            if elapsed >= timestamps[-1]:
+                print("  Replay complete.")
+                session.set_cartesian_reference(Affine(pack_Rp(ee_rot[-1], ee_pos[-1])))
+                break
+
+            target_pos, target_rot = trajectory.interpolate(elapsed)
+            linear_vel, angular_vel = trajectory.velocity(elapsed)
+            session.set_cartesian_reference(
+                Affine(pack_Rp(target_rot, target_pos)),
+                Twist(linear_vel * rc.speed, angular_vel * rc.speed),
+            )
+
+            if gripper is not None and np.isfinite(gripper_open_data[step]):
+                current_gripper_open = bool(round(float(gripper_open_data[step])))
+                if current_gripper_open != last_gripper_open:
+                    target_width = (
+                        gc.get("open_width_m", 0.085)
+                        if current_gripper_open
+                        else gc.get("close_width_m", 0.0)
+                    )
+                    try:
+                        gripper.move_width(
+                            target_width,
+                            speed=int(gc.get("speed", 255)),
+                            force=int(gc.get("force", 255)),
+                            wait=False,
+                            max_width_m=gc.get("max_width_m", 0.085),
+                        )
+                        last_gripper_open = current_gripper_open
+                        gripper_open_for_record = current_gripper_open
+                    except Exception as e:
+                        print(f"\n  [gripper] move failed: {e}")
+
+            if recorder is not None:
+                teleop_state = robot.get_last_teleop_state()
+                measured_pose = np.asarray(teleop_state["O_T_EE"], dtype=float).reshape(4, 4)
+                recorder.step(
+                    ee_pos=measured_pose[:3, 3],
+                    ee_rot=measured_pose[:3, :3],
+                    cmd_linear_vel=np.zeros(3),
+                    cmd_angular_vel=np.zeros(3),
+                    buttons=0,
+                    enabled=True,
+                    joint_pos=np.asarray(teleop_state["q"], dtype=float),
+                    joint_vel=np.asarray(teleop_state["dq"], dtype=float),
+                    gripper_open=gripper_open_for_record,
+                    robot_abs_time=float(teleop_state["abs_time"]),
+                )
+
+            time.sleep(rc.period)
+
+    return gripper_open_for_record
+
+
+def play_with_recovery(*, play_fn=play_joint_trajectory, **kwargs):
     robot = kwargs["robot"]
     while True:
         robot.recover_from_errors()
         try:
-            return play_joint_trajectory(**kwargs)
+            return play_fn(**kwargs)
         except RuntimeError as e:
             print(f"\n  Controller faulted: {e}")
             print("  Recovering and retrying...")
@@ -153,10 +270,22 @@ def run_replay(cfg: DictConfig):
 
     print(f"Loading episode: {episode_path}")
     episode = load_episode(episode_path)
+    if bool(rc.get("preprocess", True)):
+        pre_cfg = cfg.get("preprocess", None)
+        if pre_cfg is None:
+            raise RuntimeError("replay.preprocess=true requires the top-level preprocess config")
+        print("  Preprocessing episode before replay...")
+        processed = preprocess_episode_arrays(episode, pre_cfg)
+        if processed is None:
+            raise RuntimeError("Replay preprocessing failed; see preprocess logs above")
+        episode.update(processed)
 
     timestamps = episode["timestamps"]
     joint_pos = episode["joint_pos"]
     joint_vel = episode["joint_vel"]
+    tracker_mode = str(rc.get("tracker", "joint")).lower()
+    if tracker_mode not in {"joint", "cartesian"}:
+        raise ValueError(f"replay.tracker must be 'joint' or 'cartesian', got {tracker_mode!r}")
     n_steps = len(timestamps)
     duration = timestamps[-1]
 
@@ -165,6 +294,13 @@ def run_replay(cfg: DictConfig):
             "Episode has NaN joint_pos samples — was joint state captured during recording?"
         )
     has_joint_vel = not np.any(np.isnan(joint_vel))
+    ee_pos = episode.get("ee_pos")
+    ee_rot = episode.get("ee_rot")
+    if tracker_mode == "cartesian":
+        if ee_pos is None or ee_rot is None:
+            raise ValueError("Cartesian replay requires ee_pos and ee_rot datasets in the episode")
+        if np.any(np.isnan(ee_pos)) or np.any(np.isnan(ee_rot)):
+            raise ValueError("Cartesian replay requires finite ee_pos and ee_rot samples")
 
     gripper_open_data = episode.get("gripper_open")
     has_gripper_data = (
@@ -177,8 +313,16 @@ def run_replay(cfg: DictConfig):
 
     print(f"  {n_steps} steps, {duration:.1f}s duration")
     print(f"  Replay speed: {rc.speed}x")
-    print(f"  Joint stiffness: {stiffness.tolist()}")
-    print(f"  Joint velocity feedforward: {'enabled' if has_joint_vel else 'disabled (NaN in recording)'}")
+    print(f"  Tracker: {tracker_mode}")
+    if tracker_mode == "joint":
+        print(f"  Joint stiffness: {stiffness.tolist()}")
+        print(f"  Joint velocity feedforward: {'enabled' if has_joint_vel else 'disabled (NaN in recording)'}")
+    else:
+        print(
+            "  Cartesian stiffness: "
+            f"translation={float(rc.get('translational_stiffness', cfg.teleop.translational_stiffness))}, "
+            f"rotation={float(rc.get('rotational_stiffness', cfg.teleop.rotational_stiffness))}"
+        )
     if has_gripper_data:
         print(f"  Gripper replay: {'enabled' if gc.get('enabled', False) else 'disabled (gripper.enabled=false in config)'}")
     else:
@@ -258,6 +402,7 @@ def run_replay(cfg: DictConfig):
             metadata={
                 "replay_episode": str(episode_path),
                 "replay_speed": float(rc.speed),
+                "replay_tracker": tracker_mode,
                 "gripper_enabled": gripper is not None,
                 **extrinsics_metadata,
             },
@@ -265,20 +410,32 @@ def run_replay(cfg: DictConfig):
         recorder.start()
 
     try:
-        gripper_open_for_record = play_with_recovery(
+        play_fn = play_cartesian_trajectory if tracker_mode == "cartesian" else play_joint_trajectory
+        common_kwargs = dict(
             robot=robot,
             rc=rc,
             gc=gc,
-            stiffness=stiffness,
             timestamps=timestamps,
-            joint_pos=joint_pos,
-            joint_vel=joint_vel,
-            has_joint_vel=has_joint_vel,
             gripper=gripper,
             gripper_open_data=gripper_open_data,
             recorder=recorder,
             gripper_open_for_record=gripper_open_for_record,
         )
+        if tracker_mode == "cartesian":
+            common_kwargs.update(
+                cfg=cfg,
+                ee_pos=ee_pos,
+                ee_rot=ee_rot,
+                joint_pos=joint_pos,
+            )
+        else:
+            common_kwargs.update(
+                stiffness=stiffness,
+                joint_pos=joint_pos,
+                joint_vel=joint_vel,
+                has_joint_vel=has_joint_vel,
+            )
+        gripper_open_for_record = play_with_recovery(play_fn=play_fn, **common_kwargs)
         if recorder is not None:
             recorder.close()
             recorder = None
@@ -287,23 +444,36 @@ def run_replay(cfg: DictConfig):
             reverse_timestamps = timestamps[-1] - timestamps[::-1]
             reverse_joint_pos = joint_pos[::-1]
             reverse_joint_vel = -joint_vel[::-1] if has_joint_vel else joint_vel[::-1]
+            reverse_ee_pos = ee_pos[::-1] if ee_pos is not None else None
+            reverse_ee_rot = ee_rot[::-1] if ee_rot is not None else None
             reverse_gripper_open_data = (
                 gripper_open_data[::-1] if gripper_open_data is not None else gripper_open_data
             )
-            play_with_recovery(
+            reverse_kwargs = dict(
                 robot=robot,
                 rc=rc,
                 gc=gc,
-                stiffness=stiffness,
                 timestamps=reverse_timestamps,
-                joint_pos=reverse_joint_pos,
-                joint_vel=reverse_joint_vel,
-                has_joint_vel=has_joint_vel,
                 gripper=gripper,
                 gripper_open_data=reverse_gripper_open_data,
                 gripper_open_for_record=gripper_open_for_record,
-                complete_message="Reverse reset complete.",
             )
+            if tracker_mode == "cartesian":
+                reverse_kwargs.update(
+                    cfg=cfg,
+                    ee_pos=reverse_ee_pos,
+                    ee_rot=reverse_ee_rot,
+                    joint_pos=reverse_joint_pos,
+                )
+            else:
+                reverse_kwargs.update(
+                    stiffness=stiffness,
+                    joint_pos=reverse_joint_pos,
+                    joint_vel=reverse_joint_vel,
+                    has_joint_vel=has_joint_vel,
+                )
+            play_with_recovery(play_fn=play_fn, **reverse_kwargs)
+            print("  Reverse reset complete.")
         else:
             print("  Reverse reset skipped.")
 
