@@ -38,6 +38,21 @@ demonstrate:
     coulomb: [0.5, 0.4, 0.5, 0.4, 0.4, 0.4, 0.2]
     viscous: [0.08, 0.05, 0.08, 0.05, 0.08, 0.08, 0.05]
   button_debounce_s: 0.35
+  # Demonstration controller. "joint" (default) = backdrivable joint-impedance float.
+  # "cartesian" = kinesthetic guiding with the Cartesian tracker live (reference tracks
+  # the measured pose, so the EE floats) — collect demos whose joint redundancy resolves
+  # the same way replay's higher-stiffness Cartesian tracker will resolve it.
+  controller: cartesian
+  # Light main-task stiffness so the arm is easy to hand-guide (damping ~ sqrt(stiffness)).
+  cartesian_translational_stiffness: 60.0
+  cartesian_rotational_stiffness: 0.0
+  # Nullspace stiffness kept at the replay value (replay.nullspace_stiffness=2.0) so the
+  # posture bias is faithful even though the main-task stiffness is low during teaching.
+  cartesian_nullspace_stiffness: 10.0
+  # nullspace_target defaults to teleop.reset_joint_config (the home config you reset to,
+  # which is also replay's default nullspace_target = episode's first joint state).
+  # Override with a 7-element list, or "none" to disable the posture bias.
+  # cartesian_nullspace_target: none
 
 cameras:
   third_person:
@@ -69,7 +84,7 @@ gripper:
   force: 255
 
 visualization:
-  enabled: true
+  enabled: false
   host: "0.0.0.0"
   port: 8080
   update_hz: 30.0
@@ -114,12 +129,12 @@ replay:
   max_linear_vel_m_s: 0.03                      # Open-loop retime speed limit for Cartesian translation.
   max_angular_vel_rad_s: 0.25                   # Open-loop retime speed limit for Cartesian orientation.
   episode: null  # path to .h5 episode or .npy q-trajectory file, or null for latest .h5 in data_dir
-  speed: 0.5
+  speed: 0.25
   period: 0.001
   # Joint impedance gains. Stiffer = better tracking, less compliance.
   joint_stiffness: [320.0, 320.0, 320.0, 320.0, 120.0, 120.0, 30.0]
   translational_stiffness: 1200.0                # Cartesian tracker translation stiffness.
-  rotational_stiffness: 15.0                     # Cartesian tracker rotation stiffness.
+  rotational_stiffness: 50.0                    # Cartesian tracker rotation stiffness.
   nullspace_stiffness: 2.0                      # Cartesian tracker posture-task stiffness.
   # nullspace_target defaults to the first joint state in the replayed episode; set to "none" to disable.
   # Pre-positioning move to the first joint configuration of the episode.
@@ -134,17 +149,6 @@ deploy:
   record_trajectory: false                       # If true, log the executed session to data_dir/episode_*.h5 (same format as mode=replay), replayable via main.py mode=replay.
   max_linear_vel_m_s: 0.03                      # Open-loop retime speed limit for Cartesian translation.
   max_angular_vel_rad_s: 0.25                   # Open-loop retime speed limit for Cartesian orientation.
-  # Catchup hold: after a plan finishes (reference streamed to its final
-  # waypoint) or stalls (timeout), freeze the reference and keep re-commanding
-  # it so the impedance controller converges before requesting the next plan —
-  # so the next observation is captured from a settled pose and tracking error
-  # doesn't accumulate across plan boundaries. The hold exits as soon as BOTH
-  # the position and rotation tracking errors fall within tolerance, or after
-  # catchup_ticks execution ticks (the cap, ≈ catchup_ticks/execution_hz s),
-  # whichever comes first. catchup_ticks=0 disables (≈ immediate replan).
-  catchup_ticks: 100
-  catchup_pos_tol_m: 0.015        # position error to consider the EE caught up (m)
-  catchup_rot_tol_rad: 0.02       # rotation error to consider the EE caught up (rad, ≈1.1°)
   # Workspace safety box (base frame, metres). Cartesian targets are clipped here.
   # Widened to encompass the policy's commanded region (observed X up to 0.87,
   # Y up to 0.30 during grasp-glass deploys). The original tight teleop-range
@@ -153,6 +157,8 @@ deploy:
   workspace_hi: [0.95,  0.40, 0.90]
   translational_stiffness: 500.0
   rotational_stiffness: 100.0
+  translational_stiffness: 800.0
+  rotational_stiffness: 50.0
   # Null-space biasing for the impedance controller. When stiffness > 0 the
   # controller resolves the 7-DOF→6-DOF redundancy by biasing the joint config
   # toward `nullspace_target` (7-vector). Useful for poses near the rack where
@@ -169,8 +175,8 @@ deploy:
   # 2.0 N·m/rad (the teleop value) wasn't enough to actually drive joint 0
   # back to the target under deploy's faster commanded dynamics. 10-20 is
   # the working range; bump further if joint 0 still doesn't pull back.
-  nullspace_stiffness: 0
-  # nullspace_target: [0.120437, -0.797005, -0.427542, -2.740433, 2.785569, 2.719076, 2.955555]
+  nullspace_stiffness: 2
+  nullspace_target: [0.120437, -0.797005, -0.427542, -2.740433, 2.785569, 2.719076, 2.955555]
   # nullspace_target: [-0.06, 0.12, -0.60, -2.72, 1.98, 1.78, 0.45]   # example
   #
   # WARNING: nullspace_target[3] = -2.803 is only 0.27 rad (15°) from the
@@ -241,7 +247,7 @@ deploy:
       # ±0.75 model units (worst-case 38cm world shift in z), and combined
       # with the smooth-handoff prepend below, the executor never commands a
       # jump that exceeds max_linear_vel_m_s.
-      guidance_strength: 0.2
+      guidance_strength: 0.1
       delta_norm_cap: 0.04          # raised from 0.03 to let y/x components also saturate
                                     # — smaller slab → smaller raw gradient → only z was
                                     # hitting the cap; y/x are linear at low magnitude and
@@ -257,8 +263,8 @@ deploy:
       distance:
         enabled: true
         full: 0.15                  # >= this distance (m) -> full guidance
-        near: 0.04                  # <= this distance (m) -> `floor` (in the basin)
-        floor: 0.5                  # keep half-guidance even at the basin
+        near: 0.1                  # <= this distance (m) -> `floor` (in the basin)
+        floor: 0.0                  # keep half-guidance even at the basin
       start_guidance_timestep: 10000  # apply for t <= this; lower to focus low-t
       avoidance_weight: 420         # strength of the front-face wall vs the rack affordance
       # Avoidance is built as a *wall* at the front (-x) face of each obstacle
@@ -326,7 +332,7 @@ preprocess:
   output_dir: ./data/processed
   overwrite: false
 
-  gripper_dwell_s: 0.8  # hold arm still at gripper open/close events (s); 0 to disable
+  gripper_dwell_s: 0  # hold arm still at gripper open/close events (s); 0 to disable
 
   trim:
     enabled: true

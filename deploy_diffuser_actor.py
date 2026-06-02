@@ -969,6 +969,7 @@ def main(cfg: DictConfig) -> int:
     from clear_franka.diffuser_actor_io import euler_xyz_to_matrix
     from clear_franka.geometry import pack_Rp
     from zero_franky.robotiq import RobotiqGripperProxy
+    from scipy.spatial.transform import Rotation
     from clear_franka.recorder import TrajectoryRecorder
     from clear_franka.visualization import CortadoViserVisualizer
     from threed_mouse import ThreeDMouse
@@ -1276,15 +1277,6 @@ def main(cfg: DictConfig) -> int:
         active_plan_started_at = 0.0
         consumed_sequence = -1
         waiting_for_plan = False
-        # Catchup hold countdown (cap). -1 = not holding; set to plan_catchup_ticks
-        # when a plan finishes (streamed to its final waypoint) OR is abandoned
-        # mid-stream (timeout), decremented each tick while we re-command the
-        # frozen reference. The next plan is requested once the EE converges to
-        # that reference (pos+rot within tolerance) or the counter drops below 0,
-        # whichever first. Reset to -1 on adoption. catchup_target_* = frozen ref.
-        catchup_remaining = -1
-        catchup_target_pos: np.ndarray | None = None
-        catchup_target_rot: np.ndarray | None = None
         next_tick = time.monotonic()
         last_viz_update = 0.0
         viz_dt = 1.0 / 5.0
@@ -1294,17 +1286,6 @@ def main(cfg: DictConfig) -> int:
         plan_max_linear_vel_m_s = float(cfg.deploy.get("max_linear_vel_m_s", 0.03))
         plan_max_angular_vel_rad_s = float(cfg.deploy.get("max_angular_vel_rad_s", 0.25))
         plan_timeout_grace_s = 2.0
-        # Catchup: after a plan finishes (or stalls), hold the frozen reference
-        # and let the impedance controller converge before requesting the next
-        # plan, so the next observation is captured from a settled pose. The hold
-        # exits as soon as BOTH the position and rotation tracking errors fall
-        # within tolerance, or after catchup_ticks execution ticks (the cap),
-        # whichever comes first. catchup_ticks=0 disables (single re-command tick).
-        plan_catchup_ticks = int(cfg.deploy.get("catchup_ticks", 0))
-        catchup_pos_tol_m = float(
-            cfg.deploy.get("catchup_pos_tol_m", plan_completion_tolerance_m)
-        )
-        catchup_rot_tol_rad = float(cfg.deploy.get("catchup_rot_tol_rad", 0.05))
 
         # ----- mode transitions (swappable gesture->action mapping layer) -----
         def _enter_inference(prim: int, label: str) -> None:
@@ -1527,7 +1508,6 @@ def main(cfg: DictConfig) -> int:
                     else:
                         active_plan = plan
                         waiting_for_plan = False
-                        catchup_remaining = -1
                         adopted_at = time.monotonic()
                         active_index = _plan_start_index(
                             plan,
@@ -1573,59 +1553,8 @@ def main(cfg: DictConfig) -> int:
                 else:
                     request_event.set()
 
-            # ---------- catchup hold: let the controller converge before replan ----------
-            # Both terminal conditions (streamed-to-end and mid-stream timeout)
-            # funnel here: we freeze the reference at the pose we were last
-            # tracking and re-command it until the EE catches up (position AND
-            # rotation error within tolerance) or the plan_catchup_ticks cap is
-            # hit, then request the next plan — so the next observation is captured
-            # from a settled pose and tracking error doesn't accumulate across plan
-            # boundaries. With plan_catchup_ticks=0 this is a single tick (≈ the
-            # original immediate-replan behavior).
-            if active_plan is not None and catchup_remaining >= 0:
-                state = robot.latest_state
-                if state is None:
-                    state = rate.time_call("state_wait", robot.wait_for_state, 1.0)
-                ee_pos, _ee_rot, _O_T_EE = _read_ee_pose_from_state(state)
-                tracker.set_target(
-                    Affine(pack_Rp(catchup_target_rot, catchup_target_pos))
-                )
-                if deploy_trace is not None:
-                    deploy_trace.record_error(
-                        t=time.monotonic(),
-                        plan_sequence=active_plan.sequence,
-                        active_index=active_index,
-                        target_pos=catchup_target_pos,
-                        target_rot=catchup_target_rot,
-                        measured_pos=ee_pos,
-                        measured_rot=_ee_rot,
-                    )
-                # Caught up when BOTH position and rotation errors are within
-                # tolerance; otherwise keep holding until the catchup_ticks cap.
-                pos_err = float(np.linalg.norm(catchup_target_pos - ee_pos))
-                R_err = catchup_target_rot @ _ee_rot.T
-                rot_err = float(np.arccos(
-                    np.clip((np.trace(R_err) - 1.0) / 2.0, -1.0, 1.0)
-                ))
-                converged = pos_err <= catchup_pos_tol_m and rot_err <= catchup_rot_tol_rad
-                catchup_remaining -= 1
-                if converged or catchup_remaining < 0:
-                    logger.info(
-                        "  plan %d catchup %s (pos=%.1fmm rot=%.1f°); requesting next plan",
-                        active_plan.sequence,
-                        "converged" if converged else "cap reached",
-                        pos_err * 1000.0, np.degrees(rot_err),
-                    )
-                    visualizer.clear_plan_waypoints()
-                    active_plan = None
-                    active_cartesian_trajectory = None
-                    active_plan_index_offset = 0
-                    active_plan_started_at = 0.0
-                    request_event.set()
-                    waiting_for_plan = True
-
             # ---------- execute the active plan suffix ----------
-            elif active_plan is not None and active_index < len(active_plan.trajectory):
+            if active_plan is not None and active_index < len(active_plan.trajectory):
                 state = robot.latest_state
                 if state is None:
                     state = rate.time_call("state_wait", robot.wait_for_state, 1.0)
@@ -1675,37 +1604,33 @@ def main(cfg: DictConfig) -> int:
                     plan_timeout_s,
                     active_cartesian_trajectory.duration + plan_timeout_grace_s,
                 )
-                streamed_to_end = active_index >= len(active_plan.trajectory) - 1
-                timed_out = (
-                    time.monotonic() - active_plan_started_at > active_plan_timeout_s
-                )
-
-                # Either terminal condition freezes the current reference and
-                # hands off to the catchup hold above, which counts down and then
-                # requests the replacement plan. streamed_to_end is reached at the
-                # trajectory's scheduled duration (well before active_plan_timeout_s),
-                # so in normal operation we always finish via the streamed-to-end
-                # path; the timeout is the safety net for a stalled loop.
-                if streamed_to_end or timed_out:
-                    catchup_target_pos = np.asarray(target_xyz, dtype=np.float64).copy()
-                    catchup_target_rot = np.asarray(target_rot, dtype=np.float64).copy()
-                    catchup_remaining = plan_catchup_ticks
-                    if streamed_to_end:
-                        logger.info(
-                            "  plan %d streamed to end at idx=%d/%d (err=%.1fmm); "
-                            "catchup hold %d ticks",
-                            active_plan.sequence, active_index,
-                            len(active_plan.trajectory), final_dist * 1000.0,
-                            plan_catchup_ticks,
-                        )
-                    else:
-                        logger.info(
-                            "  plan %d timed out after %.1fs at idx=%d/%d; "
-                            "catchup hold %d ticks then replace",
-                            active_plan.sequence, active_plan_timeout_s,
-                            active_index, len(active_plan.trajectory),
-                            plan_catchup_ticks,
-                        )
+                if (
+                    active_index >= len(active_plan.trajectory) - 1
+                    and final_dist <= plan_completion_tolerance_m
+                ):
+                    logger.info("  completed plan %d", active_plan.sequence)
+                    visualizer.clear_plan_waypoints()
+                    active_plan = None
+                    active_cartesian_trajectory = None
+                    active_plan_index_offset = 0
+                    active_plan_started_at = 0.0
+                    request_event.set()
+                    waiting_for_plan = True
+                elif time.monotonic() - active_plan_started_at > active_plan_timeout_s:
+                    logger.info(
+                        "  plan %d timed out after %.1fs at idx=%d/%d; requesting replacement",
+                        active_plan.sequence,
+                        active_plan_timeout_s,
+                        active_index,
+                        len(active_plan.trajectory),
+                    )
+                    visualizer.clear_plan_waypoints()
+                    active_plan = None
+                    active_cartesian_trajectory = None
+                    active_plan_index_offset = 0
+                    active_plan_started_at = 0.0
+                    request_event.set()
+                    waiting_for_plan = True
 
             elif active_plan is not None:
                 visualizer.clear_plan_waypoints()

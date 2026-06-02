@@ -163,6 +163,61 @@ class CameraPreprocessor:
         return rgb_200, base_xyz.astype(np.float32)
 
 
+def model_crop_rgb(rgb_200: np.ndarray, crop_images: bool = True) -> np.ndarray:
+    """The exact crop the policy applies before the image encoder.
+
+    Mirrors DiffuserActorBasePolicy._prepare_rgb: when ``crop_images`` is true
+    and the image is at least 200x200, the inner [20:180, 20:180] region is
+    kept (200 -> 160). Otherwise the image is returned unchanged.
+    """
+    if crop_images and rgb_200.shape[0] >= 200 and rgb_200.shape[1] >= 200:
+        return rgb_200[20:180, 20:180]
+    return rgb_200
+
+
+def save_model_input_preview(rows, out_path, *, crop_images: bool = True,
+                             display: int = 320) -> str:
+    """Write a montage PNG showing what the DiffuserActor image encoder receives.
+
+    ``rows`` is a list of ``(label, rgb_full, rgb_200)`` tuples with RGB channel
+    order (as returned by ZedCamera.grab_frame + CameraPreprocessor.process).
+    For each camera the montage shows three panels, left to right:
+      1. the raw frame's center-square crop (the stage-1 FOV crop — the left/right
+         sides of the 16:9 ZED frame are discarded before resize),
+      2. the 200x200 processed image with the model-crop rectangle [20:180,180]
+         drawn on it,
+      3. the final NxN the encoder actually sees (160x160 when crop_images, else
+         200x200).
+    Inputs are RGB; converted to BGR for cv2.imwrite. Returns the output path.
+    """
+    def _cell(img_rgb, text, rect=None):
+        bgr = cv2.resize(img_rgb[:, :, ::-1], (display, display),
+                         interpolation=cv2.INTER_NEAREST)
+        bgr = np.ascontiguousarray(bgr)
+        if rect is not None:
+            cv2.rectangle(bgr, rect[:2], rect[2:], (0, 255, 0), 2)
+        cv2.rectangle(bgr, (0, 0), (display, 22), (0, 0, 0), -1)
+        cv2.putText(bgr, text, (4, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                    (255, 255, 255), 1, cv2.LINE_AA)
+        return bgr
+
+    scale = display / 200.0
+    rect = (int(20 * scale), int(20 * scale), int(180 * scale), int(180 * scale))
+    row_imgs = []
+    for label, rgb_full, rgb_200 in rows:
+        square, _ = center_square_crop_resize(rgb_full, display, cv2.INTER_AREA)
+        crop = model_crop_rgb(rgb_200, crop_images)
+        n = crop.shape[0]
+        row_imgs.append(np.hstack([
+            _cell(square, f"{label}: raw center-crop"),
+            _cell(rgb_200, "200x200 (+model crop)", rect=rect),
+            _cell(crop, f"{n}x{n} ENCODER INPUT"),
+        ]))
+    montage = np.vstack(row_imgs)
+    cv2.imwrite(str(out_path), montage)
+    return str(out_path)
+
+
 # ---------------------------------------------------------------------------
 # Action-side helpers
 # ---------------------------------------------------------------------------

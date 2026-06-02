@@ -69,6 +69,7 @@ def play_joint_trajectory(
     gripper_open_data,
     recorder=None,
     gripper_open_for_record=None,
+    viz=None,
 ):
     n_steps = len(timestamps)
     trajectory = Trajectory(joint_pos, timestamps)
@@ -147,6 +148,8 @@ def play_joint_trajectory(
                     robot_abs_time=float(teleop_state["abs_time"]),
                 )
 
+            if viz is not None:
+                viz.step()
 
     return gripper_open_for_record
 
@@ -165,6 +168,7 @@ def play_cartesian_trajectory(
     gripper_open_data,
     recorder=None,
     gripper_open_for_record=None,
+    viz=None,
 ):
     n_steps = len(timestamps)
     trajectory = CartesianTrajectory(ee_pos, ee_rot, timestamps)
@@ -261,6 +265,9 @@ def play_cartesian_trajectory(
                     robot_abs_time=float(teleop_state["abs_time"]),
                 )
 
+            if viz is not None:
+                viz.step()
+
     return gripper_open_for_record
 
 
@@ -275,6 +282,104 @@ def play_with_recovery(*, play_fn=play_joint_trajectory, **kwargs):
             print("  Recovering and retrying...")
 
 
+def _resolve_pointcloud_source(cfg: DictConfig):
+    """Return (source_name, source_cfg, enabled) for the active point-cloud source."""
+    vc = cfg.get("visualization", {})
+    pointcloud_cfg = vc.get("pointclouds", {})
+    source = next(
+        (n for n in ("third_person", "hand") if pointcloud_cfg.get(n, {}).get("enabled", False)),
+        "third_person",
+    )
+    pc = pointcloud_cfg.get(source, {})
+    enabled = bool(vc.get("enabled", False) and pc.get("enabled", False))
+    return source, pc, enabled
+
+
+def _setup_replay_visualizer(cfg: DictConfig, cameras: dict, pointcloud_source: str, pc):
+    """Build the viser visualizer + point-cloud stream when visualization.enabled.
+
+    ``cameras`` is the already-running camera dict (may be empty). Returns
+    (visualizer, pointcloud_camera, pointcloud_frame_name) or (None, None, None).
+    """
+    vc = cfg.get("visualization", {})
+    if not vc.get("enabled", False):
+        return None, None, None
+
+    from clear_franka.visualization import CortadoViserVisualizer
+
+    visualizer = CortadoViserVisualizer(host=vc.get("host", "0.0.0.0"), port=int(vc.get("port", 8080)))
+    pointcloud_camera = cameras.get(pointcloud_source)
+    pointcloud_frame_name = None
+    if pointcloud_camera is not None and pc.get("enabled", False):
+        frame_name = pc.get(
+            "frame_name", "hand_zed" if pointcloud_source == "hand" else "/third_person_zed"
+        )
+        if pointcloud_source == "hand":
+            pointcloud_frame_name = visualizer.add_hand_camera_frame_from_extrinsics(
+                frame_name, cfg.cameras.hand.get("extrinsics_path", "./data/extrinsics_hand.json")
+            )
+        else:
+            pointcloud_frame_name = visualizer.add_camera_frame_from_extrinsics(
+                frame_name,
+                cfg.cameras.third_person.get(
+                    "extrinsics_path", "./data/extrinsics_third_person.json"
+                ),
+            )
+        pointcloud_camera.start_pointcloud_stream(
+            update_hz=float(pc.get("update_hz", 5.0)),
+            stride=int(pc.get("stride", 4)),
+            max_points=int(pc.get("max_points", 100_000)),
+            max_distance_m=float(pc.get("max_distance_m", 3.0)),
+        )
+        print(f"  [viser] {pointcloud_source} ZED point cloud enabled.")
+    return visualizer, pointcloud_camera, pointcloud_frame_name
+
+
+class _ReplayVizUpdater:
+    """Throttled per-tick viser update for the replay playback loops.
+
+    Reads the latest controller state and pushes joints, the EE frame, and the
+    point cloud to viser, rate-limited to ``update_hz`` so it doesn't burden the
+    1 kHz reference-streaming loop.
+    """
+
+    def __init__(self, visualizer, robot, pointcloud_camera, pointcloud_frame_name, pc, update_hz):
+        self._visualizer = visualizer
+        self._robot = robot
+        self._pointcloud_camera = pointcloud_camera
+        self._pointcloud_frame_name = pointcloud_frame_name
+        self._pc = pc or {}
+        self._min_dt = (1.0 / float(update_hz)) if update_hz else 0.0
+        self._last_update = 0.0
+        self._last_pc_timestamp = None
+
+    def step(self):
+        now = time.monotonic()
+        if now - self._last_update < self._min_dt:
+            return
+        self._last_update = now
+        try:
+            teleop_state = self._robot.get_last_teleop_state()
+        except RuntimeError:
+            return
+        joint_pos = np.asarray(teleop_state["q"], dtype=float)
+        measured_pose = np.asarray(teleop_state["O_T_EE"], dtype=float).reshape(4, 4)
+        self._visualizer.update(joint_pos)
+        self._visualizer.update_eef_frame(measured_pose)
+        if self._pointcloud_camera is not None:
+            latest = self._pointcloud_camera.get_latest_pointcloud()
+            if latest is not None:
+                points, colors, timestamp = latest
+                if timestamp != self._last_pc_timestamp:
+                    self._visualizer.update_pointcloud(
+                        self._pointcloud_frame_name or self._pc.get("frame_name", "/third_person_zed"),
+                        points,
+                        colors,
+                        point_size=float(self._pc.get("point_size", 0.01)),
+                    )
+                    self._last_pc_timestamp = timestamp
+
+
 def run_replay(cfg: DictConfig):
     rc = cfg.replay
     gc = cfg.get("gripper", {})
@@ -286,15 +391,25 @@ def run_replay(cfg: DictConfig):
 
     print(f"Loading episode: {episode_path}")
     episode = load_episode(episode_path)
+    viz_enabled = bool(cfg.get("visualization", {}).get("enabled", False))
+    # EE position path at each preprocess stage, for the viser overlay below.
+    ee_stages = None
+    raw_ee_pos = episode.get("ee_pos")
     if bool(rc.get("preprocess", True)):
         pre_cfg = cfg.get("preprocess", None)
         if pre_cfg is None:
             raise RuntimeError("replay.preprocess=true requires the top-level preprocess config")
         print("  Preprocessing episode before replay...")
-        processed = preprocess_episode_arrays(episode, **_preprocess_kwargs(pre_cfg))
+        processed = preprocess_episode_arrays(
+            episode, collect_ee_stages=viz_enabled, **_preprocess_kwargs(pre_cfg)
+        )
         if processed is None:
             raise RuntimeError("Replay preprocessing failed; see preprocess logs above")
+        ee_stages = processed.pop("ee_stages", None)
         episode.update(processed)
+    elif viz_enabled and raw_ee_pos is not None:
+        # No preprocessing — only the original recorded path exists.
+        ee_stages = {"original": np.asarray(raw_ee_pos, dtype=np.float64)[:, :3]}
 
     timestamps = episode["timestamps"]
     joint_pos = episode["joint_pos"]
@@ -413,15 +528,21 @@ def run_replay(cfg: DictConfig):
 
     time.sleep(0.5)
 
+    vc = cfg.get("visualization", {})
+    pointcloud_source, pc, pointcloud_enabled = _resolve_pointcloud_source(cfg)
+
     cameras = {}
     recorder = None
-    if rc.get("record", False):
+    record_enabled = bool(rc.get("record", False))
+    # Cameras are needed for recording and/or for live point-cloud visualization.
+    if record_enabled or pointcloud_enabled:
         from clear_franka.camera import enabled_camera_names, make_zed_camera
-        for name in enabled_camera_names(cfg):
+        include = (pointcloud_source,) if pointcloud_enabled else ()
+        for name in enabled_camera_names(cfg, include=include):
             cameras[name] = make_zed_camera(cfg, name)
             cameras[name].run()
 
-        vc = cfg.get("visualization", {})
+    if record_enabled:
         extrinsics_metadata = {}
         for cam_name in cameras:
             ext_path = vc.get("pointclouds", {}).get(cam_name, {}).get(
@@ -447,6 +568,43 @@ def run_replay(cfg: DictConfig):
         )
         recorder.start()
 
+    visualizer, pointcloud_camera, pointcloud_frame_name = _setup_replay_visualizer(
+        cfg, cameras, pointcloud_source, pc
+    )
+    if visualizer is not None:
+        # Overlay the deploy safety box so it's obvious when a replayed trajectory
+        # leaves it. Replay does NOT clip to this box (only deploy does), so the
+        # arm can — and will — be commanded outside it if the recording goes there.
+        dep = cfg.get("deploy", {})
+        ws_lo = dep.get("workspace_lo", None)
+        ws_hi = dep.get("workspace_hi", None)
+        if ws_lo is not None and ws_hi is not None:
+            visualizer.add_workspace_box(ws_lo, ws_hi)
+            print(
+                f"  [viser] deploy.workspace box overlaid: lo={list(ws_lo)} hi={list(ws_hi)}"
+            )
+        # Overlay the preprocess-pipeline EE paths: original (recorded) vs
+        # TOPPRA-retimed vs Ruckig-smoothed (the executed path).
+        if ee_stages:
+            stage_colors = {
+                "original": (180, 180, 180),   # grey — raw recorded
+                "retimed": (0, 210, 255),      # cyan — TOPPRA retimed (pre-smooth)
+                "smoothed": (255, 0, 170),     # magenta — Ruckig smoothed (executed)
+            }
+            for stage, col in stage_colors.items():
+                path = ee_stages.get(stage)
+                if path is not None and len(path) >= 2:
+                    visualizer.add_path_overlay(f"/replay_traj/{stage}", path, color=col)
+                    print(f"  [viser] {stage} EE path overlaid ({len(path)} pts)")
+    viz = (
+        _ReplayVizUpdater(
+            visualizer, robot, pointcloud_camera, pointcloud_frame_name, pc,
+            float(vc.get("update_hz", 30.0)),
+        )
+        if visualizer is not None
+        else None
+    )
+
     try:
         play_fn = play_cartesian_trajectory if tracker_mode == "cartesian" else play_joint_trajectory
         play_joint_pos = joint_pos if joint_pos_ik is None else joint_pos_ik
@@ -461,6 +619,7 @@ def run_replay(cfg: DictConfig):
             gripper_open_data=gripper_open_data,
             recorder=recorder,
             gripper_open_for_record=gripper_open_for_record,
+            viz=viz,
         )
         if tracker_mode == "cartesian":
             common_kwargs.update(
@@ -500,6 +659,7 @@ def run_replay(cfg: DictConfig):
                 gripper=gripper,
                 gripper_open_data=reverse_gripper_open_data,
                 gripper_open_for_record=gripper_open_for_record,
+                viz=viz,
             )
             if tracker_mode == "cartesian":
                 reverse_kwargs.update(

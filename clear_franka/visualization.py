@@ -70,7 +70,10 @@ class CortadoViserVisualizer:
         self._plan_point_handle = None
         self._interpolated_plan_line_handle = None
         self._plan_frame_handles = []
+        self._workspace_box_handle = None
+        self._path_overlay_handles: dict = {}
         self.workspace_box_editor: WorkspaceBoxEditor | None = None
+        self._init_tracking_error_gui()
 
         url_host = "localhost" if host in {"0.0.0.0", "::"} else host
         print(f"  [viser] Cortado URDF loaded from {urdf_path}")
@@ -236,6 +239,49 @@ class CortadoViserVisualizer:
         handle.wxyz = viser.transforms.SO3.from_matrix(T[:3, :3]).wxyz
         handle.position = T[:3, 3]
 
+    def _init_tracking_error_gui(self) -> None:
+        """Add a read-only viser GUI panel for live Cartesian tracking error.
+
+        Mirrors the quantities written to the deploy trace's ``tracking_error``
+        group: positional error (commanded reference - measured EE) and the
+        geodesic orientation error.
+        """
+        self._tracking_error_gui_ready = False
+        try:
+            with self.server.gui.add_folder("Tracking error"):
+                self._gui_pos_err_norm = self.server.gui.add_number(
+                    "‖pos err‖ (mm)", initial_value=0.0, disabled=True,
+                )
+                self._gui_pos_err_xyz = self.server.gui.add_text(
+                    "pos err xyz (mm)", initial_value="0.0, 0.0, 0.0", disabled=True,
+                )
+                self._gui_rot_err = self.server.gui.add_number(
+                    "rot err (deg)", initial_value=0.0, disabled=True,
+                )
+            self._tracking_error_gui_ready = True
+        except Exception as exc:  # pragma: no cover - GUI is best-effort
+            print(f"  [viser] tracking-error GUI unavailable: {exc}")
+
+    def update_tracking_error(
+        self,
+        pos_error: np.ndarray | None,
+        rot_error_rad: float | None,
+    ) -> None:
+        """Push the latest Cartesian tracking error to the viser GUI readout.
+
+        ``pos_error`` is the base-frame (reference - measured) translation in
+        meters; ``rot_error_rad`` is the geodesic angle between commanded and
+        measured orientation in radians. No-op if the GUI failed to init.
+        """
+        if not getattr(self, "_tracking_error_gui_ready", False):
+            return
+        if pos_error is not None:
+            pos_mm = np.asarray(pos_error, dtype=float).reshape(3) * 1000.0
+            self._gui_pos_err_norm.value = float(np.linalg.norm(pos_mm))
+            self._gui_pos_err_xyz.value = ", ".join(f"{v:+.1f}" for v in pos_mm)
+        if rot_error_rad is not None:
+            self._gui_rot_err.value = float(np.degrees(rot_error_rad))
+
     def clear_plan_waypoints(self) -> None:
         for handle in (
             self._plan_line_handle,
@@ -251,6 +297,89 @@ class CortadoViserVisualizer:
         for handle in self._plan_frame_handles:
             handle.remove()
         self._plan_frame_handles = []
+
+    def add_workspace_box(
+        self,
+        lo,
+        hi,
+        name: str = "/workspace_box",
+        color: tuple[int, int, int] = (255, 215, 0),
+        line_width: float = 2.0,
+    ) -> None:
+        """Overlay an axis-aligned base-frame box (e.g. deploy.workspace_lo/hi).
+
+        Drawn as a 12-edge wireframe, transformed from the Franka base frame into
+        the URDF root frame so it lines up with the robot and point cloud. Pass
+        the deploy safety box to see when a trajectory leaves it. Idempotent —
+        re-calling replaces the previous box.
+        """
+        lo = np.asarray(lo, dtype=float).reshape(3)
+        hi = np.asarray(hi, dtype=float).reshape(3)
+        corners = np.array([
+            [lo[0], lo[1], lo[2]], [hi[0], lo[1], lo[2]],
+            [hi[0], hi[1], lo[2]], [lo[0], hi[1], lo[2]],
+            [lo[0], lo[1], hi[2]], [hi[0], lo[1], hi[2]],
+            [hi[0], hi[1], hi[2]], [lo[0], hi[1], hi[2]],
+        ], dtype=float)
+        edges = [
+            (0, 1), (1, 2), (2, 3), (3, 0),   # bottom face
+            (4, 5), (5, 6), (6, 7), (7, 4),   # top face
+            (0, 4), (1, 5), (2, 6), (3, 7),   # vertical edges
+        ]
+        T_base_to_root = self.urdf_model.get_transform("fr3_link0")
+        R_base_to_root = T_base_to_root[:3, :3]
+        corners = (R_base_to_root @ corners.T).T + T_base_to_root[:3, 3]
+        starts = corners[[a for a, _ in edges]]
+        ends = corners[[b for _, b in edges]]
+        segments = np.stack([starts, ends], axis=1).astype(np.float32)
+        colors = np.full((len(segments), 2, 3), color, dtype=np.uint8)
+        if self._workspace_box_handle is not None:
+            self._workspace_box_handle.remove()
+        self._workspace_box_handle = self.server.scene.add_line_segments(
+            name=name,
+            points=segments,
+            colors=colors,
+            line_width=line_width,
+        )
+
+    def clear_workspace_box(self) -> None:
+        if self._workspace_box_handle is not None:
+            self._workspace_box_handle.remove()
+            self._workspace_box_handle = None
+
+    def add_path_overlay(
+        self,
+        name: str,
+        positions,
+        color: tuple[int, int, int] = (200, 200, 200),
+        line_width: float = 2.0,
+    ) -> None:
+        """Overlay a base-frame EE position polyline (N>=2, 3) as a named line.
+
+        Transformed from the Franka base frame into the URDF root frame so it
+        lines up with the robot and point cloud. Idempotent per ``name`` — pass
+        ``None``/too-few points to remove an existing overlay of that name.
+        """
+        existing = self._path_overlay_handles.get(name)
+        if existing is not None:
+            existing.remove()
+            self._path_overlay_handles[name] = None
+        if positions is None:
+            return
+        positions = np.asarray(positions, dtype=float)
+        if positions.ndim != 2 or positions.shape[1] < 3 or len(positions) < 2:
+            return
+        T_base_to_root = self.urdf_model.get_transform("fr3_link0")
+        R_base_to_root = T_base_to_root[:3, :3]
+        points = (R_base_to_root @ positions[:, :3].T).T + T_base_to_root[:3, 3]
+        segments = np.stack([points[:-1], points[1:]], axis=1).astype(np.float32)
+        colors = np.full((len(segments), 2, 3), color, dtype=np.uint8)
+        self._path_overlay_handles[name] = self.server.scene.add_line_segments(
+            name=name,
+            points=segments,
+            colors=colors,
+            line_width=line_width,
+        )
 
     def update_interpolated_plan_path(
         self,
