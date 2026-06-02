@@ -125,6 +125,12 @@ deploy:
   record_trajectory: false                       # If true, log the executed session to data_dir/episode_*.h5 (same format as mode=replay), replayable via main.py mode=replay.
   max_linear_vel_m_s: 0.03                      # Open-loop retime speed limit for Cartesian translation.
   max_angular_vel_rad_s: 0.25                   # Open-loop retime speed limit for Cartesian orientation.
+  # Settle phase: after the target is streamed to the final waypoint, hold that
+  # reference and let the impedance controller catch up before requesting the
+  # next plan. Stops tracking error accumulating across plan boundaries.
+  plan_settle_tolerance_m: 0.015                # Converged when measured EE is within this of the final waypoint.
+  plan_settle_timeout_s: 2.0                    # Max hold time waiting to converge before advancing anyway.
+  plan_settle_min_s: 0.0                        # Guaranteed minimum hold even if already converged.
   # Workspace safety box (base frame, metres). Cartesian targets are clipped here.
   # Widened to encompass the policy's commanded region (observed X up to 0.87,
   # Y up to 0.30 during grasp-glass deploys). The original tight teleop-range
@@ -301,7 +307,6 @@ deploy:
     pos_thresh_m: 0.05
     eul_thresh_rad: 0.30
 
-# Preprocess pipeline: trim -> retime -> smooth.
 preprocess:
   input_dir: ./data
   output_dir: ./data/processed
