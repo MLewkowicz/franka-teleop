@@ -123,6 +123,17 @@ deploy:
   record_trajectory: false                       # If true, log the executed session to data_dir/episode_*.h5 (same format as mode=replay), replayable via main.py mode=replay.
   max_linear_vel_m_s: 0.03                      # Open-loop retime speed limit for Cartesian translation.
   max_angular_vel_rad_s: 0.25                   # Open-loop retime speed limit for Cartesian orientation.
+  # Catchup hold: after a plan finishes (reference streamed to its final
+  # waypoint) or stalls (timeout), freeze the reference and keep re-commanding
+  # it so the impedance controller converges before requesting the next plan —
+  # so the next observation is captured from a settled pose and tracking error
+  # doesn't accumulate across plan boundaries. The hold exits as soon as BOTH
+  # the position and rotation tracking errors fall within tolerance, or after
+  # catchup_ticks execution ticks (the cap, ≈ catchup_ticks/execution_hz s),
+  # whichever comes first. catchup_ticks=0 disables (≈ immediate replan).
+  catchup_ticks: 100
+  catchup_pos_tol_m: 0.015        # position error to consider the EE caught up (m)
+  catchup_rot_tol_rad: 0.02       # rotation error to consider the EE caught up (rad, ≈1.1°)
   # Workspace safety box (base frame, metres). Cartesian targets are clipped here.
   # Widened to encompass the policy's commanded region (observed X up to 0.87,
   # Y up to 0.30 during grasp-glass deploys). The original tight teleop-range
@@ -130,7 +141,7 @@ deploy:
   workspace_lo: [0.20, -0.45, 0.00]
   workspace_hi: [0.95,  0.40, 0.90]
   translational_stiffness: 500.0
-  rotational_stiffness: 15.0
+  rotational_stiffness: 100.0
   # Null-space biasing for the impedance controller. When stiffness > 0 the
   # controller resolves the 7-DOF→6-DOF redundancy by biasing the joint config
   # toward `nullspace_target` (7-vector). Useful for poses near the rack where
