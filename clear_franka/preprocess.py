@@ -75,6 +75,7 @@ def preprocess_episode(
     smooth_max_joint_accel: np.ndarray | list[float] | None = None,
     smooth_max_joint_jerk: np.ndarray | list[float] | None = None,
     smooth_dt: float = 0.001,
+    gripper_dwell_s: float = 0.0,
     params_metadata: dict[str, Any] | None = None,
 ) -> bool:
     """Read a raw demonstration episode, apply the preprocessing pipeline, write it.
@@ -107,6 +108,7 @@ def preprocess_episode(
         smooth_max_joint_accel=smooth_max_joint_accel,
         smooth_max_joint_jerk=smooth_max_joint_jerk,
         smooth_dt=smooth_dt,
+        gripper_dwell_s=gripper_dwell_s,
     )
     if out_arrays is None:
         return False
@@ -147,6 +149,7 @@ def preprocess_episode_arrays(
     smooth_max_joint_accel: np.ndarray | list[float] | None = None,
     smooth_max_joint_jerk: np.ndarray | list[float] | None = None,
     smooth_dt: float = 0.001,
+    gripper_dwell_s: float = 0.0,
 ) -> dict[str, np.ndarray] | None:
     """Apply the preprocessing pipeline to an already-loaded episode.
 
@@ -294,13 +297,6 @@ def preprocess_episode_arrays(
         target_times=target_times,
     )
 
-    # Recompute joint_vel from the smoothed joint_pos rather than re-sampling the
-    # noisy recorded velocities (np.gradient gives a centred difference).
-    if joint_pos_out.shape[0] >= 2:
-        joint_vel_out = np.gradient(joint_pos_out, times_out, axis=0)
-    else:
-        joint_vel_out = np.zeros_like(joint_pos_out)
-
     # --- 5. recompute ee_pos / ee_rot via FK on the smoothed joints ----------
     # The recorded Cartesian values would be inconsistent with the smoothed
     # joint positions; FK on joint_pos_out guarantees consistency.
@@ -312,6 +308,24 @@ def preprocess_episode_arrays(
             resampled["ee_rot"] = fk_rot
         logger.info("preprocess: recomputed ee_pos/ee_rot via FK (%d frames)", joint_pos_out.shape[0])
 
+    # --- 6. insert dwell at gripper state transitions ----------------------
+    # TOPPRA allocates no time to stationary segments (zero geometric length),
+    # so gripper open/close events get compressed to zero dwell. Re-insert
+    # explicit hold frames so the physical gripper has time to complete its motion.
+    if gripper_dwell_s > 0.0 and "gripper_open" in resampled:
+        joint_pos_out, times_out, resampled = _insert_gripper_dwell(
+            joint_pos_out, times_out, resampled,
+            dwell_s=float(gripper_dwell_s), dt=float(smooth_dt),
+        )
+
+    # Recompute joint_vel from final joint_pos (after any dwell insertion).
+    # np.gradient gives centred differences; covers the zero-velocity dwell
+    # frames correctly since adjacent positions are identical there.
+    if joint_pos_out.shape[0] >= 2:
+        joint_vel_out = np.gradient(joint_pos_out, times_out, axis=0)
+    else:
+        joint_vel_out = np.zeros_like(joint_pos_out)
+
     out_arrays: dict[str, np.ndarray] = {
         "timestamps": times_out,
         "joint_pos": joint_pos_out,
@@ -319,6 +333,46 @@ def preprocess_episode_arrays(
     }
     out_arrays.update(resampled)
     return out_arrays
+
+
+def _insert_gripper_dwell(
+    joint_pos: np.ndarray,
+    times: np.ndarray,
+    resampled: dict[str, np.ndarray],
+    dwell_s: float,
+    dt: float,
+) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    """Insert hold frames at every gripper open/close transition.
+
+    For each index where gripper_open changes, appends `dwell_n` copies of
+    that frame immediately after the transition, shifting all subsequent
+    timestamps forward by `dwell_n * dt`.
+    """
+    gripper = resampled["gripper_open"]
+    changes = np.where(gripper[1:] != gripper[:-1])[0] + 1
+    if len(changes) == 0:
+        return joint_pos, times, resampled
+
+    dwell_n = max(1, round(dwell_s / dt))
+    logger.info(
+        "preprocess: inserting %.2fs dwell (%d frames) at %d gripper transition(s): indices %s",
+        dwell_s, dwell_n, len(changes), changes.tolist(),
+    )
+
+    resampled = dict(resampled)
+
+    def _insert(arr: np.ndarray, idx: int) -> np.ndarray:
+        tile = np.repeat(arr[idx : idx + 1], dwell_n, axis=0)
+        return np.concatenate([arr[: idx + 1], tile, arr[idx + 1 :]])
+
+    for idx in sorted(changes.tolist(), reverse=True):
+        t_dwell = times[idx] + np.arange(1, dwell_n + 1) * dt
+        times = np.concatenate([times[: idx + 1], t_dwell, times[idx + 1 :] + dwell_n * dt])
+        joint_pos = _insert(joint_pos, idx)
+        for key in list(resampled.keys()):
+            resampled[key] = _insert(resampled[key], idx)
+
+    return joint_pos, times, resampled
 
 
 # ---------------------------------------------------------------------------

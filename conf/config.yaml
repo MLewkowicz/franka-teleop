@@ -103,9 +103,7 @@ replay:
   max_linear_vel_m_s: 0.03                      # Open-loop retime speed limit for Cartesian translation.
   max_angular_vel_rad_s: 0.25                   # Open-loop retime speed limit for Cartesian orientation.
   episode: null  # path to .h5 episode or .npy q-trajectory file, or null for latest .h5 in data_dir
-  npy_traj_index: 0                             # for .npy files holding multiple trajectories, which one to play
-  npy_duration: 10.0                            # total playback duration (s) spanned by .npy waypoints; lower = faster
-  speed: 0.40                                      # 0.05..1.0: slow-down factor (1.0=original timing). > 1.0 is allowed but may exceed joint velocity limits — warns at startup. Implementation densifies via cubic-spline + streams at `period`, so the impedance loop never sees a step.
+  speed: 0.5
   period: 0.001
   # Joint impedance gains. Stiffer = better tracking, less compliance.
   joint_stiffness: [320.0, 320.0, 320.0, 320.0, 120.0, 120.0, 30.0]
@@ -306,10 +304,12 @@ preprocess:
   output_dir: ./data/processed
   overwrite: false
 
+  gripper_dwell_s: 0.8  # hold arm still at gripper open/close events (s); 0 to disable
+
   trim:
     enabled: true
     time_window: 0.3
-    threshold: 0.05
+    threshold: 0.01
 
   smooth:
     enabled: true

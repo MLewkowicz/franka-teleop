@@ -63,6 +63,7 @@ def _preprocess_kwargs(pre_cfg: DictConfig) -> dict:
         "smooth_max_joint_accel": smooth_cfg["max_joint_accel"],
         "smooth_max_joint_jerk": smooth_cfg["max_joint_jerk"],
         "smooth_dt": float(smooth_cfg.get("dt", 0.001)),
+        "gripper_dwell_s": float(params.get("gripper_dwell_s", 0.0)),
     }
 
 
