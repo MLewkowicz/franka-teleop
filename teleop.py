@@ -34,11 +34,26 @@ RESET_LONG_PRESS_S = 0.8
 
 def run_teleop(cfg: DictConfig):
     from zero_franky import Robot
-    from franky import Affine, JointMotion, JointState, JointStopMotion, Twist
+    from franky import (
+        Affine,
+        JointMotion,
+        JointState,
+        JointStopMotion,
+        ManipulabilityTask,
+        PostureTask,
+        Twist,
+    )
 
     tc = cfg.teleop
     sc = tc.spacemouse
     reset_joint_config = np.asarray(tc.reset_joint_config, dtype=float)
+    nullspace_target_cfg = tc.get("nullspace_target", None)
+    if nullspace_target_cfg is None:
+        nullspace_target = reset_joint_config
+    elif str(nullspace_target_cfg).lower() == "none":
+        nullspace_target = None
+    else:
+        nullspace_target = np.asarray(nullspace_target_cfg, dtype=float)
     gc = cfg.get("gripper", {})
     vc = cfg.get("visualization", {})
     pointcloud_cfg = vc.get("pointclouds", {})
@@ -262,7 +277,10 @@ def run_teleop(cfg: DictConfig):
                 period=0.001,
                 translational_stiffness=tc.translational_stiffness,
                 rotational_stiffness=tc.rotational_stiffness,
-                nullspace_stiffness=tc.nullspace_stiffness,
+                nullspace_tasks=[
+                    PostureTask(nullspace_target, stiffness=tc.nullspace_stiffness),
+                    ManipulabilityTask(gain=5.0, max_torque=1.0),
+                ],
                 lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
                 upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
             )
