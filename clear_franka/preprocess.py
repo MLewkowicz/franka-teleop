@@ -371,35 +371,46 @@ def _insert_gripper_dwell(
     dwell_s: float,
     dt: float,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
-    """Insert hold frames at every gripper open/close transition.
+    """Insert symmetric hold frames around every gripper open/close transition.
 
-    For each index where gripper_open changes, appends `dwell_n` copies of
-    that frame immediately after the transition, shifting all subsequent
-    timestamps forward by `dwell_n * dt`.
+    For each index where gripper_open changes, inserts `half_n` frames holding
+    the pre-change state immediately before the transition and `half_n` frames
+    holding the post-change state immediately after. This makes the dwell work
+    correctly in both forward and reverse playback.
     """
     gripper = resampled["gripper_open"]
     changes = np.where(gripper[1:] != gripper[:-1])[0] + 1
     if len(changes) == 0:
         return joint_pos, times, resampled
 
-    dwell_n = max(1, round(dwell_s / dt))
+    half_n = max(1, round(dwell_s / dt / 2))
     logger.info(
-        "preprocess: inserting %.2fs dwell (%d frames) at %d gripper transition(s): indices %s",
-        dwell_s, dwell_n, len(changes), changes.tolist(),
+        "preprocess: inserting %.2fs symmetric dwell (%d+%d frames) at %d gripper transition(s): indices %s",
+        dwell_s, half_n, half_n, len(changes), changes.tolist(),
     )
 
     resampled = dict(resampled)
 
-    def _insert(arr: np.ndarray, idx: int) -> np.ndarray:
-        tile = np.repeat(arr[idx : idx + 1], dwell_n, axis=0)
+    def _repeat_after(arr: np.ndarray, idx: int, n: int) -> np.ndarray:
+        tile = np.repeat(arr[idx : idx + 1], n, axis=0)
         return np.concatenate([arr[: idx + 1], tile, arr[idx + 1 :]])
 
     for idx in sorted(changes.tolist(), reverse=True):
-        t_dwell = times[idx] + np.arange(1, dwell_n + 1) * dt
-        times = np.concatenate([times[: idx + 1], t_dwell, times[idx + 1 :] + dwell_n * dt])
-        joint_pos = _insert(joint_pos, idx)
+        # Post-change: half_n frames holding the post-change state.
+        t_post = times[idx] + np.arange(1, half_n + 1) * dt
+        times = np.concatenate([times[: idx + 1], t_post, times[idx + 1 :] + half_n * dt])
+        joint_pos = _repeat_after(joint_pos, idx, half_n)
         for key in list(resampled.keys()):
-            resampled[key] = _insert(resampled[key], idx)
+            resampled[key] = _repeat_after(resampled[key], idx, half_n)
+
+        # Pre-change: half_n frames holding the pre-change state (at idx-1).
+        if idx > 0:
+            pre = idx - 1
+            t_pre = times[pre] + np.arange(1, half_n + 1) * dt
+            times = np.concatenate([times[: pre + 1], t_pre, times[pre + 1 :] + half_n * dt])
+            joint_pos = _repeat_after(joint_pos, pre, half_n)
+            for key in list(resampled.keys()):
+                resampled[key] = _repeat_after(resampled[key], pre, half_n)
 
     return joint_pos, times, resampled
 
