@@ -5,7 +5,7 @@ Shared preprocessing is called from two places:
   * file-to-file by the standalone CLI `preprocess_demonstrations.py` for
     batch re-runs.
 
-Pipeline (each step gated by `cfg.preprocess.<step>.enabled`):
+Pipeline (each step gated by explicit function arguments):
   1. trim   → drops leading/trailing stationary segments (`Trajectory.trim`)
   2. retime → TOPPRA: time-optimal traversal under (max_vel, max_accel).
               Runs on the SPARSE trimmed waypoints (~hundreds) — well-conditioned.
@@ -19,8 +19,8 @@ Aligned non-joint fields (ee_pos, ee_rot, gripper_open, …) are first sliced to
 the trim window, then re-sampled at the final post-smooth/retime timestamps:
 linear for vectors, slerp for rotations, nearest-neighbour for binary signals.
 
-`toppra` and `ruckig` are imported lazily here (not at module load) so a missing
-dependency only fails the steps that actually need it.
+`toppra` and `ruckig` are imported lazily here so missing dependencies fail the
+steps that need them.
 """
 
 from __future__ import annotations
@@ -32,7 +32,6 @@ from typing import Any
 
 import h5py
 import numpy as np
-from omegaconf import DictConfig, OmegaConf
 from scipy.spatial.transform import Rotation, Slerp
 
 from clear_franka.joint_trajectory import Trajectory
@@ -59,51 +58,64 @@ _RESAMPLE_KIND = {
 def preprocess_episode(
     raw_h5_path: Path | str,
     out_h5_path: Path | str,
-    params: DictConfig | dict[str, Any],
+    *,
+    trim_enabled: bool = True,
+    trim_time_window: float = 0.3,
+    trim_threshold: float = 0.01,
+    retime_enabled: bool = False,
+    retime_sample_uniform: bool = False,
+    retime_max_joint_vel: np.ndarray | list[float] | None = None,
+    retime_max_joint_accel: np.ndarray | list[float] | None = None,
+    smooth_enabled: bool = True,
+    smooth_max_joint_vel: np.ndarray | list[float] | None = None,
+    smooth_max_joint_accel: np.ndarray | list[float] | None = None,
+    smooth_max_joint_jerk: np.ndarray | list[float] | None = None,
+    smooth_dt: float = 0.001,
+    params_metadata: dict[str, Any] | None = None,
 ) -> bool:
     """Read a raw demonstration episode, apply the preprocessing pipeline, write it.
 
-    Returns True on success. Returns False on a *handled* failure (e.g. the
-    episode is too short to trim, Ruckig is not installed, the velocity bound
-    is violated). The raw file is never modified, so on False the caller can
-    safely fall back to the raw episode.
-
-    Raises only on programmer error (bad config schema). Missing optional deps
-    (`toppra`, `ruckig`) surface as False with a logged error, not an exception.
+    Returns True on success. Returns False only for explicit data-quality
+    failures such as too-short episodes or velocity-bound violations. Dependency,
+    load, processing, and write exceptions bubble up to the caller.
     """
     raw_h5_path = Path(raw_h5_path)
     out_h5_path = Path(out_h5_path)
-
-    params_dict = _params_to_dict(params)
 
     if not raw_h5_path.exists():
         logger.error("preprocess: raw episode does not exist: %s", raw_h5_path)
         return False
 
-    try:
-        raw = _load_episode(raw_h5_path)
-    except Exception as exc:
-        logger.error("preprocess: failed to load %s: %s", raw_h5_path, exc)
-        return False
+    raw = _load_episode(raw_h5_path)
 
-    out_arrays = preprocess_episode_arrays(raw, params_dict)
+    out_arrays = preprocess_episode_arrays(
+        raw,
+        trim_enabled=trim_enabled,
+        trim_time_window=trim_time_window,
+        trim_threshold=trim_threshold,
+        retime_enabled=retime_enabled,
+        retime_sample_uniform=retime_sample_uniform,
+        retime_max_joint_vel=retime_max_joint_vel,
+        retime_max_joint_accel=retime_max_joint_accel,
+        smooth_enabled=smooth_enabled,
+        smooth_max_joint_vel=smooth_max_joint_vel,
+        smooth_max_joint_accel=smooth_max_joint_accel,
+        smooth_max_joint_jerk=smooth_max_joint_jerk,
+        smooth_dt=smooth_dt,
+    )
     if out_arrays is None:
         return False
 
     # --- write out -------------------------------------------------------
     out_h5_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        _write_episode(
-            out_h5_path,
-            arrays=out_arrays,
-            raw_attrs=raw["_attrs"],
-            raw_camera_group=raw.get("_camera_timestamps"),
-            preprocessing_params=params_dict,
-            raw_basename=raw_h5_path.name,
-        )
-    except Exception as exc:
-        logger.error("preprocess: write %s failed: %s", out_h5_path, exc)
-        return False
+    _write_episode(
+        out_h5_path,
+        arrays=out_arrays,
+        raw_attrs=raw["_attrs"],
+        raw_camera_group=raw.get("_camera_timestamps"),
+        preprocessing_params={} if params_metadata is None else dict(params_metadata),
+        raw_basename=raw_h5_path.name,
+    )
 
     logger.info(
         "preprocess: wrote %s (%d samples, %.2fs)",
@@ -116,15 +128,25 @@ def preprocess_episode(
 
 def preprocess_episode_arrays(
     raw: dict[str, Any],
-    params: DictConfig | dict[str, Any],
+    *,
+    trim_enabled: bool = True,
+    trim_time_window: float = 0.3,
+    trim_threshold: float = 0.01,
+    retime_enabled: bool = False,
+    retime_sample_uniform: bool = False,
+    retime_max_joint_vel: np.ndarray | list[float] | None = None,
+    retime_max_joint_accel: np.ndarray | list[float] | None = None,
+    smooth_enabled: bool = True,
+    smooth_max_joint_vel: np.ndarray | list[float] | None = None,
+    smooth_max_joint_accel: np.ndarray | list[float] | None = None,
+    smooth_max_joint_jerk: np.ndarray | list[float] | None = None,
+    smooth_dt: float = 0.001,
 ) -> dict[str, np.ndarray] | None:
     """Apply the preprocessing pipeline to an already-loaded episode.
 
     Returns processed arrays on success, or None for the same handled failures
     as preprocess_episode().
     """
-    params_dict = _params_to_dict(params)
-
     if raw["joint_pos"].shape[0] < 2:
         logger.error("preprocess: episode too short (%d samples)", raw["joint_pos"].shape[0])
         return None
@@ -136,17 +158,12 @@ def preprocess_episode_arrays(
     # --- 1. trim ----------------------------------------------------------
     timestamps_in = raw["timestamps"].astype(np.float64)
     joint_pos_in = raw["joint_pos"].astype(np.float64)
-    trim_cfg = params_dict.get("trim", {})
-    if trim_cfg.get("enabled", True):
+    if trim_enabled:
         traj = Trajectory(joint_pos_in, timestamps_in)
-        try:
-            trimmed = traj.trim(
-                time_window=float(trim_cfg.get("time_window", 0.3)),
-                threshold=float(trim_cfg.get("threshold", 0.01)),
-            )
-        except AssertionError as exc:
-            logger.error("preprocess: trim failed: %s", exc)
-            return None
+        trimmed = traj.trim(
+            time_window=float(trim_time_window),
+            threshold=float(trim_threshold),
+        )
         # Trajectory.trim slices the original arrays [lo:hi+1], so trimmed.waypts_time
         # values are exact members of timestamps_in. Recover the slice indices.
         lo = int(np.searchsorted(timestamps_in, trimmed.waypts_time[0], side="left"))
@@ -179,49 +196,42 @@ def preprocess_episode_arrays(
     # Run BEFORE smooth so TOPPRA operates on the sparse trimmed waypoints
     # (hundreds). Running it on Ruckig's dense 1 kHz output (~17k samples)
     # makes its reachability solver fail with FailUncontrollable.
-    smooth_cfg = params_dict.get("smooth", {})
-    retime_cfg = params_dict.get("retime", {})
     current = trimmed_traj
-    if retime_cfg.get("enabled", False):
-        # Reuse smooth's velocity/accel limits unless overridden in the retime block.
+    if retime_enabled:
+        if retime_max_joint_vel is None and smooth_max_joint_vel is None:
+            raise ValueError("retime_enabled=True requires retime_max_joint_vel or smooth_max_joint_vel")
+        if retime_max_joint_accel is None and smooth_max_joint_accel is None:
+            raise ValueError("retime_enabled=True requires retime_max_joint_accel or smooth_max_joint_accel")
         max_vel = np.asarray(
-            retime_cfg.get("max_joint_vel", smooth_cfg.get("max_joint_vel")),
+            smooth_max_joint_vel if retime_max_joint_vel is None else retime_max_joint_vel,
             dtype=np.float64,
         )
         max_accel = np.asarray(
-            retime_cfg.get("max_joint_accel", smooth_cfg.get("max_joint_accel")),
+            smooth_max_joint_accel if retime_max_joint_accel is None else retime_max_joint_accel,
             dtype=np.float64,
         )
-        try:
-            current = current.retime(
-                max_vel=max_vel,
-                max_accel=max_accel,
-                sample_uniform=bool(retime_cfg.get("sample_uniform", False)),
-            )
-        except ImportError as exc:
-            logger.error("preprocess: toppra not installed: %s", exc)
-            return None
-        except Exception as exc:
-            logger.error("preprocess: retime() failed: %s", exc)
-            return None
+        current = current.retime(
+            max_vel=max_vel,
+            max_accel=max_accel,
+            sample_uniform=bool(retime_sample_uniform),
+        )
 
     # --- 3. smooth (Ruckig) -----------------------------------------------
     # Operates on the (possibly retimed) waypoints. Ruckig's bounded-jerk
     # profile absorbs residual jitter and emits a dense control-rate stream.
-    if smooth_cfg.get("enabled", True):
-        try:
-            current = current.smooth(
-                max_vel=np.asarray(smooth_cfg["max_joint_vel"], dtype=np.float64),
-                max_accel=np.asarray(smooth_cfg["max_joint_accel"], dtype=np.float64),
-                max_jerk=np.asarray(smooth_cfg["max_joint_jerk"], dtype=np.float64),
-                dt=float(smooth_cfg.get("dt", 0.001)),
-            )
-        except ImportError as exc:
-            logger.error("preprocess: ruckig not installed: %s", exc)
-            return None
-        except Exception as exc:
-            logger.error("preprocess: smooth() failed: %s", exc)
-            return None
+    if smooth_enabled:
+        if smooth_max_joint_vel is None:
+            raise ValueError("smooth_enabled=True requires smooth_max_joint_vel")
+        if smooth_max_joint_accel is None:
+            raise ValueError("smooth_enabled=True requires smooth_max_joint_accel")
+        if smooth_max_joint_jerk is None:
+            raise ValueError("smooth_enabled=True requires smooth_max_joint_jerk")
+        current = current.smooth(
+            max_vel=np.asarray(smooth_max_joint_vel, dtype=np.float64),
+            max_accel=np.asarray(smooth_max_joint_accel, dtype=np.float64),
+            max_jerk=np.asarray(smooth_max_joint_jerk, dtype=np.float64),
+            dt=float(smooth_dt),
+        )
 
     # Final joint trajectory and (rebased-to-zero) timestamps.
     joint_pos_out = np.asarray(current.waypts, dtype=np.float64)
@@ -232,8 +242,8 @@ def preprocess_episode_arrays(
         return None
 
     # Velocity-bound assertion (post-smooth). Allow 5% slack for numerical diff.
-    if smooth_cfg.get("enabled", True):
-        max_vel_cfg = np.asarray(smooth_cfg["max_joint_vel"], dtype=np.float64)
+    if smooth_enabled:
+        max_vel_cfg = np.asarray(smooth_max_joint_vel, dtype=np.float64)
         joint_vel_check = np.diff(joint_pos_out, axis=0) / np.maximum(np.diff(times_out)[:, None], 1e-9)
         peak = np.abs(joint_vel_check).max(axis=0)
         if np.any(peak > max_vel_cfg * 1.05):
@@ -265,12 +275,6 @@ def preprocess_episode_arrays(
     }
     out_arrays.update(resampled)
     return out_arrays
-
-
-def _params_to_dict(params: DictConfig | dict[str, Any]) -> dict[str, Any]:
-    if isinstance(params, DictConfig):
-        return OmegaConf.to_container(params, resolve=True)
-    return dict(params)
 
 
 # ---------------------------------------------------------------------------

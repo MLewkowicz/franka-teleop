@@ -109,8 +109,8 @@ replay:
   period: 0.001
   # Joint impedance gains. Stiffer = better tracking, less compliance.
   joint_stiffness: [320.0, 320.0, 320.0, 320.0, 120.0, 120.0, 30.0]
-  translational_stiffness: 100.0                # Cartesian tracker translation stiffness.
-  rotational_stiffness: 5.0                     # Cartesian tracker rotation stiffness.
+  translational_stiffness: 1000.0                # Cartesian tracker translation stiffness.
+  rotational_stiffness: 10.0                     # Cartesian tracker rotation stiffness.
   nullspace_stiffness: 2.0                      # Cartesian tracker posture-task stiffness.
   # nullspace_target defaults to the first joint state in the replayed episode; set to "none" to disable.
   # Pre-positioning move to the first joint configuration of the episode.
@@ -171,7 +171,7 @@ deploy:
   joint_limit_damping: 5.0                # smooths velocity approach
   joint_limit_max_torque: 30.0            # max repulsion torque per joint
   joint_limit_buffer_rad: 0.05            # pad lower/upper limits inward by this
-  
+
   steering:
     enabled: false                 # flip to true (or override on CLI) to steer
     # Absolute target orientation, Euler XYZ radians, SAME convention as
@@ -301,42 +301,27 @@ deploy:
     pos_thresh_m: 0.05
     eul_thresh_rad: 0.30
 
-# Demonstration preprocessing — runs automatically at the end of `mode=demonstrate`
-# (and via `preprocess_demonstrations.py` for batch re-runs). Pipeline:
-#   1. trim   — drop leading/trailing stationary samples (idle-time before the
-#               operator starts kinesthetically guiding the arm bleeds into the
-#               policy as a stationary opening; this removes it).
-#   2. smooth — Ruckig online tracking → dense, jerk-bounded joint trajectory.
-#               Preserves the operator's pacing while removing hand-tremor jitter
-#               and bounding velocity/accel/jerk.
-#   3. retime — TOPPRA time-optimal traversal. OFF by default because it would
-#               collapse natural pauses in the demonstration; turn on if you want
-#               a faster replay that ignores demonstrated timing.
-# Raw episodes are NEVER modified; processed copies land in `output_dir`.
+# Preprocess pipeline: trim -> retime -> smooth.
 preprocess:
-  enabled: true
   input_dir: ./data
   output_dir: ./data/processed
-  overwrite: false                  # skip episodes whose processed copy already exists
+  overwrite: false
 
   trim:
     enabled: true
-    time_window: 0.3                # seconds — window for displacement check
-    threshold: 0.01                 # rad — sum-norm joint displacement under which we call it stationary
+    time_window: 0.3
+    threshold: 0.05
 
-  smooth:                            # Ruckig — preserves human pacing, bounds vel/accel/jerk
+  smooth:
     enabled: true
-    max_joint_vel:   [2.0, 2.0, 2.0, 2.0, 2.5, 2.5, 2.5]    # rad/s — ~half of Franka FR3 limits
-    max_joint_accel: [5.0, 5.0, 5.0, 5.0, 6.0, 6.0, 6.0]    # rad/s^2
-    max_joint_jerk:  [50,  50,  50,  50,  60,  60,  60]     # rad/s^3
-    dt: 0.001                                               # 1 kHz to match recording
+    max_joint_vel:   [2.0, 2.0, 2.0, 2.0, 2.5, 2.5, 2.5]
+    max_joint_accel: [5.0, 5.0, 5.0, 5.0, 6.0, 6.0, 6.0]
+    max_joint_jerk:  [50,  50,  50,  50,  60,  60,  60]
+    dt: 0.001
 
-  retime:                            # TOPPRA — time-optimal under same kinematic limits
-    enabled: true                   # leave off for teaching demos; preserves natural pacing
+  retime:
+    enabled: true
     sample_uniform: true
-    # Optional overrides; default to smooth.max_joint_vel / smooth.max_joint_accel:
-    # max_joint_vel:   [...]
-    # max_joint_accel: [...]
 
 calibration:
   camera_mount: third_person           # third_person | hand

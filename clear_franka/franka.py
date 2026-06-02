@@ -1,5 +1,6 @@
 """Shared Franka hardware constants and runtime helpers."""
 
+import os
 import time
 
 DEFAULT_LOWER_JOINT_LIMITS = [-2.9007, -1.8361, -2.9007, -3.0770, -2.8763, 0.4398, -3.0508]
@@ -20,6 +21,22 @@ def joint_friction_kwargs(cfg) -> dict:
     if friction_cfg.get("velocity_epsilon") is not None:
         kwargs["friction_velocity_epsilon"] = float(friction_cfg.velocity_epsilon)
     return kwargs
+
+
+def desk_credentials(
+    *,
+    hostname: str,
+    username: str | None = None,
+    password: str | None = None,
+) -> tuple[str, str, str]:
+    username = username or os.environ.get("FRANKA_DESK_USERNAME")
+    password = password or os.environ.get("FRANKA_DESK_PASSWORD")
+    if not username or not password:
+        raise RuntimeError(
+            "Set desk.username/desk.password in Hydra config or "
+            "FRANKA_DESK_USERNAME/FRANKA_DESK_PASSWORD in the environment."
+        )
+    return hostname, str(username), str(password)
 
 
 def wait_for_motion_idle(robot, timeout_s: float = 5.0, poll_s: float = 0.05) -> bool:

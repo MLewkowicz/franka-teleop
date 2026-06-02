@@ -45,8 +45,8 @@ class TrajectoryRecorder:
         self._count = 0
         self._start_time = 0.0
         self._start_wall = ""
-        # Set by `_save_episode` so callers (e.g. demonstrate.py's auto-preprocess
-        # hook) can find the just-saved h5 without reconstructing its path.
+        # Set by `_save_episode` so callers can find the just-saved h5 without
+        # reconstructing its path.
         self.last_saved_path: Path | None = None
         self._alloc_buffers()
 

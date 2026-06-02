@@ -5,7 +5,7 @@ from pathlib import Path
 
 import h5py
 import numpy as np
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from zero_franky import Robot
 from franky import Affine, JointMotion, JointState, ManipulabilityTask, PostureTask, Twist
@@ -42,6 +42,27 @@ def prompt_reverse_reset() -> bool:
         print("  Reverse reset skipped (no input available).")
         return False
     return answer in ("", "y", "yes")
+
+
+def _preprocess_kwargs(pre_cfg: DictConfig) -> dict:
+    params = OmegaConf.to_container(pre_cfg, resolve=True)
+    trim_cfg = params.get("trim", {})
+    retime_cfg = params.get("retime", {})
+    smooth_cfg = params.get("smooth", {})
+    return {
+        "trim_enabled": bool(trim_cfg.get("enabled", True)),
+        "trim_time_window": float(trim_cfg.get("time_window", 0.3)),
+        "trim_threshold": float(trim_cfg.get("threshold", 0.01)),
+        "retime_enabled": bool(retime_cfg.get("enabled", False)),
+        "retime_sample_uniform": bool(retime_cfg.get("sample_uniform", False)),
+        "retime_max_joint_vel": retime_cfg.get("max_joint_vel", None),
+        "retime_max_joint_accel": retime_cfg.get("max_joint_accel", None),
+        "smooth_enabled": bool(smooth_cfg.get("enabled", True)),
+        "smooth_max_joint_vel": smooth_cfg["max_joint_vel"],
+        "smooth_max_joint_accel": smooth_cfg["max_joint_accel"],
+        "smooth_max_joint_jerk": smooth_cfg["max_joint_jerk"],
+        "smooth_dt": float(smooth_cfg.get("dt", 0.001)),
+    }
 
 
 def play_joint_trajectory(
@@ -275,7 +296,7 @@ def run_replay(cfg: DictConfig):
         if pre_cfg is None:
             raise RuntimeError("replay.preprocess=true requires the top-level preprocess config")
         print("  Preprocessing episode before replay...")
-        processed = preprocess_episode_arrays(episode, pre_cfg)
+        processed = preprocess_episode_arrays(episode, **_preprocess_kwargs(pre_cfg))
         if processed is None:
             raise RuntimeError("Replay preprocessing failed; see preprocess logs above")
         episode.update(processed)

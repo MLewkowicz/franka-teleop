@@ -9,7 +9,6 @@ Press Ctrl-C to stop.
 
 import contextlib
 import json
-import os
 import time
 
 import hydra
@@ -20,56 +19,14 @@ from omegaconf import DictConfig
 from clear_franka.franka import (
     DEFAULT_LOWER_JOINT_LIMITS,
     DEFAULT_UPPER_JOINT_LIMITS,
+    desk_credentials,
     joint_friction_kwargs,
     stop_tracker_motion,
     wait_for_motion_idle,
 )
-from clear_franka.preprocess import preprocess_episode
 from clear_franka.recorder import TrajectoryRecorder
 from clear_franka.robotiq_net_proxy import RobotiqGripperProxy
 from clear_franka.utils import LoopRatePrinter, announce
-
-
-def _maybe_preprocess(cfg: DictConfig, raw_path) -> None:
-    """Run trim → retime → smooth on the just-saved episode, write to processed/.
-
-    Called immediately after `recorder.stop()`. Never raises — the raw file is
-    already on disk, so any failure here is recoverable via the standalone CLI
-    (`preprocess_demonstrations.py`).
-    """
-    from pathlib import Path
-
-    pre_cfg = cfg.get("preprocess", None)
-    if pre_cfg is None or not pre_cfg.get("enabled", False):
-        return
-    raw_path = Path(raw_path)
-    out_dir = Path(pre_cfg.get("output_dir", "./data/processed"))
-    out_path = out_dir / raw_path.name
-    if out_path.exists() and not pre_cfg.get("overwrite", False):
-        print(f"  [preprocess] {out_path.name} already exists, skipping")
-        return
-    try:
-        ok = preprocess_episode(raw_path, out_path, pre_cfg)
-    except Exception as exc:
-        print(f"  [preprocess] FAILED ({exc}) — raw episode at {raw_path} is intact")
-        return
-    if ok:
-        print(f"  [preprocess] wrote {out_path}")
-    else:
-        print(f"  [preprocess] skipped (see log) — raw episode at {raw_path} is intact")
-
-
-def _desk_credentials(cfg: DictConfig) -> tuple[str, str, str]:
-    desk_cfg = cfg.get("desk", {})
-    hostname = str(desk_cfg.get("hostname", cfg.robot.ip))
-    username = desk_cfg.get("username") or os.environ.get("FRANKA_DESK_USERNAME")
-    password = desk_cfg.get("password") or os.environ.get("FRANKA_DESK_PASSWORD")
-    if not username or not password:
-        raise RuntimeError(
-            "Set desk.username/desk.password in Hydra config or "
-            "FRANKA_DESK_USERNAME/FRANKA_DESK_PASSWORD in the environment."
-        )
-    return hostname, str(username), str(password)
 
 
 def _toggle_gripper(gripper, gripper_open: bool, gripper_cfg, visualizer=None) -> bool:
@@ -167,7 +124,12 @@ def run_demonstrate(cfg: DictConfig):
     button_timeout = float(dc.get("button_timeout", period))
     button_debounce_s = float(dc.button_debounce_s)
 
-    hostname, username, password = _desk_credentials(cfg)
+    desk_cfg = cfg.get("desk", {})
+    hostname, username, password = desk_credentials(
+        hostname=str(desk_cfg.get("hostname", cfg.robot.ip)),
+        username=desk_cfg.get("username"),
+        password=desk_cfg.get("password"),
+    )
     robot = Robot(cfg.robot.ip)
     robot.recover_from_errors()
 
@@ -329,8 +291,6 @@ def run_demonstrate(cfg: DictConfig):
                             loop_rate.newline()
                             recorder.toggle()
                             announce("recording stopped" if not recorder.recording else "recording started")
-                            if not recorder.recording and recorder.last_saved_path is not None:
-                                _maybe_preprocess(cfg, recorder.last_saved_path)
                         elif event.button == PilotButton.CHECK:
                             last_button_action[event.button] = now
                             loop_rate.newline()

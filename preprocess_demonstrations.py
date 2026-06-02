@@ -21,7 +21,7 @@ import logging
 from pathlib import Path
 
 import hydra
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from clear_franka.preprocess import preprocess_episode
 
@@ -35,6 +35,28 @@ def _iter_raw_episodes(input_dir: Path) -> list[Path]:
     return sorted(input_dir.glob("episode_*.h5"))
 
 
+def _preprocess_kwargs(pre_cfg: DictConfig) -> dict:
+    params = OmegaConf.to_container(pre_cfg, resolve=True)
+    trim_cfg = params.get("trim", {})
+    retime_cfg = params.get("retime", {})
+    smooth_cfg = params.get("smooth", {})
+    return {
+        "trim_enabled": bool(trim_cfg.get("enabled", True)),
+        "trim_time_window": float(trim_cfg.get("time_window", 0.3)),
+        "trim_threshold": float(trim_cfg.get("threshold", 0.01)),
+        "retime_enabled": bool(retime_cfg.get("enabled", False)),
+        "retime_sample_uniform": bool(retime_cfg.get("sample_uniform", False)),
+        "retime_max_joint_vel": retime_cfg.get("max_joint_vel", None),
+        "retime_max_joint_accel": retime_cfg.get("max_joint_accel", None),
+        "smooth_enabled": bool(smooth_cfg.get("enabled", True)),
+        "smooth_max_joint_vel": smooth_cfg["max_joint_vel"],
+        "smooth_max_joint_accel": smooth_cfg["max_joint_accel"],
+        "smooth_max_joint_jerk": smooth_cfg["max_joint_jerk"],
+        "smooth_dt": float(smooth_cfg.get("dt", 0.001)),
+        "params_metadata": params,
+    }
+
+
 @hydra.main(version_base=None, config_path="conf", config_name="config")
 def main(cfg: DictConfig) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -46,6 +68,7 @@ def main(cfg: DictConfig) -> None:
     input_dir = Path(pre_cfg.get("input_dir", "./data"))
     output_dir = Path(pre_cfg.get("output_dir", "./data/processed"))
     overwrite = bool(pre_cfg.get("overwrite", False))
+    preprocess_kwargs = _preprocess_kwargs(pre_cfg)
 
     # Single-episode mode via `+episode=PATH` Hydra override.
     single = cfg.get("episode", None)
@@ -73,12 +96,7 @@ def main(cfg: DictConfig) -> None:
             print(f"  [skip] {raw.name} (processed copy exists; pass preprocess.overwrite=true to redo)")
             skip_count += 1
             continue
-        try:
-            ok = preprocess_episode(raw, out, pre_cfg)
-        except Exception as exc:
-            print(f"  [fail] {raw.name}: {exc}")
-            fail_count += 1
-            continue
+        ok = preprocess_episode(raw, out, **preprocess_kwargs)
         if ok:
             print(f"  [ok]   {raw.name} -> {out}")
             ok_count += 1
