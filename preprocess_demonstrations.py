@@ -11,9 +11,8 @@ Usage:
     # Overwrite existing processed copies (re-tune with new params):
     uv run python preprocess_demonstrations.py preprocess.overwrite=true
 
-The same `preprocess_episode()` is invoked from `demonstrate.py` immediately
-after a recording stops, so this CLI is for batch / re-runs only — fresh
-demonstrations do not need it.
+Replay can run the same preprocessing in memory before playback. This CLI is
+for writing processed HDF5 copies for inspection, caching, or batch re-runs.
 """
 
 from __future__ import annotations

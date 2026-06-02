@@ -1,9 +1,9 @@
 """Demonstration episode preprocessing — trim leading idle, smooth, retime.
 
-Shared `preprocess_episode()` is called from two places:
-  * inline in `demonstrate.py` immediately after recording stops, so a processed
-    copy lands in `data/processed/` without a manual step;
-  * by the standalone CLI `preprocess_demonstrations.py` for batch re-runs.
+Shared preprocessing is called from two places:
+  * in-memory by `replay.py` before playback when `replay.preprocess=true`;
+  * file-to-file by the standalone CLI `preprocess_demonstrations.py` for
+    batch re-runs.
 
 Pipeline (each step gated by `cfg.preprocess.<step>.enabled`):
   1. trim   → drops leading/trailing stationary segments (`Trajectory.trim`)
@@ -74,10 +74,7 @@ def preprocess_episode(
     raw_h5_path = Path(raw_h5_path)
     out_h5_path = Path(out_h5_path)
 
-    if isinstance(params, DictConfig):
-        params_dict = OmegaConf.to_container(params, resolve=True)
-    else:
-        params_dict = dict(params)
+    params_dict = _params_to_dict(params)
 
     if not raw_h5_path.exists():
         logger.error("preprocess: raw episode does not exist: %s", raw_h5_path)
@@ -89,13 +86,52 @@ def preprocess_episode(
         logger.error("preprocess: failed to load %s: %s", raw_h5_path, exc)
         return False
 
-    if raw["joint_pos"].shape[0] < 2:
-        logger.error("preprocess: episode too short (%d samples)", raw["joint_pos"].shape[0])
+    out_arrays = preprocess_episode_arrays(raw, params_dict)
+    if out_arrays is None:
         return False
 
-    if np.isnan(raw["joint_pos"]).any():
-        logger.error("preprocess: joint_pos contains NaN — refusing to process %s", raw_h5_path)
+    # --- write out -------------------------------------------------------
+    out_h5_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _write_episode(
+            out_h5_path,
+            arrays=out_arrays,
+            raw_attrs=raw["_attrs"],
+            raw_camera_group=raw.get("_camera_timestamps"),
+            preprocessing_params=params_dict,
+            raw_basename=raw_h5_path.name,
+        )
+    except Exception as exc:
+        logger.error("preprocess: write %s failed: %s", out_h5_path, exc)
         return False
+
+    logger.info(
+        "preprocess: wrote %s (%d samples, %.2fs)",
+        out_h5_path,
+        out_arrays["joint_pos"].shape[0],
+        float(out_arrays["timestamps"][-1]),
+    )
+    return True
+
+
+def preprocess_episode_arrays(
+    raw: dict[str, Any],
+    params: DictConfig | dict[str, Any],
+) -> dict[str, np.ndarray] | None:
+    """Apply the preprocessing pipeline to an already-loaded episode.
+
+    Returns processed arrays on success, or None for the same handled failures
+    as preprocess_episode().
+    """
+    params_dict = _params_to_dict(params)
+
+    if raw["joint_pos"].shape[0] < 2:
+        logger.error("preprocess: episode too short (%d samples)", raw["joint_pos"].shape[0])
+        return None
+
+    if np.isnan(raw["joint_pos"]).any():
+        logger.error("preprocess: joint_pos contains NaN — refusing to process")
+        return None
 
     # --- 1. trim ----------------------------------------------------------
     timestamps_in = raw["timestamps"].astype(np.float64)
@@ -110,7 +146,7 @@ def preprocess_episode(
             )
         except AssertionError as exc:
             logger.error("preprocess: trim failed: %s", exc)
-            return False
+            return None
         # Trajectory.trim slices the original arrays [lo:hi+1], so trimmed.waypts_time
         # values are exact members of timestamps_in. Recover the slice indices.
         lo = int(np.searchsorted(timestamps_in, trimmed.waypts_time[0], side="left"))
@@ -137,7 +173,7 @@ def preprocess_episode(
 
     if trimmed_traj.num_waypts < 4:
         logger.error("preprocess: too few samples after trim (%d) — refusing to smooth", trimmed_traj.num_waypts)
-        return False
+        return None
 
     # --- 2. retime (TOPPRA) -----------------------------------------------
     # Run BEFORE smooth so TOPPRA operates on the sparse trimmed waypoints
@@ -164,10 +200,10 @@ def preprocess_episode(
             )
         except ImportError as exc:
             logger.error("preprocess: toppra not installed: %s", exc)
-            return False
+            return None
         except Exception as exc:
             logger.error("preprocess: retime() failed: %s", exc)
-            return False
+            return None
 
     # --- 3. smooth (Ruckig) -----------------------------------------------
     # Operates on the (possibly retimed) waypoints. Ruckig's bounded-jerk
@@ -182,10 +218,10 @@ def preprocess_episode(
             )
         except ImportError as exc:
             logger.error("preprocess: ruckig not installed: %s", exc)
-            return False
+            return None
         except Exception as exc:
             logger.error("preprocess: smooth() failed: %s", exc)
-            return False
+            return None
 
     # Final joint trajectory and (rebased-to-zero) timestamps.
     joint_pos_out = np.asarray(current.waypts, dtype=np.float64)
@@ -193,7 +229,7 @@ def preprocess_episode(
     times_out = times_out - times_out[0]
     if times_out[-1] <= 0:
         logger.error("preprocess: degenerate output duration %.6f", float(times_out[-1]))
-        return False
+        return None
 
     # Velocity-bound assertion (post-smooth). Allow 5% slack for numerical diff.
     if smooth_cfg.get("enabled", True):
@@ -206,7 +242,7 @@ def preprocess_episode(
                 np.array2string(peak, precision=3),
                 np.array2string(max_vel_cfg, precision=3),
             )
-            return False
+            return None
 
     # --- 4. resample aligned fields at the new timestamps -----------------
     resampled = _resample_aligned_fields(
@@ -228,29 +264,13 @@ def preprocess_episode(
         "joint_vel": joint_vel_out,
     }
     out_arrays.update(resampled)
+    return out_arrays
 
-    # --- 5. write out -----------------------------------------------------
-    out_h5_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        _write_episode(
-            out_h5_path,
-            arrays=out_arrays,
-            raw_attrs=raw["_attrs"],
-            raw_camera_group=raw.get("_camera_timestamps"),
-            preprocessing_params=params_dict,
-            raw_basename=raw_h5_path.name,
-        )
-    except Exception as exc:
-        logger.error("preprocess: write %s failed: %s", out_h5_path, exc)
-        return False
 
-    logger.info(
-        "preprocess: wrote %s (%d samples, %.2fs)",
-        out_h5_path,
-        joint_pos_out.shape[0],
-        float(times_out[-1]),
-    )
-    return True
+def _params_to_dict(params: DictConfig | dict[str, Any]) -> dict[str, Any]:
+    if isinstance(params, DictConfig):
+        return OmegaConf.to_container(params, resolve=True)
+    return dict(params)
 
 
 # ---------------------------------------------------------------------------
