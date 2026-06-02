@@ -1,4 +1,16 @@
 outputs/
 data/
 __pycache__/
+*.swp
 *.pyc
+scripts/print_joints.py
+scripts/test_gripper.py
+tracker_error_debug.py
+deploy_diffuser_actor.PRE_HYBRID.20260527_191555.py
+deploy_diffuser_actor.PRE_STEERING.20260527_150622.py
+deploy_diffuser_actor.rsynced.bak.py
+.idea/
+checkpoints/
+FABRICS/
+DIFFUSER_ACTOR_DEPLOY_DEBUG.md
+STEERING_STATUS.md

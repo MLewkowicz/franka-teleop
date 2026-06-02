@@ -1281,11 +1281,6 @@ def main(cfg: DictConfig) -> int:
         active_plan_started_at = 0.0
         consumed_sequence = -1
         waiting_for_plan = False
-        # Set when the time-parameterized target reaches the final waypoint; while
-        # non-None we HOLD that reference and let the impedance controller converge
-        # before requesting the next plan (prevents tracking error accumulating
-        # across plan boundaries). Reset to None on adoption.
-        settle_started_at: float | None = None
         next_tick = time.monotonic()
         last_viz_update = 0.0
         viz_dt = 1.0 / 5.0
@@ -1295,16 +1290,6 @@ def main(cfg: DictConfig) -> int:
         plan_max_linear_vel_m_s = float(cfg.deploy.get("max_linear_vel_m_s", 0.03))
         plan_max_angular_vel_rad_s = float(cfg.deploy.get("max_angular_vel_rad_s", 0.25))
         plan_timeout_grace_s = 2.0
-        # ----- settle phase (let the tracker catch up before the next plan) -----
-        # After the target has been streamed to the final waypoint, hold it and
-        # wait up to plan_settle_timeout_s for the measured EE to converge within
-        # plan_settle_tolerance_m, with a guaranteed minimum dwell of
-        # plan_settle_min_s. Then request the next plan.
-        plan_settle_tolerance_m = float(
-            cfg.deploy.get("plan_settle_tolerance_m", plan_completion_tolerance_m)
-        )
-        plan_settle_timeout_s = float(cfg.deploy.get("plan_settle_timeout_s", 2.0))
-        plan_settle_min_s = float(cfg.deploy.get("plan_settle_min_s", 0.0))
 
         # ----- mode transitions (swappable gesture->action mapping layer) -----
         def _enter_inference(prim: int, label: str) -> None:
@@ -1527,7 +1512,6 @@ def main(cfg: DictConfig) -> int:
                     else:
                         active_plan = plan
                         waiting_for_plan = False
-                        settle_started_at = None
                         adopted_at = time.monotonic()
                         active_index = _plan_start_index(
                             plan,
@@ -1624,65 +1608,21 @@ def main(cfg: DictConfig) -> int:
                     plan_timeout_s,
                     active_cartesian_trajectory.duration + plan_timeout_grace_s,
                 )
-
-                # The time-parameterized target has reached the final waypoint
-                # (interpolate() clamps there for elapsed > duration, so the same
-                # reference keeps being commanded each tick — we're holding it).
-                streamed_to_end = active_index >= len(active_plan.trajectory) - 1
-
-                if streamed_to_end and settle_started_at is None:
-                    settle_started_at = time.monotonic()
-                    logger.info(
-                        "  plan %d streamed to end; settling (err=%.1fmm, "
-                        "tol=%.1fmm, timeout=%.1fs)",
-                        active_plan.sequence, final_dist * 1000.0,
-                        plan_settle_tolerance_m * 1000.0, plan_settle_timeout_s,
-                    )
-
-                settle_elapsed = (
-                    time.monotonic() - settle_started_at
-                    if settle_started_at is not None else 0.0
-                )
-                settled = (
-                    streamed_to_end
-                    and final_dist <= plan_settle_tolerance_m
-                    and settle_elapsed >= plan_settle_min_s
-                )
-                settle_expired = (
-                    settle_started_at is not None
-                    and settle_elapsed > plan_settle_timeout_s
-                )
-
-                if settled or settle_expired:
-                    if settled:
-                        logger.info(
-                            "  completed plan %d (settled %.0fms, err=%.1fmm)",
-                            active_plan.sequence, settle_elapsed * 1000.0,
-                            final_dist * 1000.0,
-                        )
-                    else:
-                        logger.info(
-                            "  plan %d settle timeout (%.1fs, err=%.1fmm); advancing",
-                            active_plan.sequence, plan_settle_timeout_s,
-                            final_dist * 1000.0,
-                        )
+                if (
+                    active_index >= len(active_plan.trajectory) - 1
+                    and final_dist <= plan_completion_tolerance_m
+                ):
+                    logger.info("  completed plan %d", active_plan.sequence)
                     visualizer.clear_plan_waypoints()
                     active_plan = None
                     active_cartesian_trajectory = None
                     active_plan_index_offset = 0
                     active_plan_started_at = 0.0
-                    settle_started_at = None
                     request_event.set()
                     waiting_for_plan = True
-                elif (
-                    not streamed_to_end
-                    and time.monotonic() - active_plan_started_at > active_plan_timeout_s
-                ):
-                    # Stalled mid-trajectory (target not yet at the final waypoint);
-                    # abandon and replan. Once streaming has finished the settle
-                    # phase above governs instead, so this won't fire during the hold.
+                elif time.monotonic() - active_plan_started_at > active_plan_timeout_s:
                     logger.info(
-                        "  plan %d timed out mid-stream after %.1fs at idx=%d/%d; replacing",
+                        "  plan %d timed out after %.1fs at idx=%d/%d; requesting replacement",
                         active_plan.sequence,
                         active_plan_timeout_s,
                         active_index,
@@ -1693,7 +1633,6 @@ def main(cfg: DictConfig) -> int:
                     active_cartesian_trajectory = None
                     active_plan_index_offset = 0
                     active_plan_started_at = 0.0
-                    settle_started_at = None
                     request_event.set()
                     waiting_for_plan = True
 

@@ -40,44 +40,26 @@ def prompt_reverse_reset() -> bool:
     return answer in ("", "y", "yes")
 
 
-def compute_replay_kinematics(
-    *,
-    timestamps: np.ndarray,
-    joint_vel: np.ndarray,
-    speed: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return time-scaled desired joint velocity and acceleration."""
-    if np.any(np.diff(timestamps) <= 0.0):
-        raise ValueError("Episode timestamps must be strictly increasing")
-
-    base_joint_vel = np.asarray(joint_vel, dtype=float)
-    if len(timestamps) < 2:
-        base_joint_acc = np.zeros_like(base_joint_vel)
-    else:
-        edge_order = 2 if len(timestamps) > 2 else 1
-        base_joint_acc = np.gradient(base_joint_vel, timestamps, axis=0, edge_order=edge_order)
-
-    return base_joint_vel * speed, base_joint_acc * speed * speed
-
-
 def make_inverse_dynamics_replay_policy(
     *,
     timestamps: np.ndarray,
     joint_pos: np.ndarray,
-    joint_vel_ref: np.ndarray,
-    joint_acc_ref: np.ndarray,
     speed: float,
 ):
     """Build a cloudpickle-friendly policy that runs on the zero_franky server."""
     timestamps = np.asarray(timestamps, dtype=float)
     joint_pos = np.asarray(joint_pos, dtype=float)
-    joint_vel_ref = np.asarray(joint_vel_ref, dtype=float)
-    joint_acc_ref = np.asarray(joint_acc_ref, dtype=float)
 
     def policy(context):
         import numpy as _np
+        from scipy.interpolate import make_interp_spline
 
         model = context.robot.model
+        k = 3 if len(timestamps) >= 4 else 1
+        kwargs = {"bc_type": "clamped"} if k == 3 else {}
+        position_spline = make_interp_spline(timestamps, joint_pos, k=k, **kwargs)
+        velocity_spline = position_spline.derivative(1)
+        acceleration_spline = position_spline.derivative(2) if k >= 2 else None
 
         def step(context):
             elapsed = context.elapsed * speed
@@ -88,16 +70,21 @@ def make_inverse_dynamics_replay_policy(
                     "torque_feedforward": [0.0] * 7,
                 }
 
-            index = int(_np.searchsorted(timestamps, elapsed, side="right") - 1)
-            index = max(0, min(index, len(timestamps) - 1))
+            q = _np.asarray(position_spline(elapsed), dtype=float).reshape(7)
+            dq = _np.asarray(velocity_spline(elapsed), dtype=float).reshape(7) * speed
+            if acceleration_spline is None:
+                ddq = _np.zeros(7, dtype=float)
+            else:
+                ddq = _np.asarray(acceleration_spline(elapsed), dtype=float).reshape(7)
+                ddq = ddq * speed * speed
 
             state = context.robot.state
             mass = _np.asarray(model.mass(state), dtype=float)
-            tau = _np.ravel(mass @ joint_acc_ref[index])
+            tau = _np.ravel(mass @ ddq)
 
             return {
-                "position": joint_pos[index].tolist(),
-                "velocity": joint_vel_ref[index].tolist(),
+                "position": q.tolist(),
+                "velocity": dq.tolist(),
                 "torque_feedforward": tau.tolist(),
             }
 
@@ -114,13 +101,10 @@ def play_joint_trajectory(
     stiffness: np.ndarray,
     timestamps: np.ndarray,
     joint_pos: np.ndarray,
-    joint_vel_ref: np.ndarray,
-    joint_acc_ref: np.ndarray,
     gripper,
     gripper_open_data,
     recorder=None,
     gripper_open_for_record=None,
-    complete_message: str = "Replay complete.",
 ):
     n_steps = len(timestamps)
 
@@ -133,8 +117,6 @@ def play_joint_trajectory(
     policy = make_inverse_dynamics_replay_policy(
         timestamps=timestamps,
         joint_pos=joint_pos,
-        joint_vel_ref=joint_vel_ref,
-        joint_acc_ref=joint_acc_ref,
         speed=float(rc.speed),
     )
 
@@ -168,8 +150,8 @@ def play_joint_trajectory(
                     raise RuntimeError(f"Joint replay policy stopped: {status}")
                 last_status_check = now
 
-            if step >= n_steps - 1:
-                print(f"  {complete_message}")
+            if elapsed >= timestamps[-1]:
+                print("  Replay complete.")
                 session.set_joint_reference(joint_pos[-1].tolist())
                 break
 
@@ -245,13 +227,13 @@ def run_replay(cfg: DictConfig):
     joint_vel = episode["joint_vel"]
     n_steps = len(timestamps)
     duration = timestamps[-1]
+    if np.any(np.diff(timestamps) <= 0.0):
+        raise ValueError("Episode timestamps must be strictly increasing")
 
     if np.any(np.isnan(joint_pos)):
         raise ValueError(
             "Episode has NaN joint_pos samples — was joint state captured during recording?"
         )
-    if np.any(np.isnan(joint_vel)):
-        raise ValueError("Episode has NaN joint_vel samples")
 
     gripper_open_data = episode.get("gripper_open")
     has_gripper_data = (
@@ -259,16 +241,11 @@ def run_replay(cfg: DictConfig):
     )
 
     stiffness = np.asarray(rc.joint_stiffness, dtype=float)
-    joint_vel_ref, joint_acc_ref = compute_replay_kinematics(
-        timestamps=timestamps,
-        joint_vel=joint_vel,
-        speed=float(rc.speed),
-    )
     print(f"  {n_steps} steps, {duration:.1f}s duration")
     print(f"  Replay speed: {rc.speed}x")
     print(f"  Joint stiffness: {stiffness.tolist()}")
-    print("  Joint velocity feedforward: recorded")
-    print("  Inverse dynamics feedforward: enabled")
+    print("  Joint velocity feedforward: spline derivative")
+    print("  Inverse dynamics feedforward: spline acceleration")
     print("    Coriolis compensation: franky motion")
     if has_gripper_data:
         print(f"  Gripper replay: {'enabled' if gc.get('enabled', False) else 'disabled (gripper.enabled=false in config)'}")
@@ -363,8 +340,6 @@ def run_replay(cfg: DictConfig):
             stiffness=stiffness,
             timestamps=timestamps,
             joint_pos=joint_pos,
-            joint_vel_ref=joint_vel_ref,
-            joint_acc_ref=joint_acc_ref,
             gripper=gripper,
             gripper_open_data=gripper_open_data,
             recorder=recorder,
@@ -377,8 +352,6 @@ def run_replay(cfg: DictConfig):
         if prompt_reverse_reset():
             reverse_timestamps = timestamps[-1] - timestamps[::-1]
             reverse_joint_pos = joint_pos[::-1]
-            reverse_joint_vel_ref = -joint_vel_ref[::-1]
-            reverse_joint_acc_ref = joint_acc_ref[::-1]
             reverse_gripper_open_data = (
                 gripper_open_data[::-1] if gripper_open_data is not None else gripper_open_data
             )
@@ -389,13 +362,11 @@ def run_replay(cfg: DictConfig):
                 stiffness=stiffness,
                 timestamps=reverse_timestamps,
                 joint_pos=reverse_joint_pos,
-                joint_vel_ref=reverse_joint_vel_ref,
-                joint_acc_ref=reverse_joint_acc_ref,
                 gripper=gripper,
                 gripper_open_data=reverse_gripper_open_data,
                 gripper_open_for_record=gripper_open_for_record,
-                complete_message="Reverse reset complete.",
             )
+            print("  Reverse reset complete.")
         else:
             print("  Reverse reset skipped.")
 
