@@ -968,6 +968,7 @@ def main(cfg: DictConfig) -> int:
     from clear_franka.utils import LoopRatePrinter
     from clear_franka.diffuser_actor_io import euler_xyz_to_matrix
     from clear_franka.geometry import pack_Rp
+    from scipy.spatial.transform import Rotation
     from clear_franka.robotiq_net_proxy import RobotiqGripperProxy
     from clear_franka.recorder import TrajectoryRecorder
     from clear_franka.visualization import CortadoViserVisualizer
@@ -1291,6 +1292,22 @@ def main(cfg: DictConfig) -> int:
         plan_max_angular_vel_rad_s = float(cfg.deploy.get("max_angular_vel_rad_s", 0.25))
         plan_timeout_grace_s = 2.0
 
+        # ----- host-side terminal-convergence aids (feat/cartesian-integral-ff) -----
+        # franky's Cartesian impedance has no integrator, so the EE settles to
+        # target - residual/stiffness. We add a host-side integral on the tracking
+        # error (active only during the terminal hold, to avoid winding up against
+        # the velocity lag mid-trajectory) plus velocity feedforward via target_twist.
+        velocity_feedforward = bool(cfg.deploy.get("velocity_feedforward", True))
+        integral_enabled = bool(cfg.deploy.get("integral_enabled", True))
+        integral_gain_pos = float(cfg.deploy.get("integral_gain_pos", 1.5))
+        integral_gain_rot = float(cfg.deploy.get("integral_gain_rot", 1.5))
+        integral_max_pos_m = float(cfg.deploy.get("integral_max_pos_m", 0.04))
+        integral_max_rot_rad = float(cfg.deploy.get("integral_max_rot_rad", 0.12))
+        integral_deadband_pos_m = float(cfg.deploy.get("integral_deadband_pos_m", 0.002))
+        integral_deadband_rot_rad = float(cfg.deploy.get("integral_deadband_rot_rad", 0.01))
+        pos_err_int = np.zeros(3, dtype=np.float64)
+        rot_err_int = np.zeros(3, dtype=np.float64)
+
         # ----- mode transitions (swappable gesture->action mapping layer) -----
         def _enter_inference(prim: int, label: str) -> None:
             nonlocal mode, stage_idx, active_plan, active_cartesian_trajectory
@@ -1512,6 +1529,11 @@ def main(cfg: DictConfig) -> int:
                     else:
                         active_plan = plan
                         waiting_for_plan = False
+                        # Fresh integral state per plan — the steady-state offset
+                        # is configuration-dependent, so carrying it across plans
+                        # would inject a stale correction at the next endpoint.
+                        pos_err_int = np.zeros(3, dtype=np.float64)
+                        rot_err_int = np.zeros(3, dtype=np.float64)
                         adopted_at = time.monotonic()
                         active_index = _plan_start_index(
                             plan,
@@ -1572,6 +1594,16 @@ def main(cfg: DictConfig) -> int:
                     len(active_plan.trajectory) - 1,
                 )
                 target_xyz, target_rot = active_cartesian_trajectory.interpolate(elapsed)
+                # Past the trajectory duration the reference pose is clamped at the
+                # final waypoint, so the feedforward velocity must be zero. (velocity()
+                # returns the last segment's nonzero slope for a degree-1 spline, which
+                # would otherwise drive the EE past the endpoint during the hold.)
+                at_terminal_hold = elapsed >= active_cartesian_trajectory.duration
+                if at_terminal_hold:
+                    ref_lin_vel = np.zeros(3, dtype=np.float64)
+                    ref_ang_vel = np.zeros(3, dtype=np.float64)
+                else:
+                    ref_lin_vel, ref_ang_vel = active_cartesian_trajectory.velocity(elapsed)
                 visualizer.update_plan_waypoints(active_plan.trajectory, active_index)
 
                 # Optional safety clip — keep targets inside the recorded workspace.
@@ -1579,7 +1611,50 @@ def main(cfg: DictConfig) -> int:
                 hi = np.array(cfg.deploy.workspace_hi, dtype=np.float64)
                 target_xyz = np.clip(target_xyz, lo, hi)
 
-                tracker.set_cartesian_reference(Affine(pack_Rp(target_rot, target_xyz)))
+                # ----- host-side integral term on the Cartesian tracking error -----
+                # The impedance controller is a pure proportional spring, so the EE
+                # settles to target - residual/stiffness and never reaches the final
+                # waypoint. Accumulate the (planned target - measured) error during
+                # the *terminal hold* (elapsed >= duration; the reference is clamped
+                # at the final waypoint) and ramp the commanded setpoint along it
+                # until the residual is cancelled. Gating on the terminal hold avoids
+                # winding up against the deliberate velocity lag during transit.
+                # target_xyz / target_rot are left untouched so the tracking-error
+                # readout below still reports the true plan-tracking error.
+                pos_err = target_xyz - ee_pos
+                rot_err_vec = Rotation.from_matrix(target_rot @ _ee_rot.T).as_rotvec()
+                if integral_enabled and at_terminal_hold:
+                    if np.linalg.norm(pos_err) > integral_deadband_pos_m:
+                        pos_err_int = pos_err_int + pos_err * execution_dt
+                        if integral_gain_pos > 0.0:
+                            lim = integral_max_pos_m / integral_gain_pos
+                            pos_err_int = np.clip(pos_err_int, -lim, lim)
+                    if np.linalg.norm(rot_err_vec) > integral_deadband_rot_rad:
+                        rot_err_int = rot_err_int + rot_err_vec * execution_dt
+                        if integral_gain_rot > 0.0:
+                            lim = integral_max_rot_rad / integral_gain_rot
+                            rot_err_int = np.clip(rot_err_int, -lim, lim)
+                pos_corr = integral_gain_pos * pos_err_int
+                rot_corr = integral_gain_rot * rot_err_int
+                cmd_xyz = np.clip(target_xyz + pos_corr, lo, hi)
+                cmd_rot = Rotation.from_rotvec(rot_corr).as_matrix() @ target_rot
+
+                if velocity_feedforward:
+                    tracker.set_cartesian_reference(
+                        Affine(pack_Rp(cmd_rot, cmd_xyz)),
+                        Twist(ref_lin_vel, ref_ang_vel),
+                    )
+                else:
+                    tracker.set_cartesian_reference(Affine(pack_Rp(cmd_rot, cmd_xyz)))
+
+                # Live Cartesian tracking error: commanded reference (the
+                # clipped target actually sent to the impedance controller)
+                # vs. measured EE pose. Same quantities the deploy trace logs.
+                pos_err_vec = target_xyz - ee_pos
+                R_err = target_rot @ _ee_rot.T
+                cos_angle = (np.trace(R_err) - 1.0) / 2.0
+                rot_err_rad = float(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
+                visualizer.update_tracking_error(pos_err_vec, rot_err_rad)
 
                 if deploy_trace is not None:
                     deploy_trace.record_error(

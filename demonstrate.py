@@ -13,7 +13,15 @@ import time
 
 import hydra
 import numpy as np
-from franky import JointMotion, JointState, PilotButton, RobotWebSession
+from franky import (
+    Affine,
+    JointMotion,
+    JointState,
+    ManipulabilityTask,
+    PilotButton,
+    PostureTask,
+    RobotWebSession,
+)
 from omegaconf import DictConfig
 
 from clear_franka.franka import (
@@ -124,6 +132,28 @@ def run_demonstrate(cfg: DictConfig):
     button_timeout = float(dc.get("button_timeout", period))
     button_debounce_s = float(dc.button_debounce_s)
 
+    # Controller for the demonstration session:
+    #   "joint"     — backdrivable joint-impedance float (the default; no Cartesian
+    #                 controller, joints freely positioned by the operator).
+    #   "cartesian" — kinesthetic guiding with the Cartesian impedance tracker live,
+    #                 streaming reference = measured pose so the EE floats while the
+    #                 nullspace PostureTask/ManipulabilityTask/joint-limit terms shape
+    #                 the redundant DOF exactly as they will at replay/deploy. Main-task
+    #                 stiffness is kept low so the arm is easy to hand-guide (damping
+    #                 scales with sqrt(stiffness)); nullspace stiffness is kept at the
+    #                 replay value so redundancy resolves faithfully.
+    controller = str(dc.get("controller", "joint")).lower()
+    cart_trans_stiffness = float(dc.get("cartesian_translational_stiffness", 60.0))
+    cart_rot_stiffness = float(dc.get("cartesian_rotational_stiffness", 4.0))
+    cart_nullspace_stiffness = float(dc.get("cartesian_nullspace_stiffness", 2.0))
+    nullspace_target_cfg = dc.get("cartesian_nullspace_target", tc.get("nullspace_target", None))
+    if nullspace_target_cfg is None:
+        cart_nullspace_target = reset_joint_config
+    elif str(nullspace_target_cfg).lower() == "none":
+        cart_nullspace_target = None
+    else:
+        cart_nullspace_target = np.asarray(nullspace_target_cfg, dtype=float)
+
     desk_cfg = cfg.get("desk", {})
     hostname, username, password = desk_credentials(
         hostname=str(desk_cfg.get("hostname", cfg.robot.ip)),
@@ -145,8 +175,15 @@ def run_demonstrate(cfg: DictConfig):
     recorder = TrajectoryRecorder(
         save_dir=cfg.data_dir,
         metadata={
-            "control_mode": "joint_impedance_demonstration",
+            "control_mode": (
+                "cartesian_impedance_kinesthetic"
+                if controller == "cartesian"
+                else "joint_impedance_demonstration"
+            ),
             "joint_stiffness": json.dumps([float(v) for v in joint_stiffness]),
+            "cartesian_translational_stiffness": float(cart_trans_stiffness),
+            "cartesian_rotational_stiffness": float(cart_rot_stiffness),
+            "cartesian_nullspace_stiffness": float(cart_nullspace_stiffness),
             "gripper_enabled": bool(gc.get("enabled", False)),
             **extrinsics_metadata,
         },
@@ -207,8 +244,16 @@ def run_demonstrate(cfg: DictConfig):
             print(f"  [viser] {pointcloud_source} ZED point cloud enabled.")
 
 
-    print("Joint impedance demonstration ready.")
-    print("  Physically guide the arm to demonstrate.")
+    if controller == "cartesian":
+        print("Cartesian impedance (kinesthetic) demonstration ready.")
+        print(
+            f"  Hand-guide the arm to demonstrate "
+            f"(trans={cart_trans_stiffness:.0f} rot={cart_rot_stiffness:.0f} "
+            f"nullspace={cart_nullspace_stiffness:.0f}; nullspace faithful, main-task light)."
+        )
+    else:
+        print("Joint impedance demonstration ready.")
+        print("  Physically guide the arm to demonstrate.")
     print("  Press CHECK to toggle the gripper.")
     print("  Press CIRCLE to start/stop recording.")
     print("  Press CROSS to reset to the start config when not recording.")
@@ -254,16 +299,68 @@ def run_demonstrate(cfg: DictConfig):
                 print("  Reset complete.")
                 suppress_cross_until_release = True
 
-            session = robot.start_joint_impedance_session(
-                hold_current_joint,
-                period=period,
-                stiffness=[float(v) for v in joint_stiffness],
-                lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
-                upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
-                **joint_friction_kwargs(dc),
-            )
+            # Put the robot in a motion-ready mode before (re)starting the impedance
+            # session. A stale mode left by a previous program (libfranka reports it
+            # as "Other") makes the async move get rejected; the motion then never
+            # runs, no state callback fires, and the first get_last_teleop_state()
+            # raises "No motion callback data has been received yet". teleop does the
+            # same recover+drain at the top of its loop.
+            robot.recover_from_errors()
+            try:
+                robot.join_motion(2)
+            except Exception:
+                pass
+
+            if controller == "cartesian":
+                # Kinesthetic guiding with the Cartesian tracker live. The EE floats
+                # because we stream reference = measured pose every tick (below), so
+                # the only resistance is the velocity damping (~sqrt(low stiffness));
+                # the nullspace PostureTask + ManipulabilityTask + joint limits stay
+                # at replay-faithful values so the redundancy resolves the same way it
+                # will when the recorded demo is replayed at higher main-task stiffness.
+                nullspace_tasks = [ManipulabilityTask(gain=5.0, max_torque=1.0)]
+                if cart_nullspace_target is not None:
+                    nullspace_tasks.insert(
+                        0, PostureTask(cart_nullspace_target, stiffness=cart_nullspace_stiffness)
+                    )
+                session = robot.start_cartesian_impedance_session(
+                    period=period,
+                    translational_stiffness=cart_trans_stiffness,
+                    rotational_stiffness=cart_rot_stiffness,
+                    nullspace_tasks=nullspace_tasks,
+                    lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
+                    upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
+                )
+            else:
+                session = robot.start_joint_impedance_session(
+                    hold_current_joint,
+                    period=period,
+                    stiffness=[float(v) for v in joint_stiffness],
+                    lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
+                    upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
+                    **joint_friction_kwargs(dc),
+                )
             session_stopped = False
             try:
+                # Wait for the first motion-callback state so the loop's initial
+                # get_last_teleop_state() doesn't race the controller spinning up.
+                # If the move was rejected (robot not in execution mode / brakes
+                # closed), this surfaces a clear timeout instead of a stale-mode
+                # error from the cleanup path.
+                _state_deadline = time.monotonic() + 3.0
+                while True:
+                    try:
+                        robot.get_last_teleop_state()
+                        break
+                    except RuntimeError:
+                        if time.monotonic() > _state_deadline:
+                            raise RuntimeError(
+                                "No state from the impedance controller within 3s — the "
+                                "move was likely rejected. Check the robot is in execution "
+                                "mode with brakes open (Desk) and no other program holds it."
+                            )
+                        time.sleep(0.01)
+
                 while True:
                     loop_rate.start_tick()
                     for event in web.poll_buttons(timeout=button_timeout):
@@ -323,6 +420,15 @@ def run_demonstrate(cfg: DictConfig):
                     joint_vel = np.asarray(teleop_state["dq"], dtype=float)
                     measured_pose = np.asarray(teleop_state["O_T_EE"], dtype=float).reshape(4, 4)
                     robot_abs_time = float(teleop_state["abs_time"])
+
+                    if controller == "cartesian":
+                        # Reference = measured pose → zero stiffness error → EE floats
+                        # for hand-guiding; nullspace tasks keep shaping the joints.
+                        try:
+                            session.set_cartesian_reference(Affine(measured_pose))
+                        except Exception as exc:
+                            loop_rate.newline()
+                            print(f"  [tracker] set_cartesian_reference failed: {exc}")
 
                     if visualizer is not None:
                         visualizer.update(joint_pos)

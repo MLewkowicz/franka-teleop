@@ -150,11 +150,16 @@ def preprocess_episode_arrays(
     smooth_max_joint_jerk: np.ndarray | list[float] | None = None,
     smooth_dt: float = 0.001,
     gripper_dwell_s: float = 0.0,
+    collect_ee_stages: bool = False,
 ) -> dict[str, np.ndarray] | None:
     """Apply the preprocessing pipeline to an already-loaded episode.
 
     Returns processed arrays on success, or None for the same handled failures
     as preprocess_episode().
+
+    When ``collect_ee_stages`` is True, the result also contains an ``ee_stages``
+    entry (a dict, not an array) mapping "original" / "retimed" / "smoothed" to
+    (N, 3) base-frame EE position paths, for visualization of the pipeline.
     """
     if raw["joint_pos"].shape[0] < 2:
         logger.error("preprocess: episode too short (%d samples)", raw["joint_pos"].shape[0])
@@ -242,6 +247,11 @@ def preprocess_episode_arrays(
 
         # Capture retimed timestamps before Ruckig overwrites current.waypts_time.
         sparse_toppra_times = np.asarray(current.waypts_time, dtype=np.float64)
+
+    # Capture the retimed (pre-smooth) joints for the EE-stage overlay.
+    retimed_joint_for_viz = (
+        np.asarray(current.waypts, dtype=np.float64) if collect_ee_stages else None
+    )
 
     # --- 3. smooth (Ruckig) -----------------------------------------------
     # Operates on the (possibly retimed) waypoints. Ruckig's bounded-jerk
@@ -332,6 +342,25 @@ def preprocess_episode_arrays(
         "joint_vel": joint_vel_out,
     }
     out_arrays.update(resampled)
+
+    if collect_ee_stages:
+        # Base-frame EE position path at each pipeline stage, for visualization.
+        # "retimed" is FK of the TOPPRA-retimed joints (== trimmed if retime is
+        # disabled); "smoothed" is the executed path (FK of the Ruckig output).
+        if raw.get("ee_pos") is not None:
+            original_ee = np.asarray(raw["ee_pos"], dtype=np.float64)[:, :3]
+        else:
+            original_ee = fk_ee_poses(np.asarray(raw["joint_pos"], dtype=np.float64))[0]
+        retimed_ee = fk_ee_poses(retimed_joint_for_viz)[0]
+        smoothed_ee = out_arrays.get("ee_pos")
+        if smoothed_ee is None:
+            smoothed_ee = fk_ee_poses(joint_pos_out)[0]
+        out_arrays["ee_stages"] = {
+            "original": original_ee,
+            "retimed": np.asarray(retimed_ee, dtype=np.float64),
+            "smoothed": np.asarray(smoothed_ee, dtype=np.float64)[:, :3],
+        }
+
     return out_arrays
 
 
