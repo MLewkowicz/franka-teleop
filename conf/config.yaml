@@ -122,6 +122,7 @@ deploy:
   langsteer_path: "/home/clear/LangSteer"
   control_hz: 10                                  # Nominal DiffuserActor waypoint rate used to interpret action horizon timing.
   execution_hz: 100                              # Cartesian reference streaming rate; samples the retimed interpolation.
+  record_trajectory: false                       # If true, log the executed session to data_dir/episode_*.h5 (same format as mode=replay), replayable via main.py mode=replay.
   max_linear_vel_m_s: 0.03                      # Open-loop retime speed limit for Cartesian translation.
   max_angular_vel_rad_s: 0.25                   # Open-loop retime speed limit for Cartesian orientation.
   # Workspace safety box (base frame, metres). Cartesian targets are clipped here.
@@ -172,7 +173,7 @@ deploy:
   joint_limit_buffer_rad: 0.05            # pad lower/upper limits inward by this
   
   steering:
-    enabled: true                 # flip to true (or override on CLI) to steer
+    enabled: false                 # flip to true (or override on CLI) to steer
     # Absolute target orientation, Euler XYZ radians, SAME convention as
     # obs.ee_pose[3:6] (ee_rot_to_euler_xyz). Inverted-place value from the
     # mode-B demos; refine by jogging to the inverted pose and reading ee euler.
@@ -204,7 +205,7 @@ deploy:
     # taken from the policy yaml automatically. Visualize/tune with
     # `uv run python visualize_value_maps.py`.
     position:
-      enabled: true             # flip to true (or override on CLI) to steer position
+      enabled: false             # flip to true (or override on CLI) to steer position
       boxes_path: "/home/clear/franka-teleop/data/workspace_boxes.json"
       # Raw VoxPoser delta = coeff·∇cost in model space. dps_coeff=1/√ᾱ blows
       # up at high t; cost gradients are ~5-10 per model unit; accumulated over

@@ -850,6 +850,7 @@ def main(cfg: DictConfig) -> int:
     from clear_franka.diffuser_actor_io import euler_xyz_to_matrix
     from clear_franka.geometry import pack_Rp
     from clear_franka.robotiq_net_proxy import RobotiqGripperProxy
+    from clear_franka.recorder import TrajectoryRecorder
     from clear_franka.visualization import CortadoViserVisualizer
     from threed_mouse import ThreeDMouse
     from threed_mouse.geometry import so3_exp
@@ -1004,6 +1005,25 @@ def main(cfg: DictConfig) -> int:
     stop_event = threading.Event()
     stage_state: dict = {"idx": stage_idx, "epoch": 0, "gripper_cmd": 1.0}
 
+    # ----- optional trajectory recorder -----
+    # Logs the executed session to data_dir/episode_*.h5 in the exact format the
+    # teleop/replay tools write, so a deploy run can be re-run with
+    #   uv run python main.py mode=replay replay.episode=<file>
+    # Cameras are deliberately NOT recorded: the inference worker grabs ZED
+    # frames synchronously (no .run()), which would conflict with the recorder's
+    # background camera capture. The joint trajectory is all replay needs.
+    recorder = None
+    if bool(cfg.deploy.get("record_trajectory", False)):
+        recorder = TrajectoryRecorder(
+            save_dir=cfg.data_dir,
+            cameras={},
+            metadata={
+                "control_mode": "diffuser_actor_deploy",
+                "policy_config": str(cfg.deploy.policy_config),
+                "gripper_enabled": gripper is not None,
+            },
+        )
+
     with contextlib.ExitStack() as stack:
         stack.enter_context(cam_hand)
         stack.enter_context(cam_tp)
@@ -1073,6 +1093,13 @@ def main(cfg: DictConfig) -> int:
         ))
         robot.start_state_stream(timeout_ms=250)
         stack.callback(robot.stop_state_stream)
+        if recorder is not None:
+            # __exit__ calls close()→stop()→_save_episode, so the h5 is written
+            # on any exit path (Ctrl-C, completion, fault).
+            stack.enter_context(recorder)
+            recorder.start()
+            logger.info("Recording trajectory to %s/episode_%s.h5",
+                        cfg.data_dir, recorder._start_wall)
         inference_thread = _start_inference_worker(
             policy=policy,
             policy_lock=policy_lock,
@@ -1189,6 +1216,29 @@ def main(cfg: DictConfig) -> int:
             visualizer.update_gripper_width(width, max_width_m=cfg.gripper.max_width_m)
             logger.info(f"[gripper] {'CLOSE' if is_open else 'OPEN'}")
 
+        def _record_tick(enabled: bool, buttons: int = 0) -> None:
+            """Log one measured timestep. Mirrors replay.py / teleop.py so the
+            resulting episode_*.h5 is byte-format compatible with mode=replay.
+            `gripper_open` is the last commanded state (stage_state)."""
+            if recorder is None:
+                return
+            teleop_state = robot.get_last_teleop_state()
+            if teleop_state is None:
+                return
+            measured_pose = np.asarray(teleop_state["O_T_EE"], dtype=float).reshape(4, 4)
+            recorder.step(
+                ee_pos=measured_pose[:3, 3],
+                ee_rot=measured_pose[:3, :3],
+                cmd_linear_vel=np.zeros(3),
+                cmd_angular_vel=np.zeros(3),
+                buttons=buttons,
+                enabled=enabled,
+                joint_pos=np.asarray(teleop_state["q"], dtype=float),
+                joint_vel=np.asarray(teleop_state["dq"], dtype=float),
+                gripper_open=(stage_state["gripper_cmd"] if gripper is not None else None),
+                robot_abs_time=float(teleop_state["abs_time"]),
+            )
+
         while not stop_event.is_set():
             rate.start_tick()
             # ---------- button polling ----------
@@ -1287,6 +1337,7 @@ def main(cfg: DictConfig) -> int:
                         )
                     except Exception as exc:
                         logger.warning(f"[teleop] set_cartesian_reference failed: {exc}")
+                _record_tick(enabled=False)
                 rate.finish_tick()
                 next_tick += execution_dt
                 sleep_time = next_tick - time.monotonic()
@@ -1447,6 +1498,7 @@ def main(cfg: DictConfig) -> int:
                 active_cartesian_trajectory = None
                 active_plan_index_offset = 0
 
+            _record_tick(enabled=active_plan is not None)
             rate.finish_tick()
             next_tick += execution_dt
             sleep_time = next_tick - time.monotonic()

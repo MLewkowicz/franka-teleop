@@ -45,6 +45,9 @@ class TrajectoryRecorder:
         self._count = 0
         self._start_time = 0.0
         self._start_wall = ""
+        # Set by `_save_episode` so callers (e.g. demonstrate.py's auto-preprocess
+        # hook) can find the just-saved h5 without reconstructing its path.
+        self.last_saved_path: Path | None = None
         self._alloc_buffers()
 
     def _alloc_buffers(self):
@@ -90,6 +93,7 @@ class TrajectoryRecorder:
         self._start_time = time.monotonic()
         self._start_wall = time.strftime("%Y%m%d_%H%M%S")
         self._recording = True
+        self.last_saved_path = None
 
         self._save_dir.mkdir(parents=True, exist_ok=True)
         video_ext = "svo2" if self._record_svo else "hdf5"
@@ -156,6 +160,7 @@ class TrajectoryRecorder:
         self._save_dir.mkdir(parents=True, exist_ok=True)
         n = self._count
         fname = self._save_dir / f"episode_{self._start_wall}.h5"
+        self.last_saved_path = fname
         video_ext = "svo2" if self._record_svo else "hdf5"
 
         with h5py.File(fname, "w") as f:
