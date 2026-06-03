@@ -161,7 +161,7 @@ deploy:
   # no integrator, so the EE settles to (target - residual_wrench/stiffness) and
   # never lands on the commanded waypoint. We close that gap host-side without
   # raising stiffness (which oscillates at the current 525/100 gains).
-  velocity_feedforward: false                    # feed the retimed trajectory velocity as target_twist; cancels the velocity-lag while the reference is moving.
+  velocity_feedforward: true                     # feed the retimed trajectory velocity as target_twist; cancels the velocity-lag while the reference is moving.
   integral_enabled: false                        # ramp the commanded setpoint along the accumulated tracking error during the terminal hold so the EE actually reaches the final waypoint.
   integral_gain_pos: 0.5                         # [1/s] translational integral gain. Higher = faster convergence, more overshoot risk.
   integral_gain_rot: 0.5                         # [1/s] rotational integral gain.

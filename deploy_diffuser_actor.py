@@ -1086,17 +1086,19 @@ def main(cfg: DictConfig) -> int:
         # ----- mode transitions -----
         def _enter_inference(prim: int, label: str) -> None:
             nonlocal mode, stage_idx, active_cartesian_trajectory, infer_sequence
-            if mode == INFERENCE:
-                logger.info("[INFERENCE] already active — ignoring tap")
-                return
+            transitioning = mode == INFERENCE and stage_idx != prim
             mode = INFERENCE
-            active_cartesian_trajectory = None
+            # Don't clear active_cartesian_trajectory here when transitioning
+            # mid-execution — the inner loops detect the epoch bump and break
+            # cleanly. Only clear it on a fresh entry from TELEOP.
+            if not transitioning:
+                active_cartesian_trajectory = None
             visualizer.clear_plan_waypoints()
             policy.set_primitive(prim)
             policy.set_object(0)
             policy.reset()
             stage_state["idx"] = prim
-            stage_state["epoch"] += 1
+            stage_state["epoch"] += 1  # invalidates any in-flight plan
             stage_idx = prim
             infer_sequence = 0
             logger.info(f"[INFERENCE] {label} (primitive {prim}) from current pose")
@@ -1376,16 +1378,38 @@ def main(cfg: DictConfig) -> int:
 
             # 4. Execute plan: stream interpolated Cartesian references at execution_hz.
             plan_started_at = time.monotonic()
+            plan_epoch = plan.epoch
+            # Safety timeout: if the plan takes more than 2× its trajectory
+            # duration (e.g. due to a stalled or very long retime), abort and
+            # replan. Grace factor accounts for slow segments at the start.
+            plan_timeout_s = active_cartesian_trajectory.duration * 2.0 + 2.0
             next_tick = plan_started_at
             plan_active_index = 0
+            stage_transitioned = False
 
             while not stop_event.is_set():
                 _poll_buttons()
                 if mode == TELEOP:
                     break
+                if stage_state["epoch"] != plan_epoch:
+                    # User tapped to switch stage (e.g. grasp → place) mid-execution.
+                    # Break cleanly; outer loop will start the next inference cycle
+                    # with the new stage already set in stage_state.
+                    stage_transitioned = True
+                    logger.info(
+                        "  plan %d aborted — stage transition to primitive %d",
+                        plan.sequence, stage_state["idx"],
+                    )
+                    break
 
                 elapsed = time.monotonic() - plan_started_at
                 if elapsed >= active_cartesian_trajectory.duration:
+                    break
+                if elapsed > plan_timeout_s:
+                    logger.warning(
+                        "  plan %d timed out after %.1fs (trajectory duration=%.1fs)",
+                        plan.sequence, elapsed, active_cartesian_trajectory.duration,
+                    )
                     break
 
                 target_xyz, target_rot = active_cartesian_trajectory.interpolate(elapsed)
@@ -1448,6 +1472,12 @@ def main(cfg: DictConfig) -> int:
                 _record_tick(enabled=False)
                 rate.finish_tick()
                 continue
+            if stage_transitioned:
+                # Stage switched mid-execution. Skip the hold and go straight to
+                # the next inference cycle; stage_state already has the new stage.
+                infer_sequence += 1
+                rate.finish_tick()
+                continue
 
             logger.info(
                 "  plan %d complete (idx=%d/%d); holding %.2fs",
@@ -1466,6 +1496,9 @@ def main(cfg: DictConfig) -> int:
             while not stop_event.is_set() and time.monotonic() < hold_end:
                 _poll_buttons()
                 if mode == TELEOP:
+                    break
+                if stage_state["epoch"] != plan_epoch:
+                    stage_transitioned = True
                     break
                 tracker.set_cartesian_reference(Affine(pack_Rp(final_rot, final_xyz)))
                 _record_tick(enabled=True)
