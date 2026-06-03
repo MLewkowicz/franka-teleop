@@ -174,7 +174,13 @@ deploy:
   workspace_lo: [0.20, -0.45, 0.00]
   workspace_hi: [0.95,  0.40, 0.90]
   translational_stiffness: 1200.0
-  rotational_stiffness: 40.0
+  # Bumped 40 → 60. The wrist settles ~15° short of the steered target and giving
+  # it more time (catchup) doesn't help → it's a STEADY-STATE impedance offset
+  # (franky's Cartesian spring has no integrator: settles at target −
+  # residual_wrench/stiffness), not a transient. Higher rotational stiffness
+  # directly shrinks that offset (~33% less at 60). If it oscillates, back off;
+  # the fuller fix is the integral feedforward (integral_enabled, feat branch).
+  rotational_stiffness: 60.0
   # Null-space biasing for the impedance controller. When stiffness > 0 the
   # controller resolves the 7-DOF→6-DOF redundancy by biasing the joint config
   # toward `nullspace_target` (7-vector). Useful for poses near the rack where
@@ -220,7 +226,16 @@ deploy:
     # obs.ee_pose[3:6] (ee_rot_to_euler_xyz). Inverted-place value from the
     # mode-B demos; refine by jogging to the inverted pose and reading ee euler.
     # target_euler: [1.79, 1.31, -1.73]
-    target_euler: [-1.35, 1.31, 1.41]
+    # target_euler: [-1.35, 1.31, 1.41]   # equivalent grasp, wrist rolls the OTHER way
+    # The rotation guidance is a LINEAR pull in 6D rot space toward this single
+    # target (no SLERP/direction knob), so to reverse the wrist's approach
+    # direction we feed an EQUIVALENT target: R_target · Rz(180°) about the
+    # gripper's local approach axis — same physical 2-finger grasp (just swaps
+    # fingers), but reached by rolling the wrist the opposite way. Only yaw
+    # (euler[2]) flips (+1.41 → −1.73); roll/pitch unchanged. If the wrist now
+    # flips about the wrong axis, try the Rx/Ry-180° variants:
+    #   Rx(180°): [1.792, -1.31, -1.41]   Ry(180°): [1.792, -1.31, 1.732]
+    target_euler: [-1.35, 1.31, -1.73]
     # NOTE — TargetRotationSteering does NOT do per-horizon SLERP; it pulls
     # every waypoint toward the same absolute target. To make rotation gradual
     # (close to LangSteer's voxposer.yaml SLERP behavior with rot_horizon_alpha_max
@@ -279,8 +294,14 @@ deploy:
       # near the target.
       distance:
         enabled: true
-        full: 0.4                  # >= this distance (m) -> full guidance
-        near: 0.1                  # <= this distance (m) -> `floor` (in the basin)
+        # Tightened 0.4/0.1 → 0.15/0.05. The ramp is on ISOTROPIC |ee-basin|, so
+        # once x and y converge the remaining (large) z-error is most of the
+        # distance — but the old 0.4→0.1 ramp had already faded guidance to ~20%
+        # by d≈0.16m, starving the z pull right when z is the only axis still far
+        # (EE stalled at z≈0.43 vs basin 0.55). Holding full guidance until 0.15m
+        # keeps the upward pull alive through the climb.
+        full: 0.15                 # >= this distance (m) -> full guidance
+        near: 0.05                 # <= this distance (m) -> `floor` (in the basin)
         floor: 0.0                  # keep half-guidance even at the basin
       # Basin latch: once the MEASURED EE first comes within this radius (m) of
       # the basin, the position branch turns OFF for the rest of the stage and
@@ -290,7 +311,13 @@ deploy:
       # out the pull re-engages and the EE oscillates in/out of the basin while
       # the policy aligns with the rack. The latch hands final alignment to the
       # policy once we've arrived. Set 0 to disable (pure DistanceScaler).
-      basin_latch_radius_m: 0.10
+      # Shrunk 0.10 → 0.05: at 0.10 the latch handed off to the policy while the
+      # EE was still ~10cm below the basin in z (it fires as soon as the 3D
+      # distance drops under the radius, which x/y convergence alone achieves).
+      # 0.05 keeps the position pull active until the EE is genuinely near the
+      # basin so z can finish climbing. The latch is one-way (never re-engages),
+      # so a smaller radius does NOT reintroduce in/out oscillation.
+      basin_latch_radius_m: 0.05
       start_guidance_timestep: 10000  # apply for t <= this; lower to focus low-t
       avoidance_weight: 420         # strength of the front-face wall vs the rack affordance
       # Avoidance is built as a *wall* at the front (-x) face of each obstacle
