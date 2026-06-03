@@ -162,19 +162,31 @@ class CartesianTrajectory:
         max_linear_vel: float,
         max_angular_vel: float,
         min_segment_dt: float = 0.001,
+        max_linear_accel: float | None = None,
+        max_angular_accel: float | None = None,
     ) -> "CartesianTrajectory":
-        """Return the same Cartesian waypoints with velocity-limited timing.
+        """Return the same Cartesian waypoints with velocity (and optionally
+        acceleration) limited timing.
 
-        Each segment duration is chosen so the straight-line translation speed
-        and geodesic SO3 angular speed stay below the requested limits:
-
+        Without acceleration limits, each segment duration is:
             dt_i = max(||dp_i|| / max_linear_vel,
                        angle(R_i^-1 R_{i+1}) / max_angular_vel,
                        min_segment_dt)
 
-        This is deliberately simpler than TOPPRA/Ruckig. It does not change the
-        path, optimize time, or enforce acceleration/jerk; it just prevents
-        large predicted jumps from being executed in one control tick.
+        When max_linear_accel / max_angular_accel are provided, a
+        forward-backward pass enforces a trapezoidal speed profile so the
+        reference velocity never changes faster than the robot can follow.
+        The trajectory starts and ends at zero speed and ramps through
+        waypoints smoothly, eliminating the instantaneous velocity jumps at
+        waypoint boundaries that cause inertial tracking transients.
+
+        Segment timing derivation (constant acceleration assumption):
+            For boundary speeds v_a → v_b over distance d:
+                t = 2·d / (v_a + v_b)
+            Forward bound on v[i]:
+                v[i] ≤ sqrt(v[i-1]² + 2·a_max·dist[i-1])
+            Backward bound (must decelerate to final):
+                v[i] ≤ sqrt(v[i+1]² + 2·a_max·dist[i])
         """
         if max_linear_vel <= 0:
             raise ValueError("max_linear_vel must be positive.")
@@ -189,11 +201,56 @@ class CartesianTrajectory:
         relative_rot = self.rotations[:-1].inv() * self.rotations[1:]
         angular_dist = relative_rot.magnitude()
 
-        segment_dt = np.maximum.reduce([
-            linear_dist / float(max_linear_vel),
-            angular_dist / float(max_angular_vel),
-            np.full(self.num_waypts - 1, float(min_segment_dt), dtype=np.float64),
-        ])
+        N = self.num_waypts
+        M = N - 1
+
+        if max_linear_accel is not None or max_angular_accel is not None:
+            # Forward-backward pass to compute boundary speeds subject to both
+            # velocity and acceleration limits, then derive segment times.
+            def _accel_limited_times(dist, v_max, a_max):
+                """Trapezoidal speed profile for a sequence of segments."""
+                # Forward pass: max achievable speed at each waypoint boundary.
+                v = np.zeros(N)
+                for i in range(M):
+                    if dist[i] < 1e-9:
+                        v[i + 1] = v[i]
+                    else:
+                        v[i + 1] = min(
+                            v_max,
+                            float(np.sqrt(max(0.0, v[i] ** 2 + 2.0 * a_max * dist[i]))),
+                        )
+                # Backward pass: must decelerate to zero at the end.
+                v[N - 1] = 0.0
+                for i in range(M - 1, -1, -1):
+                    if dist[i] < 1e-9:
+                        v[i] = min(v[i], v[i + 1])
+                    else:
+                        v[i] = min(
+                            v[i],
+                            float(np.sqrt(max(0.0, v[i + 1] ** 2 + 2.0 * a_max * dist[i]))),
+                        )
+                # Segment time: t = 2·d / (v_start + v_end).
+                v_sum = v[:-1] + v[1:]
+                dt = np.where(
+                    v_sum > 1e-10,
+                    2.0 * dist / v_sum,
+                    np.full(M, min_segment_dt),
+                )
+                return np.maximum(dt, min_segment_dt)
+
+            lin_a = float(max_linear_accel) if max_linear_accel is not None else 1e9
+            ang_a = float(max_angular_accel) if max_angular_accel is not None else 1e9
+
+            dt_lin = _accel_limited_times(linear_dist, float(max_linear_vel), lin_a)
+            dt_ang = _accel_limited_times(angular_dist, float(max_angular_vel), ang_a)
+            segment_dt = np.maximum(dt_lin, dt_ang)
+        else:
+            segment_dt = np.maximum.reduce([
+                linear_dist / float(max_linear_vel),
+                angular_dist / float(max_angular_vel),
+                np.full(M, float(min_segment_dt), dtype=np.float64),
+            ])
+
         new_times = np.concatenate([[0.0], np.cumsum(segment_dt)])
         new_times += self.waypts_time[0]
 

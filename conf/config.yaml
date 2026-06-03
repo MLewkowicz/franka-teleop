@@ -162,6 +162,14 @@ deploy:
   # never lands on the commanded waypoint. We close that gap host-side without
   # raising stiffness (which oscillates at the current 525/100 gains).
   velocity_feedforward: true                     # feed the retimed trajectory velocity as target_twist; cancels the velocity-lag while the reference is moving.
+  # Acceleration limits for the reference trajectory retime. When set, a
+  # forward-backward pass enforces a trapezoidal speed profile so the reference
+  # never changes velocity faster than the robot can follow, eliminating
+  # inertial tracking transients at waypoint boundaries. Omit (null) to use
+  # velocity-only retime (legacy). Start conservative; 0.5 m/s² is a good
+  # first try at max_linear_vel_m_s=0.03 (0→max in ~0.06s, 1-2 waypoints).
+  max_linear_accel_m_s2: null
+  max_angular_accel_rad_s2: null
   integral_enabled: false                        # ramp the commanded setpoint along the accumulated tracking error during the terminal hold so the EE actually reaches the final waypoint.
   integral_gain_pos: 0.5                         # [1/s] translational integral gain. Higher = faster convergence, more overshoot risk.
   integral_gain_rot: 0.5                         # [1/s] rotational integral gain.

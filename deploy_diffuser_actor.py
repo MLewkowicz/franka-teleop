@@ -383,6 +383,8 @@ def _make_cartesian_trajectory_for_plan(
     max_linear_vel: float,
     max_angular_vel: float,
     min_segment_dt: float,
+    max_linear_accel: float | None = None,
+    max_angular_accel: float | None = None,
     current_ee_pos: np.ndarray | None = None,
     current_ee_euler: np.ndarray | None = None,
 ):
@@ -419,6 +421,8 @@ def _make_cartesian_trajectory_for_plan(
         max_linear_vel=max_linear_vel,
         max_angular_vel=max_angular_vel,
         min_segment_dt=min_segment_dt,
+        max_linear_accel=max_linear_accel,
+        max_angular_accel=max_angular_accel,
     )
 
 
@@ -1068,6 +1072,10 @@ def main(cfg: DictConfig) -> int:
         viz_dt = 1.0 / 5.0
         plan_max_linear_vel_m_s = float(cfg.deploy.get("max_linear_vel_m_s", 0.03))
         plan_max_angular_vel_rad_s = float(cfg.deploy.get("max_angular_vel_rad_s", 0.25))
+        _lin_accel = cfg.deploy.get("max_linear_accel_m_s2", None)
+        _ang_accel = cfg.deploy.get("max_angular_accel_rad_s2", None)
+        plan_max_linear_accel = float(_lin_accel) if _lin_accel is not None else None
+        plan_max_angular_accel = float(_ang_accel) if _ang_accel is not None else None
         velocity_feedforward = bool(cfg.deploy.get("velocity_feedforward", False))
         outlier_filter_enabled = bool(
             cfg.deploy.get("outlier_filter", {}).get("enabled", True)
@@ -1364,6 +1372,8 @@ def main(cfg: DictConfig) -> int:
                 max_linear_vel=plan_max_linear_vel_m_s,
                 max_angular_vel=plan_max_angular_vel_rad_s,
                 min_segment_dt=execution_dt,
+                max_linear_accel=plan_max_linear_accel,
+                max_angular_accel=plan_max_angular_accel,
                 current_ee_pos=ee_pos,
                 current_ee_euler=ee_euler,
             )
