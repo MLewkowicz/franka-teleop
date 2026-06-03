@@ -235,7 +235,7 @@ def preprocess_episode_arrays(
         else:
             sparse = trimmed_traj
 
-        # Capture source times (in the trimmed timeline) before TOPPRA retimes.
+        # Capture source times before TOPPRA retimes.
         # sparse_source_times[i] ↔ sparse_toppra_times[i]: same path index.
         sparse_source_times = np.asarray(sparse.waypts_time, dtype=np.float64)
 
@@ -280,10 +280,6 @@ def preprocess_episode_arrays(
 
     target_times = times_out
     if sparse_source_times is not None and sparse_toppra_times is not None:
-        # Map each dense output time to its source time in the trimmed trajectory.
-        # The (sparse_toppra_times → sparse_source_times) mapping is monotone, so
-        # np.interp gives an exact, principled alignment without nearest-neighbour
-        # joint matching. For RDP: source times are exact members of times_trim.
         target_times = np.interp(times_out, sparse_toppra_times, sparse_source_times)
         target_times = np.clip(target_times, times_trim[0], times_trim[-1])
 
@@ -317,6 +313,41 @@ def preprocess_episode_arrays(
         if "ee_rot" in sliced:
             resampled["ee_rot"] = fk_rot
         logger.info("preprocess: recomputed ee_pos/ee_rot via FK (%d frames)", joint_pos_out.shape[0])
+
+    # --- 5b. snap gripper events to the arm's settled position --------------
+    # The time-based source-time map places each gripper event at the output
+    # time corresponding to the source time — but Ruckig lags the TOPPRA
+    # reference, so the arm may not yet have arrived at the target position
+    # when that time index is reached. Scan forward from each event to the
+    # frame where the arm is closest to the source joint position, and push
+    # the gripper transition there.
+    if "gripper_open" in resampled:
+        gripper_arr = resampled["gripper_open"].copy()
+        changes = np.where(gripper_arr[1:] != gripper_arr[:-1])[0] + 1
+        if len(changes) > 0:
+            max_scan = int(1.5 / float(smooth_dt))
+            modified = False
+            for idx in sorted(changes.tolist()):
+                t_src = float(np.clip(target_times[idx], times_trim[0], times_trim[-1]))
+                q_tgt = np.array([
+                    float(np.interp(t_src, times_trim, joint_pos_trim[:, j]))
+                    for j in range(joint_pos_trim.shape[1])
+                ])
+                end = min(idx + max_scan, len(joint_pos_out))
+                dists = np.linalg.norm(joint_pos_out[idx:end] - q_tgt, axis=1)
+                settle = idx + int(np.argmin(dists))
+                if settle > idx:
+                    pre_val = gripper_arr[idx - 1] if idx > 0 else gripper_arr[0]
+                    gripper_arr[idx:settle] = pre_val
+                    logger.info(
+                        "preprocess: gripper event snapped idx %d → %d (%.3fs → %.3fs, dist=%.4f rad)",
+                        idx, settle, times_out[idx], times_out[min(settle, len(times_out)-1)],
+                        float(dists[settle - idx]),
+                    )
+                    modified = True
+            if modified:
+                resampled = dict(resampled)
+                resampled["gripper_open"] = gripper_arr
 
     # --- 6. insert dwell at gripper state transitions ----------------------
     # TOPPRA allocates no time to stationary segments (zero geometric length),
@@ -371,35 +402,46 @@ def _insert_gripper_dwell(
     dwell_s: float,
     dt: float,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
-    """Insert hold frames at every gripper open/close transition.
+    """Insert symmetric hold frames around every gripper open/close transition.
 
-    For each index where gripper_open changes, appends `dwell_n` copies of
-    that frame immediately after the transition, shifting all subsequent
-    timestamps forward by `dwell_n * dt`.
+    For each index where gripper_open changes, inserts `half_n` frames holding
+    the pre-change state immediately before the transition and `half_n` frames
+    holding the post-change state immediately after. This makes the dwell work
+    correctly in both forward and reverse playback.
     """
     gripper = resampled["gripper_open"]
     changes = np.where(gripper[1:] != gripper[:-1])[0] + 1
     if len(changes) == 0:
         return joint_pos, times, resampled
 
-    dwell_n = max(1, round(dwell_s / dt))
+    half_n = max(1, round(dwell_s / dt / 2))
     logger.info(
-        "preprocess: inserting %.2fs dwell (%d frames) at %d gripper transition(s): indices %s",
-        dwell_s, dwell_n, len(changes), changes.tolist(),
+        "preprocess: inserting %.2fs symmetric dwell (%d+%d frames) at %d gripper transition(s): indices %s",
+        dwell_s, half_n, half_n, len(changes), changes.tolist(),
     )
 
     resampled = dict(resampled)
 
-    def _insert(arr: np.ndarray, idx: int) -> np.ndarray:
-        tile = np.repeat(arr[idx : idx + 1], dwell_n, axis=0)
+    def _repeat_after(arr: np.ndarray, idx: int, n: int) -> np.ndarray:
+        tile = np.repeat(arr[idx : idx + 1], n, axis=0)
         return np.concatenate([arr[: idx + 1], tile, arr[idx + 1 :]])
 
     for idx in sorted(changes.tolist(), reverse=True):
-        t_dwell = times[idx] + np.arange(1, dwell_n + 1) * dt
-        times = np.concatenate([times[: idx + 1], t_dwell, times[idx + 1 :] + dwell_n * dt])
-        joint_pos = _insert(joint_pos, idx)
+        # Post-change: half_n frames holding the post-change state.
+        t_post = times[idx] + np.arange(1, half_n + 1) * dt
+        times = np.concatenate([times[: idx + 1], t_post, times[idx + 1 :] + half_n * dt])
+        joint_pos = _repeat_after(joint_pos, idx, half_n)
         for key in list(resampled.keys()):
-            resampled[key] = _insert(resampled[key], idx)
+            resampled[key] = _repeat_after(resampled[key], idx, half_n)
+
+        # Pre-change: half_n frames holding the pre-change state (at idx-1).
+        if idx > 0:
+            pre = idx - 1
+            t_pre = times[pre] + np.arange(1, half_n + 1) * dt
+            times = np.concatenate([times[: pre + 1], t_pre, times[pre + 1 :] + half_n * dt])
+            joint_pos = _repeat_after(joint_pos, pre, half_n)
+            for key in list(resampled.keys()):
+                resampled[key] = _repeat_after(resampled[key], pre, half_n)
 
     return joint_pos, times, resampled
 
@@ -478,9 +520,6 @@ def _resample_aligned_fields(
                     gripper_open / buttons / enabled
     """
     out: dict[str, np.ndarray] = {}
-    # Clamp target times into the source range so interpolators don't extrapolate.
-    # If Ruckig overshoots the input duration slightly, the tail samples just
-    # repeat the final source value, which is the desired "hold-at-end" behaviour.
     target_clamped = np.clip(target_times, source_times[0], source_times[-1])
 
     for name, kind in _RESAMPLE_KIND.items():

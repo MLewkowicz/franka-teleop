@@ -192,16 +192,16 @@ def play_cartesian_trajectory(
     with robot.start_cartesian_impedance_session(
         period=rc.period,
         translational_stiffness=float(
-            rc.get("translational_stiffness", cfg.teleop.translational_stiffness)
+            rc.get("translational_stiffness", cfg.replay.translational_stiffness)
         ),
         rotational_stiffness=float(
-            rc.get("rotational_stiffness", cfg.teleop.rotational_stiffness)
+            rc.get("rotational_stiffness", cfg.replay.rotational_stiffness)
         ),
         nullspace_tasks=[
             PostureTask(
                 nullspace_target,
                 stiffness=float(
-                    rc.get("nullspace_stiffness", cfg.teleop.nullspace_stiffness)
+                    rc.get("nullspace_stiffness", cfg.replay.nullspace_stiffness)
                 ),
             ),
             ManipulabilityTask(gain=5.0, max_torque=1.0),
@@ -491,6 +491,16 @@ def run_replay(cfg: DictConfig):
             print(f"  [gripper] Failed to initialize: {e}")
             gripper = None
 
+    # Optional: move to a known home config before the episode-start pre-position.
+    # (Two-step: home -> episode start -> play, so the approach is consistent
+    # regardless of where the arm was left. Set replay.home_config to a 7-vector,
+    # or null to skip and go straight to the episode's first joint config.)
+    home_cfg = rc.get("home_config", None)
+    if home_cfg is not None and str(home_cfg).lower() != "none":
+        home_q = np.asarray(home_cfg, dtype=float)
+        print(f"  Moving to replay home {np.array2string(home_q, precision=3)}...")
+        robot.move(JointMotion(JointState(home_q), relative_dynamics_factor=0.1))
+
     print(f"  Pre-positioning to start configuration...")
     robot.move(JointMotion(
         JointState(joint_pos[0]),
@@ -540,15 +550,32 @@ def run_replay(cfg: DictConfig):
             except OSError:
                 pass
 
+        # Name replay episodes after the demo being replayed:
+        #   {mode_title}_{demo_number}_{replay_number}.h5
+        # Prefer the demo's embedded mode_title/episode_index attrs (survives a
+        # file rename); fall back to the demo filename stem otherwise.
+        attrs = episode.get("attrs", {})
+        demo_mode_title = attrs.get("mode_title", attrs.get("episode_name"))
+        demo_index = attrs.get("episode_index")
+        if isinstance(demo_mode_title, bytes):
+            demo_mode_title = demo_mode_title.decode()
+        if demo_mode_title is not None and demo_index is not None:
+            replay_base_name = f"{demo_mode_title}_{int(demo_index)}"
+        else:
+            replay_base_name = episode_path.stem
+        print(f"  [recorder] Replay episodes -> {replay_base_name}_<N>.h5")
+
         from clear_franka.recorder import TrajectoryRecorder
         recorder = TrajectoryRecorder(
             save_dir=cfg.data_dir,
+            episode_name=replay_base_name,
             cameras=cameras,
             metadata={
                 "replay_episode": str(episode_path),
                 "replay_speed": float(rc.speed),
                 "replay_tracker": tracker_mode,
                 "gripper_enabled": gripper is not None,
+                "source_demo": replay_base_name,
                 **extrinsics_metadata,
             },
         )

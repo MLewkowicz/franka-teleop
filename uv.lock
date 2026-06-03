@@ -2074,7 +2074,7 @@ wheels = [
 
 [[package]]
 name = "zero-franky"
-version = "0.1.1"
+version = "0.1.2"
 source = { editable = "../zero_franky" }
 dependencies = [
     { name = "cloudpickle" },

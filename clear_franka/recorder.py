@@ -19,7 +19,7 @@ def _safe_name(name: str) -> str:
 class TrajectoryRecorder:
 
     def __init__(self, save_dir="./data", capacity=120_000, metadata=None, cameras=None,
-                 record_svo=False, svo_compression="H264"):
+                 record_svo=False, svo_compression="H264", episode_name=None):
         """
         Args:
             save_dir: Directory to save episode files.
@@ -30,6 +30,10 @@ class TrajectoryRecorder:
             record_svo: If True, cameras record native ZED SVO2 files instead of HDF5.
             svo_compression: SVO compression mode (H264, H265, LOSSLESS, etc.).
                              Only used when record_svo=True.
+            episode_name: Optional base name for saved files. When set, episodes
+                are named ``{episode_name}_{N}.h5`` where N is the next free
+                index found by scanning ``save_dir`` (per start()). When None,
+                falls back to the timestamped ``episode_{YYYYmmdd_HHMMSS}.h5``.
         """
         self._save_dir = Path(save_dir)
         self._capacity = capacity
@@ -41,6 +45,10 @@ class TrajectoryRecorder:
         self._cameras = dict(cameras)
         self._record_svo = record_svo
         self._svo_compression = svo_compression
+        self._episode_name = episode_name
+        # Resolved per-episode at start(): the filename stem and its index.
+        self._episode_base = ""
+        self._episode_index = None
         self._recording = False
         self._count = 0
         self._start_time = 0.0
@@ -86,6 +94,18 @@ class TrajectoryRecorder:
         else:
             self.start()
 
+    @staticmethod
+    def _next_episode_index(save_dir: Path, safe_name: str) -> int:
+        """Lowest free N such that ``{safe_name}_{N}.h5`` does not exist in save_dir."""
+        pattern = re.compile(rf"^{re.escape(safe_name)}_(\d+)\.h5$")
+        max_idx = -1
+        if save_dir.is_dir():
+            for entry in save_dir.iterdir():
+                m = pattern.match(entry.name)
+                if m:
+                    max_idx = max(max_idx, int(m.group(1)))
+        return max_idx + 1
+
     def start(self):
         if self._recording:
             return
@@ -96,15 +116,26 @@ class TrajectoryRecorder:
         self.last_saved_path = None
 
         self._save_dir.mkdir(parents=True, exist_ok=True)
+        # Resolve this episode's filename stem. With episode_name set, scan the
+        # save dir for the next free {episode_name}_{N} index so demos/replays
+        # get stable, human-referenceable names; otherwise use the timestamp.
+        if self._episode_name:
+            safe = _safe_name(self._episode_name)
+            self._episode_index = self._next_episode_index(self._save_dir, safe)
+            self._episode_base = f"{safe}_{self._episode_index}"
+        else:
+            self._episode_index = None
+            self._episode_base = f"episode_{self._start_wall}"
+
         video_ext = "svo2" if self._record_svo else "hdf5"
         for name, camera in self._cameras.items():
             video_path = str(
-                self._save_dir / f"episode_{self._start_wall}_{_safe_name(name)}_video.{video_ext}"
+                self._save_dir / f"{self._episode_base}_{_safe_name(name)}_video.{video_ext}"
             )
             camera.start_recording(video_path, self._start_time,
                                    svo=self._record_svo, svo_compression=self._svo_compression)
 
-        print("  [recorder] RECORDING started")
+        print(f"  [recorder] RECORDING started -> {self._episode_base}.h5")
 
     def stop(self):
         if not self._recording:
@@ -159,7 +190,7 @@ class TrajectoryRecorder:
     def _save_episode(self, camera_ts=None):
         self._save_dir.mkdir(parents=True, exist_ok=True)
         n = self._count
-        fname = self._save_dir / f"episode_{self._start_wall}.h5"
+        fname = self._save_dir / f"{self._episode_base}.h5"
         self.last_saved_path = fname
         video_ext = "svo2" if self._record_svo else "hdf5"
 
@@ -192,7 +223,7 @@ class TrajectoryRecorder:
                         continue
                     safe = _safe_name(name)
                     f.attrs[f"{safe}_camera_video_file"] = (
-                        f"episode_{self._start_wall}_{safe}_video.{video_ext}"
+                        f"{self._episode_base}_{safe}_video.{video_ext}"
                     )
                     f.attrs[f"{safe}_camera_id"] = getattr(camera, "camera_id", name)
                     serial_number = getattr(camera, "serial_number", None)
@@ -205,6 +236,9 @@ class TrajectoryRecorder:
             f.attrs["start_time"] = self._start_wall
             f.attrs["num_steps"] = n
             f.attrs["duration_s"] = float(self._buffers["timestamps"][n - 1])
+            if self._episode_name is not None:
+                f.attrs["episode_name"] = self._episode_name
+                f.attrs["episode_index"] = self._episode_index
 
     def __enter__(self):
         return self

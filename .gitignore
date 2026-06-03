@@ -3,6 +3,7 @@ data/
 __pycache__/
 *.swp
 *.pyc
+*.h5
 scripts/print_joints.py
 scripts/test_gripper.py
 tracker_error_debug.py

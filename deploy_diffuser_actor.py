@@ -248,7 +248,11 @@ def _build_policy(deploy_cfg: DictConfig):
     if bounds_cfg is not None:
         policy_loc_bounds = np.asarray(bounds_cfg, dtype=np.float64).reshape(2, 3)
 
-    return policy, bool(policy_cfg.get("relative", False)), policy_loc_bounds
+    # Optional per-policy home: the joint config the arm moves to before inference.
+    # Lives in the policy yaml so it travels with the trained policy. None if absent.
+    policy_home = policy_cfg.get("home_config", None)
+
+    return policy, bool(policy_cfg.get("relative", False)), policy_loc_bounds, policy_home
 
 
 def _build_steering(deploy_cfg: DictConfig, policy, policy_relative, policy_loc_bounds):
@@ -979,7 +983,7 @@ def main(cfg: DictConfig) -> int:
     from clear_franka.franka import DEFAULT_LOWER_JOINT_LIMITS, DEFAULT_UPPER_JOINT_LIMITS
 
     # ----- policy -----
-    policy, policy_relative, policy_loc_bounds = _build_policy(cfg.deploy)
+    policy, policy_relative, policy_loc_bounds, policy_home = _build_policy(cfg.deploy)
     if policy_loc_bounds is not None:
         logger.info(
             "Policy gripper_loc_bounds (used for unnormalize_pos): lo=%s hi=%s",
@@ -1056,7 +1060,23 @@ def main(cfg: DictConfig) -> int:
                       pub_port=cfg.zero_franky.pub_port)
     robot = Robot(cfg.robot.ip)
     robot.recover_from_errors()
-    reset_joint_config = np.asarray(cfg.teleop.reset_joint_config, dtype=float)
+    # Home config the arm moves to before inference (and the default nullspace
+    # posture). Priority: deploy.home_config (per-run override) > policy yaml
+    # home_config (tied to the trained policy) > teleop.reset_joint_config.
+    _deploy_home = cfg.deploy.get("home_config", None)
+    if _deploy_home is not None and str(_deploy_home).lower() != "none":
+        reset_joint_config = np.asarray(_deploy_home, dtype=float)
+        logger.info("Home config from deploy.home_config")
+    elif policy_home is not None:
+        reset_joint_config = np.asarray(policy_home, dtype=float)
+        logger.info("Home config from policy yaml: %s", cfg.deploy.policy_config)
+    else:
+        reset_joint_config = np.asarray(cfg.teleop.reset_joint_config, dtype=float)
+    if reset_joint_config.shape != (7,):
+        raise ValueError(
+            f"home config must have 7 joint angles, got {reset_joint_config.shape[0]}: "
+            f"{reset_joint_config.tolist()}"
+        )
     logger.info(f"Resetting to start config {reset_joint_config}")
     robot.move(JointMotion(JointState(reset_joint_config),
                             relative_dynamics_factor=0.1),
@@ -1165,7 +1185,7 @@ def main(cfg: DictConfig) -> int:
         # when not set; passing null/None disables the target entirely.
         _ns_target_cfg = cfg.deploy.get("nullspace_target", None)
         if _ns_target_cfg is None:
-            _ns_target = np.asarray(cfg.teleop.reset_joint_config, dtype=np.float64)
+            _ns_target = reset_joint_config.astype(np.float64)
         elif str(_ns_target_cfg).lower() == "none":
             _ns_target = None
         else:
@@ -1282,6 +1302,15 @@ def main(cfg: DictConfig) -> int:
         active_plan_started_at = 0.0
         consumed_sequence = -1
         waiting_for_plan = False
+        # Catchup hold countdown (cap). -1 = not holding; set to plan_catchup_ticks
+        # when a plan finishes (streamed to its final waypoint) OR is abandoned
+        # mid-stream (timeout), decremented each tick while we re-command the
+        # frozen reference. The next plan is requested once the EE converges to
+        # that reference (pos+rot within tolerance) or the counter drops below 0,
+        # whichever first. Reset to -1 on adoption. catchup_target_* = frozen ref.
+        catchup_remaining = -1
+        catchup_target_pos: np.ndarray | None = None
+        catchup_target_rot: np.ndarray | None = None
         next_tick = time.monotonic()
         last_viz_update = 0.0
         viz_dt = 1.0 / 5.0
@@ -1291,6 +1320,17 @@ def main(cfg: DictConfig) -> int:
         plan_max_linear_vel_m_s = float(cfg.deploy.get("max_linear_vel_m_s", 0.03))
         plan_max_angular_vel_rad_s = float(cfg.deploy.get("max_angular_vel_rad_s", 0.25))
         plan_timeout_grace_s = 2.0
+        # Catchup: after a plan finishes (or stalls), hold the frozen reference
+        # and let the impedance controller converge before requesting the next
+        # plan, so the next observation is captured from a settled pose. The hold
+        # exits as soon as BOTH the position and rotation tracking errors fall
+        # within tolerance, or after catchup_ticks execution ticks (the cap),
+        # whichever comes first. catchup_ticks=0 disables (single re-command tick).
+        plan_catchup_ticks = int(cfg.deploy.get("catchup_ticks", 0))
+        catchup_pos_tol_m = float(
+            cfg.deploy.get("catchup_pos_tol_m", plan_completion_tolerance_m)
+        )
+        catchup_rot_tol_rad = float(cfg.deploy.get("catchup_rot_tol_rad", 0.05))
 
         # ----- host-side terminal-convergence aids (feat/cartesian-integral-ff) -----
         # franky's Cartesian impedance has no integrator, so the EE settles to
@@ -1579,8 +1619,59 @@ def main(cfg: DictConfig) -> int:
                 else:
                     request_event.set()
 
+            # ---------- catchup hold: let the controller converge before replan ----------
+            # Both terminal conditions (streamed-to-end and mid-stream timeout)
+            # funnel here: we freeze the reference at the pose we were last
+            # tracking and re-command it until the EE catches up (position AND
+            # rotation error within tolerance) or the plan_catchup_ticks cap is
+            # hit, then request the next plan — so the next observation is captured
+            # from a settled pose and tracking error doesn't accumulate across plan
+            # boundaries. With plan_catchup_ticks=0 this is a single tick (≈ the
+            # original immediate-replan behavior).
+            if active_plan is not None and catchup_remaining >= 0:
+                state = robot.latest_state
+                if state is None:
+                    state = rate.time_call("state_wait", robot.wait_for_state, 1.0)
+                ee_pos, _ee_rot, _O_T_EE = _read_ee_pose_from_state(state)
+                tracker.set_cartesian_reference(
+                    Affine(pack_Rp(catchup_target_rot, catchup_target_pos))
+                )
+                if deploy_trace is not None:
+                    deploy_trace.record_error(
+                        t=time.monotonic(),
+                        plan_sequence=active_plan.sequence,
+                        active_index=active_index,
+                        target_pos=catchup_target_pos,
+                        target_rot=catchup_target_rot,
+                        measured_pos=ee_pos,
+                        measured_rot=_ee_rot,
+                    )
+                # Caught up when BOTH position and rotation errors are within
+                # tolerance; otherwise keep holding until the catchup_ticks cap.
+                pos_err = float(np.linalg.norm(catchup_target_pos - ee_pos))
+                R_err = catchup_target_rot @ _ee_rot.T
+                rot_err = float(np.arccos(
+                    np.clip((np.trace(R_err) - 1.0) / 2.0, -1.0, 1.0)
+                ))
+                converged = pos_err <= catchup_pos_tol_m and rot_err <= catchup_rot_tol_rad
+                catchup_remaining -= 1
+                if converged or catchup_remaining < 0:
+                    logger.info(
+                        "  plan %d catchup %s (pos=%.1fmm rot=%.1f°); requesting next plan",
+                        active_plan.sequence,
+                        "converged" if converged else "cap reached",
+                        pos_err * 1000.0, np.degrees(rot_err),
+                    )
+                    visualizer.clear_plan_waypoints()
+                    active_plan = None
+                    active_cartesian_trajectory = None
+                    active_plan_index_offset = 0
+                    active_plan_started_at = 0.0
+                    request_event.set()
+                    waiting_for_plan = True
+
             # ---------- execute the active plan suffix ----------
-            if active_plan is not None and active_index < len(active_plan.trajectory):
+            elif active_plan is not None and active_index < len(active_plan.trajectory):
                 state = robot.latest_state
                 if state is None:
                     state = rate.time_call("state_wait", robot.wait_for_state, 1.0)
@@ -1683,33 +1774,37 @@ def main(cfg: DictConfig) -> int:
                     plan_timeout_s,
                     active_cartesian_trajectory.duration + plan_timeout_grace_s,
                 )
-                if (
-                    active_index >= len(active_plan.trajectory) - 1
-                    and final_dist <= plan_completion_tolerance_m
-                ):
-                    logger.info("  completed plan %d", active_plan.sequence)
-                    visualizer.clear_plan_waypoints()
-                    active_plan = None
-                    active_cartesian_trajectory = None
-                    active_plan_index_offset = 0
-                    active_plan_started_at = 0.0
-                    request_event.set()
-                    waiting_for_plan = True
-                elif time.monotonic() - active_plan_started_at > active_plan_timeout_s:
-                    logger.info(
-                        "  plan %d timed out after %.1fs at idx=%d/%d; requesting replacement",
-                        active_plan.sequence,
-                        active_plan_timeout_s,
-                        active_index,
-                        len(active_plan.trajectory),
-                    )
-                    visualizer.clear_plan_waypoints()
-                    active_plan = None
-                    active_cartesian_trajectory = None
-                    active_plan_index_offset = 0
-                    active_plan_started_at = 0.0
-                    request_event.set()
-                    waiting_for_plan = True
+                streamed_to_end = active_index >= len(active_plan.trajectory) - 1
+                timed_out = (
+                    time.monotonic() - active_plan_started_at > active_plan_timeout_s
+                )
+
+                # Either terminal condition freezes the current reference and
+                # hands off to the catchup hold above, which counts down and then
+                # requests the replacement plan. streamed_to_end is reached at the
+                # trajectory's scheduled duration (well before active_plan_timeout_s),
+                # so in normal operation we always finish via the streamed-to-end
+                # path; the timeout is the safety net for a stalled loop.
+                if streamed_to_end or timed_out:
+                    catchup_target_pos = np.asarray(target_xyz, dtype=np.float64).copy()
+                    catchup_target_rot = np.asarray(target_rot, dtype=np.float64).copy()
+                    catchup_remaining = plan_catchup_ticks
+                    if streamed_to_end:
+                        logger.info(
+                            "  plan %d streamed to end at idx=%d/%d (err=%.1fmm); "
+                            "catchup hold %d ticks",
+                            active_plan.sequence, active_index,
+                            len(active_plan.trajectory), final_dist * 1000.0,
+                            plan_catchup_ticks,
+                        )
+                    else:
+                        logger.info(
+                            "  plan %d timed out after %.1fs at idx=%d/%d; "
+                            "catchup hold %d ticks then replace",
+                            active_plan.sequence, active_plan_timeout_s,
+                            active_index, len(active_plan.trajectory),
+                            plan_catchup_ticks,
+                        )
 
             elif active_plan is not None:
                 visualizer.clear_plan_waypoints()
