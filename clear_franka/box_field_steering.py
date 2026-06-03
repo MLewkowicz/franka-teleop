@@ -42,7 +42,7 @@ from steering.scalers import (
     StepScaler,
     TimestepScaler,
 )
-from steering.target_rotation import TargetRotationSteering
+from steering.target_rotation import TargetRotationSteering, _euler_to_matrix
 
 from clear_franka.value_maps import (
     RACK,
@@ -93,6 +93,14 @@ class CombinedBoxSteering(BaseSteering):
         # Rotation pull strength (top-level `guidance_strength`, same value the
         # linear TargetRotationSteering branch uses).
         self.guidance_strength_rot = float(cfg.get("guidance_strength", 0.3))
+
+        # Committed world-frame rotation axis (set on the first
+        # set_current_gripper_rotation after reset). The long/short choice each
+        # plan is then made to KEEP rotating about this fixed axis, so replanning
+        # (and the shrinking remaining-angle) can't flip the direction. `_rot_negate`
+        # is the per-plan decision (recomputed in set_current_gripper_rotation).
+        self._rot_commit_axis: np.ndarray | None = None
+        self._rot_negate = False
 
         pcfg = dict(cfg.get("position", {}))
         ws_min = np.asarray(pcfg["workspace_bounds_min"], dtype=np.float32)
@@ -242,11 +250,34 @@ class CombinedBoxSteering(BaseSteering):
         self._coords.set_gripper_pos(np.asarray(gripper_pos, dtype=np.float32))
 
     def set_current_gripper_rotation(self, ee_euler_xyz: np.ndarray) -> None:
+        # Updates the live relative target_6d (R_base.T @ R_target_world).
         self._rot.set_current_gripper_rotation(ee_euler_xyz)
+        if not self._rot_use_slerp:
+            return
+        # Decide this plan's long/short choice so the wrist keeps rotating about
+        # one COMMITTED world-frame axis (prevents the replan/equator-crossing
+        # direction flip). Compare the current short-way axis (grasp→target, in
+        # world) to the committed axis: if they oppose, go the long way.
+        R_base = _euler_to_matrix(ee_euler_xyz, self.device)        # (3, 3) world
+        R_target = self._rot._R_target_world                        # (3, 3) world
+        R_delta = R_target @ R_base.transpose(0, 1)                 # world grasp→target
+        axis_w, angle = self._axis_angle(R_delta)
+        if angle < 1e-3:
+            self._rot_negate = False
+            return
+        if self._rot_commit_axis is None:
+            # Commit at stage entry: reverse → opposite of the short-way axis.
+            self._rot_commit_axis = (
+                -axis_w if self._rot_reverse_direction else axis_w
+            )
+        # Long way when the short-way axis opposes the committed direction.
+        self._rot_negate = bool(np.dot(axis_w, self._rot_commit_axis) < 0.0)
 
     def reset(self) -> None:
         self._rot.reset()
         self._pos_latched = False
+        self._rot_commit_axis = None
+        self._rot_negate = False
 
     # Lifecycle no-ops for run_experiment / policy compatibility.
     def setup_episode(self, task_name: str):
@@ -260,48 +291,58 @@ class CombinedBoxSteering(BaseSteering):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _slerp_targets(
-        x0_rot: torch.Tensor,
+    def _axis_angle(R: torch.Tensor) -> tuple[np.ndarray, float]:
+        """Rotation matrix (3,3) -> (unit axis (3,), angle in [0, π])."""
+        Rn = R.detach().cpu().numpy().astype(np.float64)
+        cos = (np.trace(Rn) - 1.0) / 2.0
+        angle = float(np.arccos(np.clip(cos, -1.0, 1.0)))
+        ax = np.array([Rn[2, 1] - Rn[1, 2],
+                       Rn[0, 2] - Rn[2, 0],
+                       Rn[1, 0] - Rn[0, 1]], dtype=np.float64)
+        n = np.linalg.norm(ax)
+        axis = ax / n if n > 1e-9 else np.array([0.0, 0.0, 1.0])
+        return axis, angle
+
+    @staticmethod
+    def _slerp_from_identity_targets(
         target_6d: torch.Tensor,
         alphas: torch.Tensor,
-        reverse: bool,
+        negate: bool,
+        device,
     ) -> torch.Tensor:
-        """Per-horizon SLERP targets along the SO(3) geodesic toward target_6d.
+        """Per-horizon SLERP targets from the RELATIVE identity to target_6d.
 
-        For each horizon step h, target_h = SLERP(R_pred_h, R_target, alphas[h]).
-        `reverse=False` takes the short way (negate q_target when its dot with
-        q_pred is negative); `reverse=True` forces the LONG way (negate when the
-        dot is positive) so the wrist rotates the opposite direction to the SAME
-        final orientation. Quaternion antipodal symmetry (R(q)=R(−q)) means both
-        reach the identical target at alpha=1; only the intermediate path (hence
-        the executed direction) differs.
+        Anchored at identity (the current EE pose in the relative frame), NOT the
+        live prediction — so the targets are FIXED for the plan and don't flip as
+        the denoiser's x0 estimate moves (that live-anchored flip was the
+        oscillation bug). `negate=True` flips the target quaternion to the
+        opposite hemisphere so the geodesic travels the LONG way around; the
+        per-plan caller sets it to maintain the committed world-frame direction.
 
-        x0_rot: (B, H, 6); target_6d: (6,); alphas: (H,). Returns (B, H, 6).
+        target_6d: (6,); alphas: (H,). Returns (H, 6).
         """
-        B, H, _ = x0_rot.shape
-        q_pred = matrix_to_quaternion(
-            compute_rotation_matrix_from_ortho6d(x0_rot.reshape(-1, 6))
-        )  # (B*H, 4)
-        q_target = matrix_to_quaternion(
+        H = alphas.shape[0]
+        q_id = torch.zeros(H, 4, device=device, dtype=alphas.dtype)
+        q_id[:, 0] = 1.0  # identity quaternion (w=1)
+        qt = matrix_to_quaternion(
             compute_rotation_matrix_from_ortho6d(target_6d.view(1, 6))
-        ).squeeze(0).expand(B * H, 4).contiguous()  # (B*H, 4)
+        ).squeeze(0)  # (4,)
+        if float(qt[0]) < 0.0:
+            qt = -qt                 # canonical short-way hemisphere from identity
+        if negate:
+            qt = -qt                 # flip to the long way
+        qt = qt.view(1, 4).expand(H, 4).contiguous()
 
-        dot = (q_pred * q_target).sum(dim=-1, keepdim=True)
-        if reverse:
-            q_target = torch.where(dot > 0, -q_target, q_target)  # force long way
-        else:
-            q_target = torch.where(dot < 0, -q_target, q_target)  # short way
-        dot = (q_pred * q_target).sum(dim=-1, keepdim=True).clamp(-1.0, 1.0)
-
+        dot = (q_id * qt).sum(dim=-1, keepdim=True).clamp(-1.0, 1.0)
         theta = torch.acos(dot)
         sin_theta = torch.sin(theta)
-        a = alphas.view(1, H, 1).expand(B, H, 1).reshape(-1, 1)
+        a = alphas.view(H, 1)
         safe = sin_theta.abs() > 1e-6
         w0 = torch.where(safe, torch.sin((1.0 - a) * theta) / sin_theta, 1.0 - a)
         w1 = torch.where(safe, torch.sin(a * theta) / sin_theta, a)
-        q = w0 * q_pred + w1 * q_target
+        q = w0 * q_id + w1 * qt
         q = q / q.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        return get_ortho6d_from_rotation_matrix(quaternion_to_matrix(q)).reshape(B, H, 6)
+        return get_ortho6d_from_rotation_matrix(quaternion_to_matrix(q))  # (H, 6)
 
     def _rotation_slerp_guidance(
         self,
@@ -314,11 +355,11 @@ class CombinedBoxSteering(BaseSteering):
         Mirrors TargetRotationSteering.get_guidance EXACTLY (same Tweedie x0,
         same dps/epsilon delta, same [3:9] placement) but replaces the single
         constant target with per-horizon SLERP targets along the SO(3) geodesic
-        toward the relative target. `self._rot_reverse_direction` selects the
-        direction (True = the long/other way around a near-180° flip). The
-        per-horizon alpha ramps `rot_alpha_floor → rot_alpha_max` quadratically,
-        so earlier waypoints take a smaller step along the geodesic — the same
-        gradual-onset behavior as the linear branch's `ramp`.
+        from the current pose to the relative target. Direction is committed in
+        world frame (see set_current_gripper_rotation → `_rot_negate`), so it
+        can't flip on replan. The per-horizon alpha ramps `rot_alpha_floor →
+        rot_alpha_max` quadratically, so earlier waypoints take a smaller step
+        along the geodesic — gradual onset like the linear branch's `ramp`.
         """
         rot = self._rot
         container = model_output if self.guidance_mode != "dps" else current_sample
@@ -347,11 +388,13 @@ class CombinedBoxSteering(BaseSteering):
             self._rot_alpha_max - self._rot_alpha_floor
         ) * (h_idx / max(H - 1, 1)) ** 2  # (H,)
 
-        # Per-horizon geodesic targets. reverse=True routes the SLERP the LONG
-        # way around (opposite wrist direction) to the same final orientation.
-        slerp_target = self._slerp_targets(
-            x0_rot, target_single, alphas, reverse=self._rot_reverse_direction
-        )  # (B, H, 6)
+        # Per-horizon geodesic targets, anchored at the current pose (identity in
+        # the relative frame) — fixed for the plan, so they don't oscillate as
+        # x0_rot moves. `_rot_negate` (decided per plan to hold the committed
+        # world axis) routes the SLERP the long way when needed.
+        slerp_target = self._slerp_from_identity_targets(
+            target_single, alphas, negate=self._rot_negate, device=container.device
+        ).unsqueeze(0)  # (1, H, 6) — broadcasts over batch
 
         if self.guidance_mode == "dps":
             # Nudge x_{t-1} toward the per-horizon geodesic target (same sign as
