@@ -72,6 +72,7 @@ class CombinedBoxSteering(BaseSteering):
         boxes = load_boxes(pcfg["boxes_path"])
         face_thickness_m = float(pcfg.get("face_thickness_m", 0.04))
         forward_extend_m = float(pcfg.get("forward_extend_m", 0.06))
+        basin_y_offset_m = float(pcfg.get("basin_y_offset_m", 0.0))
         basin_z_offset_m = float(pcfg.get("basin_z_offset_m", 0.0))
         rack_name = pcfg.get("rack", RACK)
         vm = build_place_value_map(
@@ -96,6 +97,7 @@ class CombinedBoxSteering(BaseSteering):
                 if pcfg.get("affordance_z_extent_m") is not None else None),
             include_underneath_wall=bool(
                 pcfg.get("include_underneath_wall", True)),
+            basin_y_offset_m=basin_y_offset_m,
             basin_z_offset_m=basin_z_offset_m,
             rack=rack_name,
         )
@@ -110,6 +112,7 @@ class CombinedBoxSteering(BaseSteering):
             boxes[rack_name]["center"], boxes[rack_name]["size"],
             face_thickness_m=face_thickness_m,
             forward_extend_m=forward_extend_m,
+            y_offset_m=basin_y_offset_m,
             z_offset_m=basin_z_offset_m,
         )
 
@@ -166,6 +169,18 @@ class CombinedBoxSteering(BaseSteering):
         # descent direction but limits magnitude; tune via cfg.position.
         self._delta_norm_cap = float(pcfg.get("delta_norm_cap", 0.02))
 
+        # Basin latch — once the *measured* EE first comes within this radius of
+        # the basin, the position branch turns OFF for the rest of the stage and
+        # stays off (rotation steering keeps running). The basin is an APPROACH
+        # point, not the final rack-slot pose; the DistanceScaler alone ramps the
+        # pull to its floor near the basin but is non-latching, so if the EE
+        # drifts back out the pull re-engages and the EE loops in/out of the
+        # basin while the policy tries to align with the rack. The latch hands
+        # final alignment entirely to the policy once we've arrived. Set to 0 to
+        # disable (fall back to pure DistanceScaler behavior). Cleared on reset().
+        self._basin_latch_radius_m = float(pcfg.get("basin_latch_radius_m", 0.10))
+        self._pos_latched = False
+
         # Log the first few pos_delta magnitudes so the user can see the field
         # actually nudging the trajectory (not destabilizing it). Tunable so we
         # can quiet it once the steering is tuned.
@@ -201,6 +216,7 @@ class CombinedBoxSteering(BaseSteering):
 
     def reset(self) -> None:
         self._rot.reset()
+        self._pos_latched = False
 
     # Lifecycle no-ops for run_experiment / policy compatibility.
     def setup_episode(self, task_name: str):
@@ -225,6 +241,27 @@ class CombinedBoxSteering(BaseSteering):
         guidance = self._rot.get_guidance(
             current_sample, timestep, obs_embedding, model_output
         )
+
+        # Basin latch — measured EE is fixed across this plan's denoising loop
+        # (it's the observation pose), so this check is effectively per-plan.
+        # Once we've arrived within the latch radius, drop the position branch
+        # entirely (return rotation-only) and never re-engage it this stage.
+        if self._basin_latch_radius_m > 0.0:
+            ee = self._coords.current_gripper_pos
+            if not self._pos_latched and ee is not None:
+                basin = torch.as_tensor(
+                    self._stage_target_world, dtype=ee.dtype, device=ee.device)
+                d = float(torch.norm(ee - basin).item())
+                if d <= self._basin_latch_radius_m:
+                    self._pos_latched = True
+                    logger.info(
+                        "CombinedBoxSteering: basin latch ENGAGED (d=%.3fm <= "
+                        "%.3fm) — position steering OFF for the rest of the stage; "
+                        "rotation steering continues, policy handles rack alignment.",
+                        d, self._basin_latch_radius_m,
+                    )
+            if self._pos_latched:
+                return guidance
 
         alpha_bar = get_alpha_bar(self._pos_scheduler, timestep, device=self.device)
         t = int(timestep.item() if isinstance(timestep, torch.Tensor) else timestep)
