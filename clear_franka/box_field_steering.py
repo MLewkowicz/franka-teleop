@@ -30,6 +30,7 @@ from core.steering import BaseSteering
 from steering.coordinates import PositionTransform
 from steering.diffusion_utils import get_alpha_bar
 from steering.position_field import PositionFieldGuidance
+from steering.rotation_field import RotationFieldGuidance
 from steering.scalers import (
     DistanceScaler,
     ScalerContext,
@@ -55,14 +56,35 @@ class CombinedBoxSteering(BaseSteering):
     def __init__(self, cfg: Any) -> None:
         super().__init__(cfg)
 
-        # Rotation branch — unchanged proven steering (handles [3:9],
-        # set_current_gripper_rotation, reset, set_rotation_scheduler).
+        # Rotation branch — TargetRotationSteering is kept for its bookkeeping
+        # (target_euler → R_target_world, set_current_gripper_rotation → the live
+        # relative target_6d, set_rotation_scheduler, guidance_mode). When
+        # `rot_use_slerp` is on we DON'T call its linear get_guidance; instead we
+        # reuse its target_6d + scheduler and steer along the SO(3) GEODESIC.
         self._rot = TargetRotationSteering(cfg)
         # The policy routes by this single attribute; share it across branches.
         self.guidance_mode = self._rot.guidance_mode
 
         self.device = cfg.get("device", "cuda")
         self.horizon = int(cfg.get("horizon", 20))
+
+        # --- Geodesic (SLERP) rotation steering -----------------------------
+        # The inverted-place target is a near-180° flip from the grasp pose. The
+        # linear-6D pull in TargetRotationSteering can't choose which way the
+        # wrist goes around it (and is ill-conditioned near the antipode). SLERP
+        # per-horizon targets travel the great-circle geodesic, and
+        # `rot_hemisphere_fix` selects the direction: True = short way, False =
+        # the OTHER way (cross the antipodal boundary). We feed the per-horizon
+        # geodesic targets into the SAME proven dps/epsilon delta formula
+        # TargetRotationSteering uses (so no new sign/scaling surprises) — only
+        # the constant target is replaced by per-horizon SLERP targets.
+        self._rot_use_slerp = bool(cfg.get("rot_use_slerp", False))
+        self._rot_hemisphere_fix = bool(cfg.get("rot_hemisphere_fix", True))
+        self._rot_alpha_floor = float(cfg.get("ramp_floor", 0.0))
+        self._rot_alpha_max = float(cfg.get("rot_horizon_alpha_max", 0.5))
+        # Rotation pull strength (top-level `guidance_strength`, same value the
+        # linear TargetRotationSteering branch uses).
+        self.guidance_strength_rot = float(cfg.get("guidance_strength", 0.3))
 
         pcfg = dict(cfg.get("position", {}))
         ws_min = np.asarray(pcfg["workspace_bounds_min"], dtype=np.float32)
@@ -229,6 +251,67 @@ class CombinedBoxSteering(BaseSteering):
     # Guidance
     # ------------------------------------------------------------------
 
+    def _rotation_slerp_guidance(
+        self,
+        current_sample: torch.Tensor,
+        timestep: int,
+        model_output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Geodesic (SLERP) rotation delta in [3:9].
+
+        Mirrors TargetRotationSteering.get_guidance EXACTLY (same Tweedie x0,
+        same dps/epsilon delta, same [3:9] placement) but replaces the single
+        constant target with per-horizon SLERP targets along the SO(3) geodesic
+        toward the relative target. `self._rot_hemisphere_fix` selects the
+        direction (False = the long/other way around a near-180° flip). The
+        per-horizon alpha ramps `rot_alpha_floor → rot_alpha_max` quadratically,
+        so earlier waypoints take a smaller step along the geodesic — the same
+        gradual-onset behavior as the linear branch's `ramp`.
+        """
+        rot = self._rot
+        container = model_output if self.guidance_mode != "dps" else current_sample
+        zero = torch.zeros_like(container)
+
+        if rot._rotation_target_6d is None or rot.rotation_scheduler is None:
+            return zero
+        t = int(timestep.item() if isinstance(timestep, torch.Tensor) else timestep)
+        if t > rot.start_guidance_timestep:
+            return zero
+
+        B, L, _ = model_output.shape
+        H = min(self.horizon, L)
+
+        abar = max(float(rot.rotation_scheduler.alphas_cumprod[t]), 1e-6)
+        sqrt_abar = abar ** 0.5
+        sqrt_1m = (1.0 - abar) ** 0.5
+
+        eps_rot = model_output[:, :H, 3:9]
+        x_t_rot = current_sample[:, :H, 3:9]
+        x0_rot = (x_t_rot - sqrt_1m * eps_rot) / sqrt_abar  # (B, H, 6)
+
+        target_single = rot._rotation_target_6d.to(container.device).view(6)
+        h_idx = torch.arange(H, device=container.device, dtype=x0_rot.dtype)
+        alphas = self._rot_alpha_floor + (
+            self._rot_alpha_max - self._rot_alpha_floor
+        ) * (h_idx / max(H - 1, 1)) ** 2  # (H,)
+
+        # Per-horizon geodesic targets. hemisphere_fix=False routes the SLERP the
+        # OTHER way around the antipode (the direction control we want).
+        slerp_target = RotationFieldGuidance.slerp_targets_per_horizon(
+            x0_rot, target_single, alphas, hemisphere_fix=self._rot_hemisphere_fix
+        )  # (B, H, 6)
+
+        if self.guidance_mode == "dps":
+            # Nudge x_{t-1} toward the per-horizon geodesic target (same sign as
+            # TargetRotationSteering's proven dps path).
+            delta = self.guidance_strength_rot * (slerp_target - x0_rot)
+        else:
+            coeff = sqrt_1m / sqrt_abar
+            delta = self.guidance_strength_rot * coeff * (x0_rot - slerp_target)
+
+        zero[:, :H, 3:9] = delta
+        return zero
+
     def get_guidance(
         self,
         current_sample: torch.Tensor,
@@ -238,9 +321,14 @@ class CombinedBoxSteering(BaseSteering):
     ) -> torch.Tensor:
         """Rotation delta in [3:9] + value-map position delta in [0:3]."""
         # Rotation branch returns a full-size tensor (delta only in [3:9]).
-        guidance = self._rot.get_guidance(
-            current_sample, timestep, obs_embedding, model_output
-        )
+        if self._rot_use_slerp:
+            guidance = self._rotation_slerp_guidance(
+                current_sample, timestep, model_output
+            )
+        else:
+            guidance = self._rot.get_guidance(
+                current_sample, timestep, obs_embedding, model_output
+            )
 
         # Basin latch — measured EE is fixed across this plan's denoising loop
         # (it's the observation pose), so this check is effectively per-plan.

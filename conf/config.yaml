@@ -228,16 +228,16 @@ deploy:
     # obs.ee_pose[3:6] (ee_rot_to_euler_xyz). Inverted-place value from the
     # mode-B demos; refine by jogging to the inverted pose and reading ee euler.
     # target_euler: [1.79, 1.31, -1.73]
-    # target_euler: [-1.35, 1.31, 1.41]   # equivalent grasp, wrist rolls the OTHER way
-    # The rotation guidance is a LINEAR pull in 6D rot space toward this single
-    # target (no SLERP/direction knob), so to reverse the wrist's approach
-    # direction we feed an EQUIVALENT target: R_target · Rz(180°) about the
-    # gripper's local approach axis — same physical 2-finger grasp (just swaps
-    # fingers), but reached by rolling the wrist the opposite way. Only yaw
-    # (euler[2]) flips (+1.41 → −1.73); roll/pitch unchanged. If the wrist now
-    # flips about the wrong axis, try the Rx/Ry-180° variants:
-    #   Rx(180°): [1.792, -1.31, -1.41]   Ry(180°): [1.792, -1.31, 1.732]
-    target_euler: [-1.35, 1.31, -1.73]
+    # NOTE on rotation DIRECTION: the inverted-place pose [-1.35,1.31,1.41] is
+    # ~176° from the grasp orientation (~[-1.88,1.10,-1.17]) — a near-180° flip.
+    # The Rz(180°) "gripper-equivalent" [-1.35,1.31,-1.73] is NOT equivalent for
+    # this hand/glass: it sits only ~16° from grasp, so the glass barely rotates
+    # ("stays level the whole way up") — do NOT use it. Because the real target
+    # is near-antipodal, the LINEAR 6D pull can't choose which way the wrist goes
+    # around (and is ill-conditioned → the ~20° under-convergence + "wrong way").
+    # Controlling the direction needs routing the rotation through an intermediate
+    # orientation (via-target / geodesic SLERP), not a target swap.
+    target_euler: [-1.35, 1.31, 1.41]
     # NOTE — TargetRotationSteering does NOT do per-horizon SLERP; it pulls
     # every waypoint toward the same absolute target. To make rotation gradual
     # (close to LangSteer's voxposer.yaml SLERP behavior with rot_horizon_alpha_max
@@ -252,6 +252,19 @@ deploy:
                                     # waypoints participate so the wrist starts rotating
                                     # sooner along the trajectory, not just at the endpoint.
     start_guidance_timestep: 25     # focus on low-t band only — basins separate there
+    # --- Geodesic (SLERP) rotation steering ---------------------------------
+    # The inverted-place target is a ~176° flip from the grasp pose. The default
+    # linear-6D pull (rot_use_slerp=false) can't choose which way the wrist goes
+    # around it and is ill-conditioned near 180° (→ "wrong way" + ~20° short).
+    # SLERP steers along the SO(3) geodesic; `rot_hemisphere_fix` picks the
+    # direction. The per-horizon SLERP fraction ramps `ramp_floor → alpha_max`.
+    rot_use_slerp: true
+    rot_hemisphere_fix: false       # false = go the OTHER way around (the fix the
+                                    # user asked for); true = short way (default SLERP).
+    rot_horizon_alpha_max: 0.5      # max geodesic fraction at wp[H-1] per call;
+                                    # higher = more rotation per plan (faster convergence,
+                                    # bigger per-step jump). Convergence accumulates across
+                                    # plans, so <1 is fine. Raise toward 0.7 if still short.
     stage_indices: [1]              # steer the place stage only
     horizon: 20
     device: cuda
