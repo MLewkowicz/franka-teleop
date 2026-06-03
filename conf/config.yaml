@@ -264,7 +264,7 @@ deploy:
       # ±0.75 model units (worst-case 38cm world shift in z), and combined
       # with the smooth-handoff prepend below, the executor never commands a
       # jump that exceeds max_linear_vel_m_s.
-      guidance_strength: 0.3
+      guidance_strength: 0.35
       delta_norm_cap: 0.04          # raised from 0.03 to let y/x components also saturate
                                     # — smaller slab → smaller raw gradient → only z was
                                     # hitting the cap; y/x are linear at low magnitude and
@@ -322,18 +322,27 @@ deploy:
       include_underneath_wall: false
       # Rack-affordance slab geometry — basin sits in front of the rack face,
       # slightly above center, and biased toward the cabinet (+y) side of the
-      # +y slot. With forward_extend=0.14 and face_thickness=0.02:
-      #   slab x  = [0.615 - 0.14, 0.615 + 0.02] = [0.475, 0.635]
-      #   basin x = 0.615 + (0.02 - 0.14)/2     = 0.555   (6cm in front of rack)
+      # slot. With forward_extend=0.14 and face_thickness=-0.03:
+      #   slab x  = [0.615 - 0.14, 0.615 - 0.03] = [0.475, 0.585]
+      #   basin x = 0.615 + (-0.03 - 0.14)/2     = 0.530   (8.5cm in front of rack)
       # `basin_y_offset_m` / `basin_z_offset_m` shift the slab+basin in y/+z
       # without moving the rack box itself, so the steering aims toward the
       # cabinet side of the slot and slightly above the rack's z-center.
-      face_thickness_m: 0.02        # thin shell inside rack
-      forward_extend_m: 0.14        # slab extends 14cm in front of rack toward robot
-                                    # — 0.07→0.10→0.14. EE kept settling under the rack
-                                    # shelf (x≈0.675, face at 0.615); pushing the basin
-                                    # further out to x=0.555 grows the x-error so the
-                                    # position field pulls the EE further back out.
+      #
+      # face_thickness sets the seed's RACK-SIDE (+x) edge at x_min+face_thickness.
+      # The EDT gradient pulls a behind-the-edge EE toward THAT edge (nearest seed
+      # voxel), so this — NOT forward_extend — is the knob that controls where the
+      # EE settles in x. At face=+0.02 the edge sat at 0.635 (2cm UNDER the shelf)
+      # and the descent pull was up-dominated ([-0.62,-0.08,+0.78]) → EE climbed
+      # up under the rack and clipped it. Moving the edge to 0.585 (3cm in FRONT
+      # of the face) makes the pull out-dominated ([-0.86,-0.05,+0.51]) so the EE
+      # is drawn out in front of the rack before rising; the policy + rotation
+      # steering then handle the final insertion (basin latch hands off at 10cm).
+      face_thickness_m: -0.03       # seed rack-side edge 3cm IN FRONT of the face
+      forward_extend_m: 0.14        # slab robot-side extent; NO effect on the pull
+                                    # direction for an EE behind the seed edge (proven
+                                    # via gradient probe) — it only sets the basin x
+                                    # (DistanceScaler/latch target) and the slab length.
       # Bias the aim point toward the cabinet (+y) side of the slot. The policy
       # has a residual −y pull off the basin (EE settled ~3cm more negative than
       # the basin, drifting toward the rack middle), so aim +y of the slot center
