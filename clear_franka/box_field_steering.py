@@ -28,9 +28,14 @@ import torch
 
 from core.steering import BaseSteering
 from steering.coordinates import PositionTransform
+from policies.diffuser_actor_components.rotation_utils import (
+    compute_rotation_matrix_from_ortho6d,
+    get_ortho6d_from_rotation_matrix,
+    matrix_to_quaternion,
+    quaternion_to_matrix,
+)
 from steering.diffusion_utils import get_alpha_bar
 from steering.position_field import PositionFieldGuidance
-from steering.rotation_field import RotationFieldGuidance
 from steering.scalers import (
     DistanceScaler,
     ScalerContext,
@@ -72,14 +77,17 @@ class CombinedBoxSteering(BaseSteering):
         # The inverted-place target is a near-180° flip from the grasp pose. The
         # linear-6D pull in TargetRotationSteering can't choose which way the
         # wrist goes around it (and is ill-conditioned near the antipode). SLERP
-        # per-horizon targets travel the great-circle geodesic, and
-        # `rot_hemisphere_fix` selects the direction: True = short way, False =
-        # the OTHER way (cross the antipodal boundary). We feed the per-horizon
-        # geodesic targets into the SAME proven dps/epsilon delta formula
-        # TargetRotationSteering uses (so no new sign/scaling surprises) — only
-        # the constant target is replaced by per-horizon SLERP targets.
+        # per-horizon targets travel the great-circle geodesic; `rot_reverse_
+        # direction` selects which way around: False = short way (clean geodesic),
+        # True = forced LONG way (opposite wrist direction, same final pose).
+        # NOTE: we can't use RotationFieldGuidance's `hemisphere_fix` for this —
+        # it only avoids paths >180°, it can't FORCE the long way when the short
+        # path is <180° (our 176° flip), so reversing requires negating the
+        # target quaternion ourselves (see _slerp_targets). The per-horizon
+        # geodesic targets feed the SAME proven dps/epsilon delta formula
+        # TargetRotationSteering uses (no new sign/scaling surprises).
         self._rot_use_slerp = bool(cfg.get("rot_use_slerp", False))
-        self._rot_hemisphere_fix = bool(cfg.get("rot_hemisphere_fix", True))
+        self._rot_reverse_direction = bool(cfg.get("rot_reverse_direction", False))
         self._rot_alpha_floor = float(cfg.get("ramp_floor", 0.0))
         self._rot_alpha_max = float(cfg.get("rot_horizon_alpha_max", 0.5))
         # Rotation pull strength (top-level `guidance_strength`, same value the
@@ -251,6 +259,50 @@ class CombinedBoxSteering(BaseSteering):
     # Guidance
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _slerp_targets(
+        x0_rot: torch.Tensor,
+        target_6d: torch.Tensor,
+        alphas: torch.Tensor,
+        reverse: bool,
+    ) -> torch.Tensor:
+        """Per-horizon SLERP targets along the SO(3) geodesic toward target_6d.
+
+        For each horizon step h, target_h = SLERP(R_pred_h, R_target, alphas[h]).
+        `reverse=False` takes the short way (negate q_target when its dot with
+        q_pred is negative); `reverse=True` forces the LONG way (negate when the
+        dot is positive) so the wrist rotates the opposite direction to the SAME
+        final orientation. Quaternion antipodal symmetry (R(q)=R(−q)) means both
+        reach the identical target at alpha=1; only the intermediate path (hence
+        the executed direction) differs.
+
+        x0_rot: (B, H, 6); target_6d: (6,); alphas: (H,). Returns (B, H, 6).
+        """
+        B, H, _ = x0_rot.shape
+        q_pred = matrix_to_quaternion(
+            compute_rotation_matrix_from_ortho6d(x0_rot.reshape(-1, 6))
+        )  # (B*H, 4)
+        q_target = matrix_to_quaternion(
+            compute_rotation_matrix_from_ortho6d(target_6d.view(1, 6))
+        ).squeeze(0).expand(B * H, 4).contiguous()  # (B*H, 4)
+
+        dot = (q_pred * q_target).sum(dim=-1, keepdim=True)
+        if reverse:
+            q_target = torch.where(dot > 0, -q_target, q_target)  # force long way
+        else:
+            q_target = torch.where(dot < 0, -q_target, q_target)  # short way
+        dot = (q_pred * q_target).sum(dim=-1, keepdim=True).clamp(-1.0, 1.0)
+
+        theta = torch.acos(dot)
+        sin_theta = torch.sin(theta)
+        a = alphas.view(1, H, 1).expand(B, H, 1).reshape(-1, 1)
+        safe = sin_theta.abs() > 1e-6
+        w0 = torch.where(safe, torch.sin((1.0 - a) * theta) / sin_theta, 1.0 - a)
+        w1 = torch.where(safe, torch.sin(a * theta) / sin_theta, a)
+        q = w0 * q_pred + w1 * q_target
+        q = q / q.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        return get_ortho6d_from_rotation_matrix(quaternion_to_matrix(q)).reshape(B, H, 6)
+
     def _rotation_slerp_guidance(
         self,
         current_sample: torch.Tensor,
@@ -295,10 +347,10 @@ class CombinedBoxSteering(BaseSteering):
             self._rot_alpha_max - self._rot_alpha_floor
         ) * (h_idx / max(H - 1, 1)) ** 2  # (H,)
 
-        # Per-horizon geodesic targets. hemisphere_fix=False routes the SLERP the
-        # OTHER way around the antipode (the direction control we want).
-        slerp_target = RotationFieldGuidance.slerp_targets_per_horizon(
-            x0_rot, target_single, alphas, hemisphere_fix=self._rot_hemisphere_fix
+        # Per-horizon geodesic targets. reverse=True routes the SLERP the LONG
+        # way around (opposite wrist direction) to the same final orientation.
+        slerp_target = self._slerp_targets(
+            x0_rot, target_single, alphas, reverse=self._rot_reverse_direction
         )  # (B, H, 6)
 
         if self.guidance_mode == "dps":

@@ -256,11 +256,14 @@ deploy:
     # The inverted-place target is a ~176° flip from the grasp pose. The default
     # linear-6D pull (rot_use_slerp=false) can't choose which way the wrist goes
     # around it and is ill-conditioned near 180° (→ "wrong way" + ~20° short).
-    # SLERP steers along the SO(3) geodesic; `rot_hemisphere_fix` picks the
-    # direction. The per-horizon SLERP fraction ramps `ramp_floor → alpha_max`.
+    # SLERP steers cleanly along the SO(3) geodesic; `rot_reverse_direction`
+    # picks which way around. The per-horizon fraction ramps `ramp_floor → max`.
     rot_use_slerp: true
-    rot_hemisphere_fix: false       # false = go the OTHER way around (the fix the
-                                    # user asked for); true = short way (default SLERP).
+    rot_reverse_direction: true     # true = force the LONG way around (opposite wrist
+                                    # direction, same final pose — the fix asked for);
+                                    # false = short-way geodesic. Note: a near-180° flip
+                                    # makes long(184°)/short(176°) close in total angle but
+                                    # OPPOSITE in direction (negated rotation axis).
     rot_horizon_alpha_max: 0.5      # max geodesic fraction at wp[H-1] per call;
                                     # higher = more rotation per plan (faster convergence,
                                     # bigger per-step jump). Convergence accumulates across
