@@ -99,6 +99,7 @@ def front_face_voxels(
     face_thickness_m: float = 0.04,
     forward_extend_m: float = 0.06,
     x_offset_m: float = 0.0,
+    y_offset_m: float = 0.0,
     z_offset_m: float = 0.0,
     y_extent_m: float | None = None,
     z_extent_m: float | None = None,
@@ -127,13 +128,13 @@ def front_face_voxels(
     z_half = half[2] if z_extent_m is None else z_extent_m / 2.0
     lo_world = np.array(
         [x_min - forward_extend_m + x_offset_m,
-         center[1] - y_half,
+         center[1] - y_half + y_offset_m,
          center[2] - z_half + z_offset_m],
         dtype=np.float32,
     )
     hi_world = np.array(
         [x_min + face_thickness_m + x_offset_m,
-         center[1] + y_half,
+         center[1] + y_half + y_offset_m,
          center[2] + z_half + z_offset_m],
         dtype=np.float32,
     )
@@ -184,6 +185,7 @@ def front_face_center(
     *,
     face_thickness_m: float = 0.04,
     forward_extend_m: float = 0.06,
+    y_offset_m: float = 0.0,
     z_offset_m: float = 0.0,
 ) -> np.ndarray:
     """World-frame center of the front-face affordance slab (the basin target).
@@ -198,7 +200,7 @@ def front_face_center(
     x_min = center[0] - half[0]
     return np.array([
         x_min + 0.5 * (face_thickness_m - forward_extend_m),
-        center[1],
+        center[1] + y_offset_m,
         center[2] + z_offset_m,
     ], dtype=np.float32)
 
@@ -235,6 +237,7 @@ def build_place_value_map(
     avoidance_carve_radius_m: float = 0.0,
     affordance_y_extent_m: float | None = None,
     affordance_z_extent_m: float | None = None,
+    basin_y_offset_m: float = 0.0,
     basin_z_offset_m: float = 0.0,
     include_underneath_wall: bool = True,
     rack: str = RACK,
@@ -262,6 +265,7 @@ def build_place_value_map(
         ws_min, ws_max, map_size,
         face_thickness_m=face_thickness_m,
         forward_extend_m=forward_extend_m,
+        y_offset_m=basin_y_offset_m,
         z_offset_m=basin_z_offset_m,
         y_extent_m=affordance_y_extent_m,
         z_extent_m=affordance_z_extent_m,
@@ -344,6 +348,7 @@ def build_place_value_map(
             front_face_center(boxes[rack]["center"], boxes[rack]["size"],
                               face_thickness_m=face_thickness_m,
                               forward_extend_m=forward_extend_m,
+                              y_offset_m=basin_y_offset_m,
                               z_offset_m=basin_z_offset_m),
             avoidance_carve_radius_m,
         )

@@ -227,7 +227,7 @@ deploy:
     # ~0.6), use a lower strength + ramp_floor=0.0 (so wp[0] gets no pull, wp[H-1]
     # gets full) + a low start_guidance_timestep (only nudge in the low-noise band
     # where mode basins separate). Crank back up if the rotation isn't completing.
-    guidance_strength: 0.2          # 0.4 stalled with eul[0] ~40° from target; smooth-handoff
+    guidance_strength: 0.3          # 0.4 stalled with eul[0] ~40° from target; smooth-handoff
                                     # + delta_norm_cap now bound the per-step jump, so the
                                     # earlier "0.6 snapped instantly" failure mode is gated.
     guidance_mode: dps              # "epsilon" (ε-delta) or "dps" (stronger, x-space)
@@ -264,7 +264,7 @@ deploy:
       # ±0.75 model units (worst-case 38cm world shift in z), and combined
       # with the smooth-handoff prepend below, the executor never commands a
       # jump that exceeds max_linear_vel_m_s.
-      guidance_strength: 0.2
+      guidance_strength: 0.3
       delta_norm_cap: 0.04          # raised from 0.03 to let y/x components also saturate
                                     # — smaller slab → smaller raw gradient → only z was
                                     # hitting the cap; y/x are linear at low magnitude and
@@ -282,6 +282,15 @@ deploy:
         full: 0.4                  # >= this distance (m) -> full guidance
         near: 0.1                  # <= this distance (m) -> `floor` (in the basin)
         floor: 0.0                  # keep half-guidance even at the basin
+      # Basin latch: once the MEASURED EE first comes within this radius (m) of
+      # the basin, the position branch turns OFF for the rest of the stage and
+      # stays off (rotation steering keeps running). The basin is an APPROACH
+      # point, not the final rack-slot pose — the DistanceScaler ramps the pull
+      # to `floor` near the basin but is non-latching, so if the EE drifts back
+      # out the pull re-engages and the EE oscillates in/out of the basin while
+      # the policy aligns with the rack. The latch hands final alignment to the
+      # policy once we've arrived. Set 0 to disable (pure DistanceScaler).
+      basin_latch_radius_m: 0.10
       start_guidance_timestep: 10000  # apply for t <= this; lower to focus low-t
       avoidance_weight: 420         # strength of the front-face wall vs the rack affordance
       # Avoidance is built as a *wall* at the front (-x) face of each obstacle
@@ -311,15 +320,25 @@ deploy:
       # being repelled by the wall sitting behind it.
       avoidance_carve_radius_m: 0.10
       include_underneath_wall: false
-      # Rack-affordance slab geometry — basin sits just in front of the rack
-      # face and slightly above center, lining up with the comfortable approach
-      # pose. With forward_extend=0.07 and face_thickness=0.02:
-      #   slab x  = [0.615 - 0.07, 0.615 + 0.02] = [0.545, 0.635]
-      #   basin x = 0.615 + (0.02 - 0.07)/2     = 0.59    (2.5cm in front of rack)
-      # `basin_z_offset_m` shifts the slab+basin in +z without moving the rack
-      # box itself, so the steering aims slightly above the rack's z-center.
+      # Rack-affordance slab geometry — basin sits in front of the rack face,
+      # slightly above center, and biased toward the cabinet (+y) side of the
+      # +y slot. With forward_extend=0.14 and face_thickness=0.02:
+      #   slab x  = [0.615 - 0.14, 0.615 + 0.02] = [0.475, 0.635]
+      #   basin x = 0.615 + (0.02 - 0.14)/2     = 0.555   (6cm in front of rack)
+      # `basin_y_offset_m` / `basin_z_offset_m` shift the slab+basin in y/+z
+      # without moving the rack box itself, so the steering aims toward the
+      # cabinet side of the slot and slightly above the rack's z-center.
       face_thickness_m: 0.02        # thin shell inside rack
-      forward_extend_m: 0.07        # slab extends 7cm in front of rack toward robot
+      forward_extend_m: 0.14        # slab extends 14cm in front of rack toward robot
+                                    # — 0.07→0.10→0.14. EE kept settling under the rack
+                                    # shelf (x≈0.675, face at 0.615); pushing the basin
+                                    # further out to x=0.555 grows the x-error so the
+                                    # position field pulls the EE further back out.
+      # Bias the aim point toward the cabinet (+y) side of the slot. The policy
+      # has a residual −y pull off the basin (EE settled ~3cm more negative than
+      # the basin, drifting toward the rack middle), so aim +y of the slot center
+      # to land the EE in-slot. basin y = box_001 center (−0.064) + offset.
+      basin_y_offset_m: 0.03        # +y toward cabinet → basin y = −0.034
       basin_z_offset_m: 0.03        # +3cm in z over rack center → basin z = 0.55
       # CRITICAL: clip the affordance seed to a small window in y/z around the
       # basin center. EDT gradients point to the *nearest* seed voxel — with a
