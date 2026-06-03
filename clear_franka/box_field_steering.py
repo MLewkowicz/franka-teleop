@@ -314,8 +314,8 @@ class CombinedBoxSteering(BaseSteering):
         Mirrors TargetRotationSteering.get_guidance EXACTLY (same Tweedie x0,
         same dps/epsilon delta, same [3:9] placement) but replaces the single
         constant target with per-horizon SLERP targets along the SO(3) geodesic
-        toward the relative target. `self._rot_hemisphere_fix` selects the
-        direction (False = the long/other way around a near-180° flip). The
+        toward the relative target. `self._rot_reverse_direction` selects the
+        direction (True = the long/other way around a near-180° flip). The
         per-horizon alpha ramps `rot_alpha_floor → rot_alpha_max` quadratically,
         so earlier waypoints take a smaller step along the geodesic — the same
         gradual-onset behavior as the linear branch's `ramp`.
