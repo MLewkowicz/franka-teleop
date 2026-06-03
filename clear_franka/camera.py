@@ -355,10 +355,27 @@ class ZedCamera:
         sl = self._sl
         runtime = sl.RuntimeParameters()
 
+        consecutive_failures = 0
+        last_fail_log = 0.0
         while not self._stop_event.is_set():
             err = self._zed.grab(runtime)
             if err != sl.ERROR_CODE.SUCCESS:
+                consecutive_failures += 1
+                now_f = time.monotonic()
+                # Throttle to one line / 2s so a transient drop doesn't spam,
+                # but surface the actual ERROR_CODE (CORRUPTED_FRAME vs
+                # CAMERA_NOT_DETECTED vs NO_NEW_FRAMES) for diagnosis.
+                if now_f - last_fail_log >= 2.0:
+                    print(
+                        f"  [camera:{self._camera_id}] grab failed: {err} "
+                        f"({consecutive_failures} consecutive)"
+                    )
+                    last_fail_log = now_f
+                # Back off once failures persist so we don't busy-spin grab().
+                if consecutive_failures > 3:
+                    time.sleep(0.05)
                 continue
+            consecutive_failures = 0
 
             now = time.monotonic()
             should_capture_pointcloud = self._should_capture_pointcloud(now)

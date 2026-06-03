@@ -119,7 +119,25 @@ def run_demonstrate(cfg: DictConfig):
     record_mode = str(dc.get("record", tc.get("record", "joints")))
     record_cameras = record_mode in ("rgb", "rgbd")
     camera_format = "rgb" if record_mode == "rgb" else "svo"
-    reset_joint_config = np.asarray(tc.reset_joint_config, dtype=float)
+
+    # Mode title — used for episode naming below and for per-mode home selection.
+    mode_title = dc.get("mode_title", None)
+    mode_title = str(mode_title).strip() if mode_title else None
+
+    # Reset/home config: the pose CROSS returns to, and the default Cartesian
+    # nullspace posture. Resolution priority:
+    #   1. demonstrate.home_configs[<mode_title>]  — per-mode home (7 joint angles)
+    #   2. demonstrate.reset_joint_config          — demonstrate-wide override
+    #   3. teleop.reset_joint_config               — shared default
+    home_configs = dc.get("home_configs", None)
+    if mode_title and home_configs is not None and mode_title in home_configs:
+        reset_joint_config = np.asarray(home_configs[mode_title], dtype=float)
+        print(f"  [home] reset/home = demonstrate.home_configs['{mode_title}']")
+    elif dc.get("reset_joint_config", None) is not None:
+        reset_joint_config = np.asarray(dc.get("reset_joint_config"), dtype=float)
+        print("  [home] reset/home = demonstrate.reset_joint_config")
+    else:
+        reset_joint_config = np.asarray(tc.reset_joint_config, dtype=float)
     joint_stiffness = dc.joint_stiffness
     period = 0.001
     button_timeout = float(dc.get("button_timeout", period))
@@ -143,12 +161,20 @@ def run_demonstrate(cfg: DictConfig):
     extrinsics_metadata = _metadata_for_cameras(cameras, cfg, vc)
 
     recorder_cfg = cfg.get("recorder", {})
+    # mode_title (resolved above) drives the episode filename: {mode_title}_{N}.h5
+    # where N is the next free index in data_dir. Timestamped names when unset.
+    if mode_title:
+        print(f"  [recorder] Demo mode title: '{mode_title}' -> {mode_title}_<N>.h5")
+    else:
+        print("  [recorder] No demonstrate.mode_title set; using timestamped episode names.")
     recorder = TrajectoryRecorder(
         save_dir=cfg.data_dir,
+        episode_name=mode_title,
         metadata={
             "control_mode": "joint_impedance_demonstration",
             "joint_stiffness": json.dumps([float(v) for v in joint_stiffness]),
             "gripper_enabled": bool(gc.get("enabled", False)),
+            **({"mode_title": mode_title} if mode_title else {}),
             **extrinsics_metadata,
         },
         cameras=cameras if record_cameras else {},

@@ -84,8 +84,23 @@ def _quaternion(rotation) -> Quaternion:
 class TrajectoryRecorder:
     """Record one episode to MCAP without doing file I/O in the control loop."""
 
-    def __init__(self, save_dir="./data", metadata=None, cameras=None,
-                 svo_compression="H264", camera_format="svo"):
+    def __init__(self, save_dir="./data", metadata=None, cameras=None, svo_compression="H264",
+                 camera_format="svo", episode_name=None):
+        """
+        Args:
+            save_dir: Directory to save episode files.
+            capacity: Pre-allocated buffer size in timesteps (120k = 2 min at 1kHz).
+            metadata: Optional dict of extra metadata stored in HDF5 attrs.
+            cameras: Optional dict/list of named ZedCamera instances. If provided,
+                every camera is recorded with the same trajectory clock epoch.
+            record_svo: If True, cameras record native ZED SVO2 files instead of HDF5.
+            svo_compression: SVO compression mode (H264, H265, LOSSLESS, etc.).
+                             Only used when record_svo=True.
+             episode_name: Optional base name for saved files. When set, episodes
+                are named ``{episode_name}_{N}.h5`` where N is the next free
+                index found by scanning ``save_dir`` (per start()). When None,
+                falls back to the timestamped ``episode_{YYYYmmdd_HHMMSS}.h5``
+        """
         self._save_dir = Path(save_dir)
         self._metadata = metadata or {}
         if cameras is None:
@@ -95,6 +110,10 @@ class TrajectoryRecorder:
         self._cameras = dict(cameras)
         self._svo_compression = svo_compression
         self._camera_format = camera_format
+        self._episode_name = episode_name
+        # Resolved per-episode at start(): the filename stem and its index.
+        self._episode_base = ""
+        self._episode_index = None
         self._recording = False
         self._count = 0
         self._start_monotonic_ns = 0
@@ -118,6 +137,18 @@ class TrajectoryRecorder:
     def _video_filename(self, camera_name: str) -> str:
         extension = "svo2" if self._camera_format == "svo" else "mp4"
         return f"episode_{self._start_name}_{_safe_name(camera_name)}_video.{extension}"
+
+    @staticmethod
+    def _next_episode_index(save_dir: Path, safe_name: str) -> int:
+        """Lowest free N such that ``{safe_name}_{N}.h5`` does not exist in save_dir."""
+        pattern = re.compile(rf"^{re.escape(safe_name)}_(\d+)\.h5$")
+        max_idx = -1
+        if save_dir.is_dir():
+            for entry in save_dir.iterdir():
+                m = pattern.match(entry.name)
+                if m:
+                    max_idx = max(max_idx, int(m.group(1)))
+        return max_idx + 1
 
     def start(self):
         if self._recording:
@@ -143,7 +174,29 @@ class TrajectoryRecorder:
             raise
 
         self._recording = True
-        print("  [recorder] RECORDING started")
+        self.last_saved_path = None
+
+        self._save_dir.mkdir(parents=True, exist_ok=True)
+        # Resolve this episode's filename stem. With episode_name set, scan the
+        # save dir for the next free {episode_name}_{N} index so demos/replays
+        # get stable, human-referenceable names; otherwise use the timestamp.
+        if self._episode_name:
+            safe = _safe_name(self._episode_name)
+            self._episode_index = self._next_episode_index(self._save_dir, safe)
+            self._episode_base = f"{safe}_{self._episode_index}"
+        else:
+            self._episode_index = None
+            self._episode_base = f"episode_{self._start_wall}"
+
+        video_ext = "svo2" if self._record_svo else "hdf5"
+        for name, camera in self._cameras.items():
+            video_path = str(
+                self._save_dir / f"{self._episode_base}_{_safe_name(name)}_video.{video_ext}"
+            )
+            camera.start_recording(video_path, self._start_time,
+                                   svo=self._record_svo, svo_compression=self._svo_compression)
+
+        print(f"  [recorder] RECORDING started -> {self._episode_base}.h5")
 
     def stop(self):
         if not self._recording:
