@@ -73,23 +73,6 @@ class InferencePlan:
     ee_euler_at_obs: np.ndarray
 
 
-class LatestPlanSlot:
-    """Single-slot handoff from the inference worker to the executor loop."""
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._plan: InferencePlan | None = None
-
-    def publish(self, plan: InferencePlan) -> None:
-        with self._lock:
-            self._plan = plan
-
-    def latest_after(self, sequence: int) -> InferencePlan | None:
-        with self._lock:
-            if self._plan is None or self._plan.sequence <= sequence:
-                return None
-            return self._plan
-
 
 class DeployTrace:
     """Sidecar recorder for a diffuser-actor deploy session.
@@ -389,21 +372,6 @@ def _extract_gripper_plan(action, horizon: int) -> np.ndarray:
         return trajectory[:horizon, 6].astype(np.float64)
     return np.full(horizon, float(action.gripper), dtype=np.float64)
 
-
-def _plan_start_index(
-    plan: InferencePlan,
-    current_ee_pos: np.ndarray,
-    plan_dt: float,
-    now: float,
-) -> int:
-    horizon = len(plan.trajectory)
-    if horizon <= 1:
-        return 0
-
-    distances = np.linalg.norm(plan.trajectory[:, :3] - current_ee_pos[None, :], axis=1)
-    closest_next = int(np.argmin(distances)) + 1
-    latency_skip = int(max(0.0, now - plan.obs_started_at) / plan_dt)
-    return min(max(1, closest_next, latency_skip), horizon - 1)
 
 
 def _make_cartesian_trajectory_for_plan(
@@ -786,162 +754,6 @@ def _log_plan_diagnostics(
         )
 
 
-def _start_inference_worker(
-    *,
-    policy,
-    policy_lock: threading.Lock,
-    robot,
-    cam_hand,
-    cam_tp,
-    pre_hand,
-    pre_tp,
-    latest_plan: LatestPlanSlot,
-    enabled_event: threading.Event,
-    request_event: threading.Event,
-    stop_event: threading.Event,
-    stage_state: dict[str, int],
-    workspace_lo: np.ndarray,
-    workspace_hi: np.ndarray,
-    policy_loc_bounds: np.ndarray | None,
-    policy_relative: bool,
-    outlier_filter_enabled: bool,
-    outlier_pos_thresh_m: float,
-    outlier_eul_thresh_rad: float,
-    steering=None,
-    steer_stage_indices: set[int] | None = None,
-    deploy_trace: "DeployTrace | None" = None,
-) -> threading.Thread:
-    steer_stage_indices = steer_stage_indices or set()
-    def worker() -> None:
-        sequence = 0
-        while not stop_event.is_set():
-            if not enabled_event.wait(0.05):
-                continue
-            if not request_event.wait(0.05):
-                continue
-            request_event.clear()
-            if not enabled_event.is_set():
-                continue
-
-            try:
-                obs_started_at = time.monotonic()
-                state = robot.wait_for_state(timeout=1.0)
-                ee_pos, ee_rot, _O_T_EE = _read_ee_pose_from_state(state)
-                T_g2b = _make_T_gripper_to_base(ee_pos, ee_rot)
-
-                hand_frame = cam_hand.grab_frame()
-                tp_frame = cam_tp.grab_frame()
-                if hand_frame is None or tp_frame is None:
-                    logger.warning("Camera grab failed — skipping inference")
-                    request_event.set()
-                    continue
-                rgb_hand_full, depth_hand_full = hand_frame
-                rgb_tp_full, depth_tp_full = tp_frame
-
-                rgb_hand_200, pcd_hand_200 = pre_hand.process(
-                    rgb_hand_full, depth_hand_full, T_g2b
-                )
-                rgb_tp_200, pcd_tp_200 = pre_tp.process(
-                    rgb_tp_full, depth_tp_full
-                )
-
-                from clear_franka.diffuser_actor_io import ee_rot_to_euler_xyz
-                ee_euler_at_obs = ee_rot_to_euler_xyz(ee_rot)
-
-                obs = _build_observation(
-                    rgb_tp_200, pcd_tp_200,
-                    rgb_hand_200, pcd_hand_200,
-                    ee_pos, ee_rot, stage_state["gripper_cmd"],
-                )
-                forward_started_at = time.monotonic()
-                with policy_lock:
-                    stage_idx = stage_state["idx"]
-                    epoch = stage_state["epoch"]
-                    active_steering = (
-                        steering
-                        if (steering is not None and stage_idx in steer_stage_indices)
-                        else None
-                    )
-                    action = policy.forward(obs, steering=active_steering)
-                forward_s = time.monotonic() - forward_started_at
-
-                # DiffuserActorBasePolicy.forward() already converts relative
-                # model outputs into absolute poses before returning Action.
-                trajectory = np.asarray(action.trajectory, dtype=np.float64).copy()
-                horizon = trajectory.shape[0]
-                if not enabled_event.is_set():
-                    continue
-
-                gripper_plan_raw = _extract_gripper_plan(action, horizon)
-                gripper_plan = gripper_plan_raw
-
-                # Filter isolated outlier waypoints (single-index diffusion
-                # spikes or gripper-coupled teleports, including the safety-
-                # critical wp[0]/wp[N-1]). The clean trajectory is what the
-                # executor sees; diagnostics below report on the patch.
-                if outlier_filter_enabled and trajectory.shape[1] >= 6:
-                    pos_filt, eul_filt, grip_filt, patched_idx, patched_pos_devs = (
-                        _filter_outlier_waypoints(
-                            trajectory[:, :3], trajectory[:, 3:6],
-                            gripper_plan_raw,
-                            pos_thresh_m=outlier_pos_thresh_m,
-                            eul_thresh_rad=outlier_eul_thresh_rad,
-                        )
-                    )
-                    if patched_idx:
-                        trajectory[:, :3] = pos_filt
-                        trajectory[:, 3:6] = eul_filt
-                        if trajectory.shape[1] >= 7:
-                            trajectory[:, 6] = grip_filt
-                        gripper_plan = grip_filt
-                        logger.warning(
-                            "  plan %d OUTLIER-FILTER: patched %d waypoint(s) at indices=%s "
-                            "(pos devs=%s)",
-                            sequence,
-                            len(patched_idx),
-                            patched_idx,
-                            ["%.3f" % d for d in patched_pos_devs],
-                        )
-
-                plan = InferencePlan(
-                    sequence=sequence,
-                    stage_idx=stage_idx,
-                    epoch=epoch,
-                    created_at=time.monotonic(),
-                    obs_started_at=obs_started_at,
-                    trajectory=trajectory,
-                    gripper=gripper_plan,
-                    ee_pos_at_obs=ee_pos.astype(np.float64).copy(),
-                    ee_euler_at_obs=np.asarray(ee_euler_at_obs, dtype=np.float64).copy(),
-                )
-                latest_plan.publish(plan)
-                if deploy_trace is not None:
-                    deploy_trace.record_plan(plan)
-                logger.info(
-                    "  published plan %d horizon=%d forward=%.2fs total=%.2fs first=%s last=%s gripper=%s",
-                    plan.sequence,
-                    horizon,
-                    forward_s,
-                    plan.created_at - obs_started_at,
-                    np.array2string(plan.trajectory[0, :3], precision=3),
-                    np.array2string(plan.trajectory[-1, :3], precision=3),
-                    np.array2string((plan.gripper > 0.0).astype(np.float64), precision=0),
-                )
-                _log_plan_diagnostics(
-                    plan, workspace_lo, workspace_hi,
-                    policy_loc_bounds, policy_relative,
-                )
-                sequence += 1
-            except Exception as e:
-                print(e)
-                logger.exception("Inference worker failed")
-                stop_event.set()
-                break
-
-    thread = threading.Thread(target=worker, name="diffuser-inference", daemon=True)
-    thread.start()
-    return thread
-
 
 # ---------------------------------------------------------------------------
 # Main loop
@@ -1110,10 +922,6 @@ def main(cfg: DictConfig) -> int:
     execution_hz = float(cfg.deploy.get("execution_hz", 100.0))
     plan_dt = 1.0 / plan_hz
     execution_dt = 1.0 / execution_hz
-    policy_lock = threading.Lock()
-    latest_plan = LatestPlanSlot()
-    enabled_event = threading.Event()
-    request_event = threading.Event()
     stop_event = threading.Event()
     stage_state: dict = {"idx": stage_idx, "epoch": 0, "gripper_cmd": 1.0}
 
@@ -1133,17 +941,6 @@ def main(cfg: DictConfig) -> int:
     long_press_s = float(cfg.teleop.get("long_press_s", 0.8))
     teleop_workspace_clip = bool(cfg.deploy.get("teleop_workspace_clip", True))
     mode = TELEOP   # start in teleop so the user positions the arm first
-
-    plan_hz = float(cfg.deploy.get("control_hz", 10.0))
-    execution_hz = float(cfg.deploy.get("execution_hz", 100.0))
-    plan_dt = 1.0 / plan_hz
-    execution_dt = 1.0 / execution_hz
-    policy_lock = threading.Lock()
-    latest_plan = LatestPlanSlot()
-    enabled_event = threading.Event()
-    request_event = threading.Event()
-    stop_event = threading.Event()
-    stage_state: dict = {"idx": stage_idx, "epoch": 0, "gripper_cmd": 1.0}
 
     # ----- optional trajectory recorder -----
     # Logs the executed session to data_dir/episode_*.h5 in the exact format the
@@ -1253,37 +1050,7 @@ def main(cfg: DictConfig) -> int:
                         deploy_trace.save(_trace_path), _trace_path,
                     )
                 )
-        inference_thread = _start_inference_worker(
-            policy=policy,
-            policy_lock=policy_lock,
-            robot=robot,
-            cam_hand=cam_hand,
-            cam_tp=cam_tp,
-            pre_hand=pre_hand,
-            pre_tp=pre_tp,
-            latest_plan=latest_plan,
-            enabled_event=enabled_event,
-            request_event=request_event,
-            stop_event=stop_event,
-            stage_state=stage_state,
-            workspace_lo=workspace_lo_np,
-            workspace_hi=workspace_hi_np,
-            policy_loc_bounds=policy_loc_bounds,
-            policy_relative=policy_relative,
-            outlier_filter_enabled=bool(
-                cfg.deploy.get("outlier_filter", {}).get("enabled", True)
-            ),
-            outlier_pos_thresh_m=float(
-                cfg.deploy.get("outlier_filter", {}).get("pos_thresh_m", 0.05)
-            ),
-            outlier_eul_thresh_rad=float(
-                cfg.deploy.get("outlier_filter", {}).get("eul_thresh_rad", 0.30)
-            ),
-            steering=steering,
-            steer_stage_indices=steer_stage_indices,
-            deploy_trace=deploy_trace,
-        )
-        stack.callback(lambda: (stop_event.set(), enabled_event.set(), inference_thread.join(timeout=1.0)))
+        stack.callback(stop_event.set)
 
         prev_left = 0
         prev_right = 0
@@ -1295,98 +1062,53 @@ def main(cfg: DictConfig) -> int:
         suppress_left_until_release = False
         suppress_right_until_release = False
         sample = None
-        active_plan: InferencePlan | None = None
         active_cartesian_trajectory = None
-        active_plan_index_offset = 0
-        active_index = 0
-        active_plan_started_at = 0.0
-        consumed_sequence = -1
-        waiting_for_plan = False
-        # Catchup hold countdown (cap). -1 = not holding; set to plan_catchup_ticks
-        # when a plan finishes (streamed to its final waypoint) OR is abandoned
-        # mid-stream (timeout), decremented each tick while we re-command the
-        # frozen reference. The next plan is requested once the EE converges to
-        # that reference (pos+rot within tolerance) or the counter drops below 0,
-        # whichever first. Reset to -1 on adoption. catchup_target_* = frozen ref.
-        catchup_remaining = -1
-        catchup_target_pos: np.ndarray | None = None
-        catchup_target_rot: np.ndarray | None = None
         next_tick = time.monotonic()
         last_viz_update = 0.0
         viz_dt = 1.0 / 5.0
-        plan_timeout_s = 3.0
-        plan_completion_tolerance_m = 0.015
-        plan_hard_skip_m = 0.12
         plan_max_linear_vel_m_s = float(cfg.deploy.get("max_linear_vel_m_s", 0.03))
         plan_max_angular_vel_rad_s = float(cfg.deploy.get("max_angular_vel_rad_s", 0.25))
-        plan_timeout_grace_s = 2.0
-        # Catchup: after a plan finishes (or stalls), hold the frozen reference
-        # and let the impedance controller converge before requesting the next
-        # plan, so the next observation is captured from a settled pose. The hold
-        # exits as soon as BOTH the position and rotation tracking errors fall
-        # within tolerance, or after catchup_ticks execution ticks (the cap),
-        # whichever comes first. catchup_ticks=0 disables (single re-command tick).
-        plan_catchup_ticks = int(cfg.deploy.get("catchup_ticks", 0))
-        catchup_pos_tol_m = float(
-            cfg.deploy.get("catchup_pos_tol_m", plan_completion_tolerance_m)
+        velocity_feedforward = bool(cfg.deploy.get("velocity_feedforward", False))
+        outlier_filter_enabled = bool(
+            cfg.deploy.get("outlier_filter", {}).get("enabled", True)
         )
-        catchup_rot_tol_rad = float(cfg.deploy.get("catchup_rot_tol_rad", 0.05))
+        outlier_pos_thresh_m = float(
+            cfg.deploy.get("outlier_filter", {}).get("pos_thresh_m", 0.05)
+        )
+        outlier_eul_thresh_rad = float(
+            cfg.deploy.get("outlier_filter", {}).get("eul_thresh_rad", 0.30)
+        )
+        # How long to hold the final pose (impedance controller re-commanded at
+        # the last waypoint) before capturing the next observation for inference.
+        hold_s = float(cfg.deploy.get("hold_s", 0.5))
+        infer_sequence = 0
 
-        # ----- host-side terminal-convergence aids (feat/cartesian-integral-ff) -----
-        # franky's Cartesian impedance has no integrator, so the EE settles to
-        # target - residual/stiffness. We add a host-side integral on the tracking
-        # error (active only during the terminal hold, to avoid winding up against
-        # the velocity lag mid-trajectory) plus velocity feedforward via target_twist.
-        velocity_feedforward = bool(cfg.deploy.get("velocity_feedforward", True))
-        integral_enabled = bool(cfg.deploy.get("integral_enabled", True))
-        integral_gain_pos = float(cfg.deploy.get("integral_gain_pos", 1.5))
-        integral_gain_rot = float(cfg.deploy.get("integral_gain_rot", 1.5))
-        integral_max_pos_m = float(cfg.deploy.get("integral_max_pos_m", 0.04))
-        integral_max_rot_rad = float(cfg.deploy.get("integral_max_rot_rad", 0.12))
-        integral_deadband_pos_m = float(cfg.deploy.get("integral_deadband_pos_m", 0.002))
-        integral_deadband_rot_rad = float(cfg.deploy.get("integral_deadband_rot_rad", 0.01))
-        pos_err_int = np.zeros(3, dtype=np.float64)
-        rot_err_int = np.zeros(3, dtype=np.float64)
-
-        # ----- mode transitions (swappable gesture->action mapping layer) -----
+        # ----- mode transitions -----
         def _enter_inference(prim: int, label: str) -> None:
-            nonlocal mode, stage_idx, active_plan, active_cartesian_trajectory
-            nonlocal active_plan_index_offset, active_plan_started_at, waiting_for_plan
+            nonlocal mode, stage_idx, active_cartesian_trajectory, infer_sequence
+            if mode == INFERENCE:
+                logger.info("[INFERENCE] already active — ignoring tap")
+                return
             mode = INFERENCE
-            active_plan = None
             active_cartesian_trajectory = None
-            active_plan_index_offset = 0
-            active_plan_started_at = 0.0
-            waiting_for_plan = True
             visualizer.clear_plan_waypoints()
-            with policy_lock:
-                policy.set_primitive(prim)
-                policy.set_object(0)
-                policy.reset()
-                stage_state["idx"] = prim
-                stage_state["epoch"] += 1
-            stage_idx = prim          # keep executor adopt guard (plan.stage_idx==stage_idx)
-            enabled_event.set()
-            request_event.set()
+            policy.set_primitive(prim)
+            policy.set_object(0)
+            policy.reset()
+            stage_state["idx"] = prim
+            stage_state["epoch"] += 1
+            stage_idx = prim
+            infer_sequence = 0
             logger.info(f"[INFERENCE] {label} (primitive {prim}) from current pose")
 
         def _enter_teleop() -> None:
-            nonlocal mode, active_plan, active_cartesian_trajectory
-            nonlocal active_plan_index_offset, active_plan_started_at, waiting_for_plan
+            nonlocal mode, active_cartesian_trajectory
             if mode == TELEOP:
                 return
             mode = TELEOP
-            enabled_event.clear()
-            request_event.clear()
-            stage_state["epoch"] += 1          # orphan any in-flight plan (adopt guard)
-            active_plan = None
+            stage_state["epoch"] += 1
             active_cartesian_trajectory = None
-            active_plan_index_offset = 0
-            active_plan_started_at = 0.0
-            waiting_for_plan = False
             visualizer.clear_plan_waypoints()
-            # No pose seeding needed: the teleop branch reads the measured pose each
-            # tick and adds (near-zero) deltas, so the arm does not jump on takeover.
             logger.info("[TELEOP] take over — jog; tap L=grasp R=place, chord=gripper")
 
         def _toggle_gripper_teleop() -> None:
@@ -1401,15 +1123,11 @@ def main(cfg: DictConfig) -> int:
                 wait=False,
                 max_width_m=cfg.gripper.max_width_m,
             )
-            # Propagate to the obs gripper channel read by the worker at conditioning.
             stage_state["gripper_cmd"] = 0.0 if is_open else 1.0
             visualizer.update_gripper_width(width, max_width_m=cfg.gripper.max_width_m)
             logger.info(f"[gripper] {'CLOSE' if is_open else 'OPEN'}")
 
         def _record_tick(enabled: bool, buttons: int = 0) -> None:
-            """Log one measured timestep. Mirrors replay.py / teleop.py so the
-            resulting episode_*.h5 is byte-format compatible with mode=replay.
-            `gripper_open` is the last commanded state (stage_state)."""
             if recorder is None:
                 return
             teleop_state = robot.get_last_teleop_state()
@@ -1429,86 +1147,89 @@ def main(cfg: DictConfig) -> int:
                 robot_abs_time=float(teleop_state["abs_time"]),
             )
 
+        def _poll_buttons() -> None:
+            """Read SpaceMouse and fire mode transitions. Safe to call from inner loops."""
+            nonlocal prev_left, prev_right, prev_chord, sample
+            nonlocal left_press_time, right_press_time
+            nonlocal left_used_in_chord, right_used_in_chord
+            nonlocal suppress_left_until_release, suppress_right_until_release
+            if mouse is None:
+                return
+            _s = mouse.get_controller_state()
+            if _s is None:
+                return
+            sample = _s
+            buttons = np.asarray(sample.buttons, dtype=int)
+            left = int(buttons[0]) if len(buttons) > 0 else 0
+            right = int(buttons[1]) if len(buttons) > 1 else 0
+
+            if suppress_left_until_release:
+                if left:
+                    left = 0
+                else:
+                    suppress_left_until_release = False
+            if suppress_right_until_release:
+                if right:
+                    right = 0
+                else:
+                    suppress_right_until_release = False
+            chord = bool(left and right)
+
+            if left and not prev_left:
+                left_press_time = time.monotonic()
+                left_used_in_chord = False
+            if right and not prev_right:
+                right_press_time = time.monotonic()
+                right_used_in_chord = False
+            if right and not prev_right and left:
+                left_used_in_chord = True
+            if left and not prev_left and right:
+                right_used_in_chord = True
+
+            if (left and left_press_time is not None and not left_used_in_chord
+                    and time.monotonic() - left_press_time >= long_press_s):
+                _enter_teleop()
+                suppress_left_until_release = True
+                left_press_time = None
+            if (right and right_press_time is not None and not right_used_in_chord
+                    and time.monotonic() - right_press_time >= long_press_s):
+                _enter_teleop()
+                suppress_right_until_release = True
+                right_press_time = None
+
+            if chord and not prev_chord:
+                left_used_in_chord = True
+                right_used_in_chord = True
+                if mode == TELEOP:
+                    _toggle_gripper_teleop()
+                else:
+                    logger.info("  (chord ignored — gripper toggles in TELEOP only)")
+
+            if (not left) and prev_left:
+                if not left_used_in_chord and left_press_time is not None:
+                    _enter_inference(0, "grasp")
+                left_press_time = None
+                left_used_in_chord = False
+            if (not right) and prev_right:
+                if not right_used_in_chord and right_press_time is not None:
+                    _enter_inference(1, "place")
+                right_press_time = None
+                right_used_in_chord = False
+
+            prev_left = left
+            prev_right = right
+            prev_chord = chord
+
         while not stop_event.is_set():
             rate.start_tick()
-            # ---------- button polling ----------
-            if mouse is not None:
-                sample = mouse.get_controller_state()
-                if sample is not None:
-                    buttons = np.asarray(sample.buttons, dtype=int)
-                    left = int(buttons[0]) if len(buttons) > 0 else 0
-                    right = int(buttons[1]) if len(buttons) > 1 else 0
-
-                    # Ignore a button until release after it took part in a chord.
-                    if suppress_left_until_release:
-                        if left:
-                            left = 0
-                        else:
-                            suppress_left_until_release = False
-                    if suppress_right_until_release:
-                        if right:
-                            right = 0
-                        else:
-                            suppress_right_until_release = False
-                    chord = bool(left and right)
-
-                    # Press-start capture (leading edges).
-                    if left and not prev_left:
-                        left_press_time = time.monotonic()
-                        left_used_in_chord = False
-                    if right and not prev_right:
-                        right_press_time = time.monotonic()
-                        right_used_in_chord = False
-                    # If the second button joins while the first is held, the first
-                    # is part of a chord, not a solo tap/long-press.
-                    if right and not prev_right and left:
-                        left_used_in_chord = True
-                    if left and not prev_left and right:
-                        right_used_in_chord = True
-
-                    # Long-press (fires while held) -> take over (TELEOP).
-                    if (left and left_press_time is not None and not left_used_in_chord
-                            and time.monotonic() - left_press_time >= long_press_s):
-                        _enter_teleop()
-                        suppress_left_until_release = True
-                        left_press_time = None
-                    if (right and right_press_time is not None and not right_used_in_chord
-                            and time.monotonic() - right_press_time >= long_press_s):
-                        _enter_teleop()
-                        suppress_right_until_release = True
-                        right_press_time = None
-
-                    # Chord rising edge -> toggle gripper (TELEOP only).
-                    if chord and not prev_chord:
-                        left_used_in_chord = True
-                        right_used_in_chord = True
-                        if mode == TELEOP:
-                            _toggle_gripper_teleop()
-                        else:
-                            logger.info("  (chord ignored — gripper toggles in TELEOP only)")
-
-                    # Tap on release -> condition + enter INFERENCE.
-                    if (not left) and prev_left:
-                        if not left_used_in_chord and left_press_time is not None:
-                            _enter_inference(0, "grasp")
-                        left_press_time = None
-                        left_used_in_chord = False
-                    if (not right) and prev_right:
-                        if not right_used_in_chord and right_press_time is not None:
-                            _enter_inference(1, "place")
-                        right_press_time = None
-                        right_used_in_chord = False
-
-                    prev_left = left
-                    prev_right = right
-                    prev_chord = chord
+            _poll_buttons()
 
             now = time.monotonic()
             if now - last_viz_update >= viz_dt:
                 _update_visualizer_robot_state(visualizer, robot.latest_state)
                 last_viz_update = now
 
-            # ---------- TELEOP branch: SpaceMouse drives the arm directly ----------
+            # ---------- TELEOP branch ----------
             if mode == TELEOP:
                 state = robot.latest_state
                 if state is None:
@@ -1537,228 +1258,153 @@ def main(cfg: DictConfig) -> int:
                     next_tick = time.monotonic()
                 continue
 
-            if active_plan is None and not waiting_for_plan:
-                request_event.set()
-                waiting_for_plan = True
+            # ---------- INFERENCE branch: sequential cycle ----------
+            # Flow each outer-loop iteration: capture obs → run inference (blocks,
+            # impedance controller holds last ref) → execute plan → hold final
+            # pose → loop back to obs capture.
 
-            # ---------- adopt latest completed plan ----------
-            current_epoch = stage_state["epoch"]
-            plan = latest_plan.latest_after(consumed_sequence)
-            if plan is not None and active_plan is None:
-                consumed_sequence = plan.sequence
-                if plan.stage_idx == stage_idx and plan.epoch == current_epoch:
-                    state = robot.latest_state
-                    if state is None:
-                        state = rate.time_call("state_wait", robot.wait_for_state, 1.0)
-                    ee_pos, ee_rot, _O_T_EE = _read_ee_pose_from_state(state)
-                    min_dist = float(np.min(
-                        np.linalg.norm(plan.trajectory[:, :3] - ee_pos[None, :], axis=1)
-                    ))
-                    if min_dist > plan_hard_skip_m:
-                        visualizer.update_plan_waypoints(plan.trajectory, 0)
-                        logger.info(
-                            "  skipping plan %d: nearest waypoint %.1f cm from EE; "
-                            "ee=%s first=%s last=%s",
-                            plan.sequence,
-                            min_dist * 100.0,
-                            np.array2string(ee_pos, precision=3),
-                            np.array2string(plan.trajectory[0, :3], precision=3),
-                            np.array2string(plan.trajectory[-1, :3], precision=3),
-                        )
-                        request_event.set()
-                    else:
-                        active_plan = plan
-                        waiting_for_plan = False
-                        # Fresh integral state per plan — the steady-state offset
-                        # is configuration-dependent, so carrying it across plans
-                        # would inject a stale correction at the next endpoint.
-                        pos_err_int = np.zeros(3, dtype=np.float64)
-                        rot_err_int = np.zeros(3, dtype=np.float64)
-                        adopted_at = time.monotonic()
-                        active_index = _plan_start_index(
-                            plan,
-                            ee_pos,
-                            plan_dt,
-                            adopted_at,
-                        )
-                        active_plan_index_offset = active_index
-                        # Compute current EE euler so the trajectory can prepend
-                        # the live pose at t=0 (smooth handoff — bridges from
-                        # current EE → plan[start_index] at max_linear_vel
-                        # instead of stepping the impedance target by a sudden
-                        # 20+ cm and tripping the joint torque reflex).
-                        from clear_franka.diffuser_actor_io import ee_rot_to_euler_xyz
-                        ee_euler = ee_rot_to_euler_xyz(ee_rot)
-                        active_cartesian_trajectory = _make_cartesian_trajectory_for_plan(
-                            plan,
-                            active_index,
-                            plan_dt,
-                            euler_xyz_to_matrix,
-                            max_linear_vel=plan_max_linear_vel_m_s,
-                            max_angular_vel=plan_max_angular_vel_rad_s,
-                            min_segment_dt=execution_dt,
-                            current_ee_pos=ee_pos,
-                            current_ee_euler=ee_euler,
-                        )
-                        active_plan_started_at = adopted_at
-                        visualizer.update_plan_waypoints(plan.trajectory, active_index)
-                        visualizer.update_interpolated_plan_path(
-                            _sample_cartesian_trajectory_positions(
-                                active_cartesian_trajectory,
-                                execution_dt,
-                            )
-                        )
-                        logger.info(
-                            "  adopted plan %d idx=%d/%d age=%.0fms infer=%.0fms",
-                            plan.sequence,
-                            active_index,
-                            len(plan.trajectory),
-                            (time.monotonic() - plan.created_at) * 1000.0,
-                            (plan.created_at - plan.obs_started_at) * 1000.0,
-                        )
-                else:
-                    request_event.set()
+            # 1. Capture observation from current settled EE pose
+            from clear_franka.diffuser_actor_io import ee_rot_to_euler_xyz
+            obs_started_at = time.monotonic()
+            state = robot.latest_state
+            if state is None:
+                state = robot.wait_for_state(timeout=1.0)
+            ee_pos, ee_rot, _O_T_EE = _read_ee_pose_from_state(state)
+            T_g2b = _make_T_gripper_to_base(ee_pos, ee_rot)
 
-            # ---------- catchup hold: let the controller converge before replan ----------
-            # Both terminal conditions (streamed-to-end and mid-stream timeout)
-            # funnel here: we freeze the reference at the pose we were last
-            # tracking and re-command it until the EE catches up (position AND
-            # rotation error within tolerance) or the plan_catchup_ticks cap is
-            # hit, then request the next plan — so the next observation is captured
-            # from a settled pose and tracking error doesn't accumulate across plan
-            # boundaries. With plan_catchup_ticks=0 this is a single tick (≈ the
-            # original immediate-replan behavior).
-            if active_plan is not None and catchup_remaining >= 0:
-                state = robot.latest_state
-                if state is None:
-                    state = rate.time_call("state_wait", robot.wait_for_state, 1.0)
-                ee_pos, _ee_rot, _O_T_EE = _read_ee_pose_from_state(state)
-                tracker.set_cartesian_reference(
-                    Affine(pack_Rp(catchup_target_rot, catchup_target_pos))
-                )
-                if deploy_trace is not None:
-                    deploy_trace.record_error(
-                        t=time.monotonic(),
-                        plan_sequence=active_plan.sequence,
-                        active_index=active_index,
-                        target_pos=catchup_target_pos,
-                        target_rot=catchup_target_rot,
-                        measured_pos=ee_pos,
-                        measured_rot=_ee_rot,
+            hand_frame = cam_hand.grab_frame()
+            tp_frame = cam_tp.grab_frame()
+            if hand_frame is None or tp_frame is None:
+                logger.warning("Camera grab failed — retrying")
+                time.sleep(0.1)
+                continue
+            rgb_hand_full, depth_hand_full = hand_frame
+            rgb_tp_full, depth_tp_full = tp_frame
+            rgb_hand_200, pcd_hand_200 = pre_hand.process(rgb_hand_full, depth_hand_full, T_g2b)
+            rgb_tp_200, pcd_tp_200 = pre_tp.process(rgb_tp_full, depth_tp_full)
+            ee_euler = ee_rot_to_euler_xyz(ee_rot)
+
+            obs = _build_observation(
+                rgb_tp_200, pcd_tp_200,
+                rgb_hand_200, pcd_hand_200,
+                ee_pos, ee_rot, stage_state["gripper_cmd"],
+            )
+
+            # 2. Run inference (blocking; impedance controller holds last ref)
+            _stage_idx = stage_state["idx"]
+            active_steering = (
+                steering
+                if (steering is not None and _stage_idx in steer_stage_indices)
+                else None
+            )
+            logger.info("  plan %d: running inference from ee=%s",
+                        infer_sequence, np.array2string(ee_pos, precision=3))
+            forward_started_at = time.monotonic()
+            action = policy.forward(obs, steering=active_steering)
+            forward_s = time.monotonic() - forward_started_at
+
+            trajectory = np.asarray(action.trajectory, dtype=np.float64).copy()
+            horizon = trajectory.shape[0]
+            gripper_plan_raw = _extract_gripper_plan(action, horizon)
+            gripper_plan = gripper_plan_raw
+
+            if outlier_filter_enabled and trajectory.shape[1] >= 6:
+                pos_filt, eul_filt, grip_filt, patched_idx, patched_pos_devs = (
+                    _filter_outlier_waypoints(
+                        trajectory[:, :3], trajectory[:, 3:6],
+                        gripper_plan_raw,
+                        pos_thresh_m=outlier_pos_thresh_m,
+                        eul_thresh_rad=outlier_eul_thresh_rad,
                     )
-                # Caught up when BOTH position and rotation errors are within
-                # tolerance; otherwise keep holding until the catchup_ticks cap.
-                pos_err = float(np.linalg.norm(catchup_target_pos - ee_pos))
-                R_err = catchup_target_rot @ _ee_rot.T
-                rot_err = float(np.arccos(
-                    np.clip((np.trace(R_err) - 1.0) / 2.0, -1.0, 1.0)
-                ))
-                converged = pos_err <= catchup_pos_tol_m and rot_err <= catchup_rot_tol_rad
-                catchup_remaining -= 1
-                if converged or catchup_remaining < 0:
-                    logger.info(
-                        "  plan %d catchup %s (pos=%.1fmm rot=%.1f°); requesting next plan",
-                        active_plan.sequence,
-                        "converged" if converged else "cap reached",
-                        pos_err * 1000.0, np.degrees(rot_err),
-                    )
-                    visualizer.clear_plan_waypoints()
-                    active_plan = None
-                    active_cartesian_trajectory = None
-                    active_plan_index_offset = 0
-                    active_plan_started_at = 0.0
-                    request_event.set()
-                    waiting_for_plan = True
-
-            # ---------- execute the active plan suffix ----------
-            elif active_plan is not None and active_index < len(active_plan.trajectory):
-                state = robot.latest_state
-                if state is None:
-                    state = rate.time_call("state_wait", robot.wait_for_state, 1.0)
-                ee_pos, _ee_rot, _O_T_EE = _read_ee_pose_from_state(state)
-                assert active_cartesian_trajectory is not None
-
-                elapsed = time.monotonic() - active_plan_started_at
-                local_index = active_cartesian_trajectory.waypoint_index_at(elapsed)
-                active_index = min(
-                    active_plan_index_offset + local_index,
-                    len(active_plan.trajectory) - 1,
                 )
+                if patched_idx:
+                    trajectory[:, :3] = pos_filt
+                    trajectory[:, 3:6] = eul_filt
+                    if trajectory.shape[1] >= 7:
+                        trajectory[:, 6] = grip_filt
+                    gripper_plan = grip_filt
+                    logger.warning(
+                        "  plan %d OUTLIER-FILTER: patched %d waypoint(s) at indices=%s "
+                        "(pos devs=%s)",
+                        infer_sequence, len(patched_idx), patched_idx,
+                        ["%.3f" % d for d in patched_pos_devs],
+                    )
+
+            plan = InferencePlan(
+                sequence=infer_sequence,
+                stage_idx=_stage_idx,
+                epoch=stage_state["epoch"],
+                created_at=time.monotonic(),
+                obs_started_at=obs_started_at,
+                trajectory=trajectory,
+                gripper=gripper_plan,
+                ee_pos_at_obs=ee_pos.astype(np.float64).copy(),
+                ee_euler_at_obs=np.asarray(ee_euler, dtype=np.float64).copy(),
+            )
+            if deploy_trace is not None:
+                deploy_trace.record_plan(plan)
+            logger.info(
+                "  plan %d horizon=%d forward=%.2fs total=%.2fs first=%s last=%s",
+                plan.sequence, horizon, forward_s,
+                plan.created_at - obs_started_at,
+                np.array2string(plan.trajectory[0, :3], precision=3),
+                np.array2string(plan.trajectory[-1, :3], precision=3),
+            )
+            _log_plan_diagnostics(
+                plan, workspace_lo_np, workspace_hi_np, policy_loc_bounds, policy_relative,
+            )
+
+            # 3. Build retimed Cartesian trajectory starting from index 0.
+            #    Prepend current EE as bridge so the first commanded target equals
+            #    the current pose (no sudden jump to plan[0]).
+            active_cartesian_trajectory = _make_cartesian_trajectory_for_plan(
+                plan, 0, plan_dt, euler_xyz_to_matrix,
+                max_linear_vel=plan_max_linear_vel_m_s,
+                max_angular_vel=plan_max_angular_vel_rad_s,
+                min_segment_dt=execution_dt,
+                current_ee_pos=ee_pos,
+                current_ee_euler=ee_euler,
+            )
+            visualizer.update_plan_waypoints(plan.trajectory, 0)
+            visualizer.update_interpolated_plan_path(
+                _sample_cartesian_trajectory_positions(active_cartesian_trajectory, execution_dt)
+            )
+            logger.info(
+                "  plan %d executing (retimed duration=%.2fs)",
+                plan.sequence, active_cartesian_trajectory.duration,
+            )
+
+            # 4. Execute plan: stream interpolated Cartesian references at execution_hz.
+            plan_started_at = time.monotonic()
+            next_tick = plan_started_at
+            plan_active_index = 0
+
+            while not stop_event.is_set():
+                _poll_buttons()
+                if mode == TELEOP:
+                    break
+
+                elapsed = time.monotonic() - plan_started_at
+                if elapsed >= active_cartesian_trajectory.duration:
+                    break
+
                 target_xyz, target_rot = active_cartesian_trajectory.interpolate(elapsed)
-                # Past the trajectory duration the reference pose is clamped at the
-                # final waypoint, so the feedforward velocity must be zero. (velocity()
-                # returns the last segment's nonzero slope for a degree-1 spline, which
-                # would otherwise drive the EE past the endpoint during the hold.)
-                at_terminal_hold = elapsed >= active_cartesian_trajectory.duration
-                if at_terminal_hold:
-                    ref_lin_vel = np.zeros(3, dtype=np.float64)
-                    ref_ang_vel = np.zeros(3, dtype=np.float64)
-                else:
-                    ref_lin_vel, ref_ang_vel = active_cartesian_trajectory.velocity(elapsed)
-                visualizer.update_plan_waypoints(active_plan.trajectory, active_index)
-
-                # Optional safety clip — keep targets inside the recorded workspace.
-                lo = np.array(cfg.deploy.workspace_lo, dtype=np.float64)
-                hi = np.array(cfg.deploy.workspace_hi, dtype=np.float64)
-                target_xyz = np.clip(target_xyz, lo, hi)
-
-                # ----- host-side integral term on the Cartesian tracking error -----
-                # The impedance controller is a pure proportional spring, so the EE
-                # settles to target - residual/stiffness and never reaches the final
-                # waypoint. Accumulate the (planned target - measured) error during
-                # the *terminal hold* (elapsed >= duration; the reference is clamped
-                # at the final waypoint) and ramp the commanded setpoint along it
-                # until the residual is cancelled. Gating on the terminal hold avoids
-                # winding up against the deliberate velocity lag during transit.
-                # target_xyz / target_rot are left untouched so the tracking-error
-                # readout below still reports the true plan-tracking error.
-                pos_err = target_xyz - ee_pos
-                rot_err_vec = Rotation.from_matrix(target_rot @ _ee_rot.T).as_rotvec()
-                if integral_enabled and at_terminal_hold:
-                    if np.linalg.norm(pos_err) > integral_deadband_pos_m:
-                        pos_err_int = pos_err_int + pos_err * execution_dt
-                        if integral_gain_pos > 0.0:
-                            lim = integral_max_pos_m / integral_gain_pos
-                            pos_err_int = np.clip(pos_err_int, -lim, lim)
-                    if np.linalg.norm(rot_err_vec) > integral_deadband_rot_rad:
-                        rot_err_int = rot_err_int + rot_err_vec * execution_dt
-                        if integral_gain_rot > 0.0:
-                            lim = integral_max_rot_rad / integral_gain_rot
-                            rot_err_int = np.clip(rot_err_int, -lim, lim)
-                pos_corr = integral_gain_pos * pos_err_int
-                rot_corr = integral_gain_rot * rot_err_int
-                cmd_xyz = np.clip(target_xyz + pos_corr, lo, hi)
-                cmd_rot = Rotation.from_rotvec(rot_corr).as_matrix() @ target_rot
+                target_xyz = np.clip(target_xyz, workspace_lo_np, workspace_hi_np)
 
                 if velocity_feedforward:
+                    ref_lin_vel, ref_ang_vel = active_cartesian_trajectory.velocity(elapsed)
                     tracker.set_cartesian_reference(
-                        Affine(pack_Rp(cmd_rot, cmd_xyz)),
+                        Affine(pack_Rp(target_rot, target_xyz)),
                         Twist(ref_lin_vel, ref_ang_vel),
                     )
                 else:
-                    tracker.set_cartesian_reference(Affine(pack_Rp(cmd_rot, cmd_xyz)))
+                    tracker.set_cartesian_reference(Affine(pack_Rp(target_rot, target_xyz)))
 
-                # Live Cartesian tracking error: commanded reference (the
-                # clipped target actually sent to the impedance controller)
-                # vs. measured EE pose. Same quantities the deploy trace logs.
-                pos_err_vec = target_xyz - ee_pos
-                R_err = target_rot @ _ee_rot.T
-                cos_angle = (np.trace(R_err) - 1.0) / 2.0
-                rot_err_rad = float(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
-                visualizer.update_tracking_error(pos_err_vec, rot_err_rad)
-
-                if deploy_trace is not None:
-                    deploy_trace.record_error(
-                        t=time.monotonic(),
-                        plan_sequence=active_plan.sequence,
-                        active_index=active_index,
-                        target_pos=target_xyz,
-                        target_rot=target_rot,
-                        measured_pos=ee_pos,
-                        measured_rot=_ee_rot,
-                    )
-
-                cmd_state = 1.0 if active_plan.gripper[active_index] >= 0.5 else 0.0
+                plan_active_index = min(
+                    active_cartesian_trajectory.waypoint_index_at(elapsed),
+                    horizon - 1,
+                )
+                cmd_state = 1.0 if plan.gripper[plan_active_index] >= 0.5 else 0.0
                 if gripper is not None and cmd_state != stage_state["gripper_cmd"]:
                     width = (cfg.gripper.open_width_m if cmd_state == 1.0
                              else cfg.gripper.close_width_m)
@@ -1767,59 +1413,77 @@ def main(cfg: DictConfig) -> int:
                     visualizer.update_gripper_width(width, max_width_m=cfg.gripper.max_width_m)
                     stage_state["gripper_cmd"] = cmd_state
 
-                final_dist = float(np.linalg.norm(
-                    active_plan.trajectory[-1, :3] - ee_pos
-                ))
-                active_plan_timeout_s = max(
-                    plan_timeout_s,
-                    active_cartesian_trajectory.duration + plan_timeout_grace_s,
-                )
-                streamed_to_end = active_index >= len(active_plan.trajectory) - 1
-                timed_out = (
-                    time.monotonic() - active_plan_started_at > active_plan_timeout_s
-                )
-
-                # Either terminal condition freezes the current reference and
-                # hands off to the catchup hold above, which counts down and then
-                # requests the replacement plan. streamed_to_end is reached at the
-                # trajectory's scheduled duration (well before active_plan_timeout_s),
-                # so in normal operation we always finish via the streamed-to-end
-                # path; the timeout is the safety net for a stalled loop.
-                if streamed_to_end or timed_out:
-                    catchup_target_pos = np.asarray(target_xyz, dtype=np.float64).copy()
-                    catchup_target_rot = np.asarray(target_rot, dtype=np.float64).copy()
-                    catchup_remaining = plan_catchup_ticks
-                    if streamed_to_end:
-                        logger.info(
-                            "  plan %d streamed to end at idx=%d/%d (err=%.1fmm); "
-                            "catchup hold %d ticks",
-                            active_plan.sequence, active_index,
-                            len(active_plan.trajectory), final_dist * 1000.0,
-                            plan_catchup_ticks,
-                        )
-                    else:
-                        logger.info(
-                            "  plan %d timed out after %.1fs at idx=%d/%d; "
-                            "catchup hold %d ticks then replace",
-                            active_plan.sequence, active_plan_timeout_s,
-                            active_index, len(active_plan.trajectory),
-                            plan_catchup_ticks,
+                meas_state = robot.latest_state
+                if meas_state is not None:
+                    ee_pos_m, ee_rot_m, _ = _read_ee_pose_from_state(meas_state)
+                    pos_err_vec = target_xyz - ee_pos_m
+                    R_err = target_rot @ ee_rot_m.T
+                    rot_err_rad = float(np.arccos(np.clip(
+                        (np.trace(R_err) - 1.0) / 2.0, -1.0, 1.0
+                    )))
+                    visualizer.update_tracking_error(pos_err_vec, rot_err_rad)
+                    if deploy_trace is not None:
+                        deploy_trace.record_error(
+                            t=time.monotonic(),
+                            plan_sequence=plan.sequence,
+                            active_index=plan_active_index,
+                            target_pos=target_xyz,
+                            target_rot=target_rot,
+                            measured_pos=ee_pos_m,
+                            measured_rot=ee_rot_m,
                         )
 
-            elif active_plan is not None:
-                visualizer.clear_plan_waypoints()
-                active_plan = None
-                active_cartesian_trajectory = None
-                active_plan_index_offset = 0
+                visualizer.update_plan_waypoints(plan.trajectory, plan_active_index)
+                _record_tick(enabled=True)
 
-            _record_tick(enabled=active_plan is not None)
+                next_tick += execution_dt
+                sleep_time = next_tick - time.monotonic()
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                else:
+                    next_tick = time.monotonic()
+
+            visualizer.clear_plan_waypoints()
+            if mode == TELEOP or stop_event.is_set():
+                _record_tick(enabled=False)
+                rate.finish_tick()
+                continue
+
+            logger.info(
+                "  plan %d complete (idx=%d/%d); holding %.2fs",
+                plan.sequence, plan_active_index, horizon, hold_s,
+            )
+
+            # 5. Hold final pose for hold_s seconds so the arm settles before the
+            #    next observation capture.
+            final_xyz, final_rot = active_cartesian_trajectory.interpolate(
+                active_cartesian_trajectory.duration
+            )
+            final_xyz = np.clip(final_xyz, workspace_lo_np, workspace_hi_np)
+            hold_end = time.monotonic() + hold_s
+            next_tick = time.monotonic()
+
+            while not stop_event.is_set() and time.monotonic() < hold_end:
+                _poll_buttons()
+                if mode == TELEOP:
+                    break
+                tracker.set_cartesian_reference(Affine(pack_Rp(final_rot, final_xyz)))
+                _record_tick(enabled=True)
+                next_tick += execution_dt
+                sleep_time = next_tick - time.monotonic()
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                else:
+                    next_tick = time.monotonic()
+
+            if mode == TELEOP or stop_event.is_set():
+                _record_tick(enabled=False)
+                rate.finish_tick()
+                continue
+
+            infer_sequence += 1
             rate.finish_tick()
-            next_tick += execution_dt
-            sleep_time = next_tick - time.monotonic()
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-            else:
-                next_tick = time.monotonic()
+            # Outer loop continues → mode == INFERENCE → capture obs → next cycle
 
     return 0
 

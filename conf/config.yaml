@@ -341,6 +341,10 @@ deploy:
   # execution. Temporary mitigation for cross-modal gripper-coupled teleports
   # and single-index diffusion spikes; can be disabled once the model is
   # retrained without those pathologies.
+  # How long to hold the final pose before capturing obs for the next inference.
+  # Gives the arm time to settle. 0.0 to skip the hold.
+  hold_s: 0.5
+
   outlier_filter:
     enabled: true
     pos_thresh_m: 0.05
