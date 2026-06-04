@@ -151,6 +151,23 @@ deploy:
   # 7-vector or null. Prefer setting home_config inside the policy yaml so it
   # travels with the trained policy; use this only for a per-run override.
   home_config: null
+  # ---- Tracker selection -------------------------------------------------------
+  # cartesian: stream the policy's EE waypoints to a Cartesian impedance controller
+  #            (rotational_stiffness below is low, so orientation tracks loosely).
+  # joint:     run IK per plan (clear_franka/cartesian_to_joint_ik.py) and stream
+  #            joint references to a high-stiffness joint impedance controller for
+  #            much tighter pose tracking. Requires the `ik` extra (jax + pyroki);
+  #            launch the deploy process with JAX_PLATFORMS=cpu.
+  tracker: cartesian                              # cartesian | joint
+  joint_stiffness: [320.0, 320.0, 320.0, 320.0, 120.0, 120.0, 30.0]  # per-joint (joint tracker); reuses the proven replay value.
+  joint_period: 0.001                             # joint impedance control period (s).
+  ik:
+    num_seeds: 4                                  # IK random restarts per waypoint (in addition to the chained seed).
+    max_iterations: 30                            # Levenberg-Marquardt iterations per solve.
+    cost_threshold: 1.0e-3                         # waypoints with final IK cost above this are treated as unreachable; the plan is truncated there. Calibrate from the FK round-trip test (reachable cost ~0).
+  joint_retime:                                   # per-joint velocity / acceleration limits for the joint-space TOPPRA retime. Tune on-robot via replay first.
+    max_joint_vel:   [0.5, 0.5, 0.5, 0.5, 1.0, 1.0, 1.0]    # rad/s (~15-25% of FR3 hardware max).
+    max_joint_accel: [3.0, 3.0, 3.0, 3.0, 4.0, 4.0, 4.0]    # rad/s^2.
   control_hz: 10                                  # Nominal DiffuserActor waypoint rate used to interpret action horizon timing.
   execution_hz: 100                              # Cartesian reference streaming rate; samples the retimed interpolation.
   record_trajectory: true                       # If true, log the executed session to data_dir/episode_*.h5 (same format as mode=replay), replayable via main.py mode=replay.

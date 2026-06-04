@@ -426,6 +426,91 @@ def _make_cartesian_trajectory_for_plan(
     )
 
 
+def _make_joint_trajectory_for_plan(
+    plan: InferencePlan,
+    start_index: int,
+    plan_dt: float,
+    ik,
+    euler_to_matrix_fn,
+    *,
+    current_q: np.ndarray,
+    max_joint_vel: np.ndarray,
+    max_joint_accel: np.ndarray,
+    lower_limits: np.ndarray,
+    upper_limits: np.ndarray,
+    cost_threshold: float,
+):
+    """Convert the plan suffix into a retimed joint-space trajectory via IK.
+
+    The joint-tracker analogue of :func:`_make_cartesian_trajectory_for_plan`.
+    Each Cartesian waypoint (EE pose in the ``fr3_link0`` frame) is solved to a
+    joint config with seed chaining (``ik.solve_chained``) so the redundant arm
+    stays on one IK branch. The measured ``current_q`` is prepended as the bridge
+    waypoint so the executor's first ``set_joint_reference`` equals the current
+    configuration (no jump), then the path is retimed in joint space under
+    per-joint velocity/acceleration limits.
+
+    Returns ``(Trajectory, gripper_index_map)`` where ``gripper_index_map[k]`` is
+    the original-plan gripper index for joint-trajectory waypoint ``k`` (the bridge
+    is k=0). Returns ``(None, None)`` when no waypoint is reachable, signalling the
+    caller to hold the current config and replan.
+    """
+    from clear_franka.joint_trajectory import Trajectory
+
+    suffix = plan.trajectory[start_index:, :6]
+    if len(suffix) == 0:
+        return None, None
+    pos = np.asarray(suffix[:, :3], dtype=np.float64)
+    rot = np.stack([euler_to_matrix_fn(e) for e in suffix[:, 3:6]], axis=0)
+
+    current_q = np.asarray(current_q, dtype=np.float64).reshape(7)
+    q_plan, cost = ik.solve_chained(pos, rot, current_q)
+
+    # Truncate at the first unreachable / out-of-limits waypoint. The remaining
+    # prefix is still safe to execute; the outer loop replans after the hold.
+    lower = np.asarray(lower_limits, dtype=np.float64)
+    upper = np.asarray(upper_limits, dtype=np.float64)
+    n_good = 0
+    for i in range(q_plan.shape[0]):
+        in_limits = bool(np.all(q_plan[i] >= lower) and np.all(q_plan[i] <= upper))
+        if cost[i] > cost_threshold or not in_limits:
+            logger.warning(
+                "  plan %d JOINT-IK: waypoint %d rejected (cost=%.3e thresh=%.3e "
+                "in_limits=%s) — truncating plan here",
+                plan.sequence, i, float(cost[i]), float(cost_threshold), in_limits,
+            )
+            break
+        n_good += 1
+
+    if n_good == 0:
+        logger.warning(
+            "  plan %d JOINT-IK: no reachable waypoint (first cost=%.3e) — holding & replanning",
+            plan.sequence, float(cost[0]) if cost.size else float("nan"),
+        )
+        return None, None
+
+    q_good = q_plan[:n_good]
+    # Prepend the measured config as the bridge waypoint (zero round-trip error).
+    q_waypts = np.vstack([current_q[None, :], q_good])
+    # gripper map: bridge (k=0) holds the gripper state of plan[start_index]; each
+    # subsequent waypoint k maps to original plan index start_index + (k-1).
+    gripper_map = np.concatenate([
+        [start_index],
+        start_index + np.arange(n_good),
+    ]).astype(int)
+
+    if len(q_waypts) == 1:  # defensive; n_good>=1 guarantees >=2, but keep parity
+        q_waypts = np.vstack([q_waypts, q_waypts])
+        gripper_map = np.concatenate([gripper_map, gripper_map[-1:]])
+    times = np.arange(len(q_waypts), dtype=np.float64) * float(plan_dt)
+
+    trajectory = Trajectory(q_waypts, times)
+    # sample_uniform=False preserves the waypoint count (and thus the gripper_map
+    # alignment) while assigning velocity/accel-feasible timestamps.
+    retimed = trajectory.retime(max_joint_vel, max_joint_accel, sample_uniform=False)
+    return retimed, gripper_map
+
+
 def _sample_cartesian_trajectory_positions(
     trajectory,
     dt: float,
@@ -1021,21 +1106,52 @@ def main(cfg: DictConfig) -> int:
             "max_torque=%.1f buffer=%.2frad",
             jl_act, jl_stf, jl_dmp, jl_tmx, jl_buf,
         )
-        tracker = stack.enter_context(robot.start_cartesian_impedance_session(
-            period=0.001,
-            translational_stiffness=cfg.deploy.translational_stiffness,
-            rotational_stiffness=cfg.deploy.rotational_stiffness,
-            nullspace_tasks=[
-                PostureTask(_ns_target, stiffness=cfg.deploy.nullspace_stiffness),
-                ManipulabilityTask(gain=5.0, max_torque=1.0),
-            ],
-            lower_joint_limits=_lower_lim,
-            upper_joint_limits=_upper_lim,
-            joint_limit_activation_distance=jl_act,
-            joint_limit_stiffness=jl_stf,
-            joint_limit_damping=jl_dmp,
-            joint_limit_max_torque=jl_tmx,
-        ))
+        # Tracker selection. The diffusion policy emits Cartesian EE waypoints;
+        # `cartesian` streams them to a Cartesian impedance controller (low
+        # rotational stiffness → loose orientation tracking), while `joint` runs
+        # IK per plan and streams joint references to a high-stiffness joint
+        # impedance controller for tighter pose tracking (see cartesian_to_joint_ik).
+        tracker_mode = str(cfg.deploy.get("tracker", "cartesian")).lower()
+        if tracker_mode not in {"cartesian", "joint"}:
+            raise ValueError(f"deploy.tracker must be 'cartesian' or 'joint', got {tracker_mode!r}")
+        ik = None
+        if tracker_mode == "cartesian":
+            tracker = stack.enter_context(robot.start_cartesian_impedance_session(
+                period=0.001,
+                translational_stiffness=cfg.deploy.translational_stiffness,
+                rotational_stiffness=cfg.deploy.rotational_stiffness,
+                nullspace_tasks=[
+                    PostureTask(_ns_target, stiffness=cfg.deploy.nullspace_stiffness),
+                    ManipulabilityTask(gain=5.0, max_torque=1.0),
+                ],
+                lower_joint_limits=_lower_lim,
+                upper_joint_limits=_upper_lim,
+                joint_limit_activation_distance=jl_act,
+                joint_limit_stiffness=jl_stf,
+                joint_limit_damping=jl_dmp,
+                joint_limit_max_torque=jl_tmx,
+            ))
+        else:
+            joint_stiffness = list(
+                cfg.deploy.get("joint_stiffness", [320.0, 320.0, 320.0, 320.0, 120.0, 120.0, 30.0])
+            )
+            if len(joint_stiffness) != 7:
+                raise ValueError(f"deploy.joint_stiffness must have 7 entries, got {joint_stiffness}")
+            tracker = stack.enter_context(robot.start_joint_impedance_session(
+                period=float(cfg.deploy.get("joint_period", 0.001)),
+                stiffness=joint_stiffness,
+                lower_joint_limits=_lower_lim,
+                upper_joint_limits=_upper_lim,
+            ))
+            from clear_franka.cartesian_to_joint_ik import CortadoIK
+            _ik_cfg = cfg.deploy.get("ik", {})
+            logger.info("Joint tracker: stiffness=%s; building IK + warming up JIT...", joint_stiffness)
+            ik = CortadoIK(
+                max_iterations=int(_ik_cfg.get("max_iterations", 30)),
+                num_seeds=int(_ik_cfg.get("num_seeds", 4)),
+            )
+            ik.warmup(reset_joint_config)
+            logger.info("Joint tracker IK ready.")
         robot.start_state_stream(timeout_ms=250)
         stack.callback(robot.stop_state_stream)
         if recorder is not None:
@@ -1067,6 +1183,9 @@ def main(cfg: DictConfig) -> int:
         suppress_right_until_release = False
         sample = None
         active_cartesian_trajectory = None
+        active_joint_trajectory = None
+        active_gripper_map = None
+        _teleop_joint_warned = [False]
         next_tick = time.monotonic()
         last_viz_update = 0.0
         viz_dt = 1.0 / 5.0
@@ -1089,11 +1208,27 @@ def main(cfg: DictConfig) -> int:
         # How long to hold the final pose (impedance controller re-commanded at
         # the last waypoint) before capturing the next observation for inference.
         hold_s = float(cfg.deploy.get("hold_s", 0.5))
+
+        # Joint-tracker per-plan params (only used when tracker_mode == "joint").
+        _jr_cfg = cfg.deploy.get("joint_retime", {})
+        joint_max_vel = np.asarray(
+            _jr_cfg.get("max_joint_vel", [0.5, 0.5, 0.5, 0.5, 1.0, 1.0, 1.0]), dtype=np.float64
+        )
+        joint_max_accel = np.asarray(
+            _jr_cfg.get("max_joint_accel", [3.0, 3.0, 3.0, 3.0, 4.0, 4.0, 4.0]), dtype=np.float64
+        )
+        ik_cost_threshold = float(cfg.deploy.get("ik", {}).get("cost_threshold", 1e-3))
+        # Buffered joint limits handed to the IK reachability/limit check (same
+        # buffer the impedance soft-stop uses, so IK never proposes a config the
+        # controller would then fight at its limit).
+        _ik_lower = np.asarray(_lower_lim, dtype=np.float64)
+        _ik_upper = np.asarray(_upper_lim, dtype=np.float64)
         infer_sequence = 0
 
         # ----- mode transitions -----
         def _enter_inference(prim: int, label: str) -> None:
             nonlocal mode, stage_idx, active_cartesian_trajectory, infer_sequence
+            nonlocal active_joint_trajectory, active_gripper_map
             transitioning = mode == INFERENCE and stage_idx != prim
             mode = INFERENCE
             # Don't clear active_cartesian_trajectory here when transitioning
@@ -1101,6 +1236,8 @@ def main(cfg: DictConfig) -> int:
             # cleanly. Only clear it on a fresh entry from TELEOP.
             if not transitioning:
                 active_cartesian_trajectory = None
+                active_joint_trajectory = None
+                active_gripper_map = None
             visualizer.clear_plan_waypoints()
             policy.set_primitive(prim)
             policy.set_object(0)
@@ -1113,11 +1250,14 @@ def main(cfg: DictConfig) -> int:
 
         def _enter_teleop() -> None:
             nonlocal mode, active_cartesian_trajectory
+            nonlocal active_joint_trajectory, active_gripper_map
             if mode == TELEOP:
                 return
             mode = TELEOP
             stage_state["epoch"] += 1
             active_cartesian_trajectory = None
+            active_joint_trajectory = None
+            active_gripper_map = None
             visualizer.clear_plan_waypoints()
             logger.info("[TELEOP] take over — jog; tap L=grasp R=place, chord=gripper")
 
@@ -1245,7 +1385,17 @@ def main(cfg: DictConfig) -> int:
                 if state is None:
                     state = rate.time_call("state_wait", robot.wait_for_state, 1.0)
                 ee_pos, ee_rot, _O_T_EE = _read_ee_pose_from_state(state)
-                if mouse is not None and sample is not None:
+                if tracker_mode != "cartesian":
+                    # The joint impedance session has no Cartesian reference; mouse
+                    # jogging is unsupported. The controller holds the last joint
+                    # reference. Tap to re-enter inference.
+                    if not _teleop_joint_warned[0]:
+                        logger.warning(
+                            "[teleop] mouse jogging is disabled with tracker=joint "
+                            "(no Cartesian reference); arm holds. Tap to resume inference."
+                        )
+                        _teleop_joint_warned[0] = True
+                elif mouse is not None and sample is not None:
                     target_pos, target_rot, v_world, w_world = _teleop_target_from_sample(
                         sample, ee_pos, ee_rot, input_filter, global_frame, so3_exp
                     )
@@ -1364,35 +1514,111 @@ def main(cfg: DictConfig) -> int:
                 plan, workspace_lo_np, workspace_hi_np, policy_loc_bounds, policy_relative,
             )
 
-            # 3. Build retimed Cartesian trajectory starting from index 0.
-            #    Prepend current EE as bridge so the first commanded target equals
-            #    the current pose (no sudden jump to plan[0]).
-            active_cartesian_trajectory = _make_cartesian_trajectory_for_plan(
-                plan, 0, plan_dt, euler_xyz_to_matrix,
-                max_linear_vel=plan_max_linear_vel_m_s,
-                max_angular_vel=plan_max_angular_vel_rad_s,
-                min_segment_dt=execution_dt,
-                max_linear_accel=plan_max_linear_accel,
-                max_angular_accel=plan_max_angular_accel,
-                current_ee_pos=ee_pos,
-                current_ee_euler=ee_euler,
-            )
+            # 3. Build the retimed reference trajectory + per-tick command for the
+            #    selected tracker, starting from index 0. Both prepend the current
+            #    configuration as a bridge so the first command equals the current
+            #    state (no sudden jump to plan[0]). `_command(elapsed)` issues the
+            #    reference and returns (target EE xyz, target EE rot, plan index) for
+            #    the shared gripper / tracking-error / viz tail below.
+            if tracker_mode == "cartesian":
+                active_cartesian_trajectory = _make_cartesian_trajectory_for_plan(
+                    plan, 0, plan_dt, euler_xyz_to_matrix,
+                    max_linear_vel=plan_max_linear_vel_m_s,
+                    max_angular_vel=plan_max_angular_vel_rad_s,
+                    min_segment_dt=execution_dt,
+                    max_linear_accel=plan_max_linear_accel,
+                    max_angular_accel=plan_max_angular_accel,
+                    current_ee_pos=ee_pos,
+                    current_ee_euler=ee_euler,
+                )
+                _traj = active_cartesian_trajectory
+                plan_duration = _traj.duration
+                visualizer.update_interpolated_plan_path(
+                    _sample_cartesian_trajectory_positions(_traj, execution_dt)
+                )
+
+                def _command(elapsed):
+                    txyz, trot = _traj.interpolate(elapsed)
+                    txyz = np.clip(txyz, workspace_lo_np, workspace_hi_np)
+                    if velocity_feedforward:
+                        lv, av = _traj.velocity(elapsed)
+                        tracker.set_cartesian_reference(
+                            Affine(pack_Rp(trot, txyz)), Twist(lv, av)
+                        )
+                    else:
+                        tracker.set_cartesian_reference(Affine(pack_Rp(trot, txyz)))
+                    aidx = min(_traj.waypoint_index_at(elapsed), horizon - 1)
+                    return txyz, trot, aidx
+
+                def _final_command():
+                    fxyz, frot = _traj.interpolate(_traj.duration)
+                    fxyz = np.clip(fxyz, workspace_lo_np, workspace_hi_np)
+                    tracker.set_cartesian_reference(Affine(pack_Rp(frot, fxyz)))
+            else:
+                # Bridge from the *current* measured config (arm has been holding
+                # during the blocking inference, so read it fresh, not the obs-time
+                # state captured seconds ago).
+                _cur_state = robot.latest_state or state
+                _cur_q = np.asarray(_cur_state["q"], dtype=np.float64)
+                active_joint_trajectory, active_gripper_map = _make_joint_trajectory_for_plan(
+                    plan, 0, plan_dt, ik, euler_xyz_to_matrix,
+                    current_q=_cur_q,
+                    max_joint_vel=joint_max_vel,
+                    max_joint_accel=joint_max_accel,
+                    lower_limits=_ik_lower,
+                    upper_limits=_ik_upper,
+                    cost_threshold=ik_cost_threshold,
+                )
+                if active_joint_trajectory is None:
+                    # No reachable waypoint: hold the current config for hold_s and
+                    # replan from a fresh observation (IK couldn't realize the plan).
+                    _hold_q = _cur_q.reshape(7).tolist()
+                    _hold_end = time.monotonic() + hold_s
+                    while not stop_event.is_set() and time.monotonic() < _hold_end:
+                        _poll_buttons()
+                        if mode == TELEOP or stage_state["epoch"] != plan.epoch:
+                            break
+                        tracker.set_joint_reference(_hold_q)
+                        time.sleep(execution_dt)
+                    infer_sequence += 1
+                    rate.finish_tick()
+                    continue
+                _jt = active_joint_trajectory
+                _gmap = active_gripper_map
+                _jt_deriv = _jt._spline.derivative()
+                _jt_t0, _jt_t1 = float(_jt.waypts_time[0]), float(_jt.waypts_time[-1])
+                plan_duration = _jt_t1 - _jt_t0
+                _wp_pos, _ = ik.fk_ee(_jt.waypts)
+                visualizer.update_interpolated_plan_path(np.asarray(_wp_pos, dtype=np.float64))
+
+                def _command(elapsed):
+                    q = _jt.interpolate(elapsed).reshape(7)
+                    dq = np.asarray(
+                        _jt_deriv(np.clip(elapsed, _jt_t0, _jt_t1)), dtype=float
+                    ).reshape(7)
+                    tracker.set_joint_reference(q.tolist(), velocity=dq.tolist())
+                    txyz, trot = ik.fk_ee(q)  # commanded EE pose, for error/viz
+                    wp = _jt.waypoint_index_at(elapsed)
+                    aidx = min(int(_gmap[min(wp, len(_gmap) - 1)]), horizon - 1)
+                    return txyz, trot, aidx
+
+                def _final_command():
+                    qf = _jt.interpolate(_jt_t1).reshape(7)
+                    tracker.set_joint_reference(qf.tolist())
+
             visualizer.update_plan_waypoints(plan.trajectory, 0)
-            visualizer.update_interpolated_plan_path(
-                _sample_cartesian_trajectory_positions(active_cartesian_trajectory, execution_dt)
-            )
             logger.info(
-                "  plan %d executing (retimed duration=%.2fs)",
-                plan.sequence, active_cartesian_trajectory.duration,
+                "  plan %d executing (%s tracker, retimed duration=%.2fs)",
+                plan.sequence, tracker_mode, plan_duration,
             )
 
-            # 4. Execute plan: stream interpolated Cartesian references at execution_hz.
+            # 4. Execute plan: stream interpolated references at execution_hz.
             plan_started_at = time.monotonic()
             plan_epoch = plan.epoch
             # Safety timeout: if the plan takes more than 2× its trajectory
             # duration (e.g. due to a stalled or very long retime), abort and
             # replan. Grace factor accounts for slow segments at the start.
-            plan_timeout_s = active_cartesian_trajectory.duration * 2.0 + 2.0
+            plan_timeout_s = plan_duration * 2.0 + 2.0
             next_tick = plan_started_at
             plan_active_index = 0
             stage_transitioned = False
@@ -1413,31 +1639,17 @@ def main(cfg: DictConfig) -> int:
                     break
 
                 elapsed = time.monotonic() - plan_started_at
-                if elapsed >= active_cartesian_trajectory.duration:
+                if elapsed >= plan_duration:
                     break
                 if elapsed > plan_timeout_s:
                     logger.warning(
                         "  plan %d timed out after %.1fs (trajectory duration=%.1fs)",
-                        plan.sequence, elapsed, active_cartesian_trajectory.duration,
+                        plan.sequence, elapsed, plan_duration,
                     )
                     break
 
-                target_xyz, target_rot = active_cartesian_trajectory.interpolate(elapsed)
-                target_xyz = np.clip(target_xyz, workspace_lo_np, workspace_hi_np)
+                target_xyz, target_rot, plan_active_index = _command(elapsed)
 
-                if velocity_feedforward:
-                    ref_lin_vel, ref_ang_vel = active_cartesian_trajectory.velocity(elapsed)
-                    tracker.set_cartesian_reference(
-                        Affine(pack_Rp(target_rot, target_xyz)),
-                        Twist(ref_lin_vel, ref_ang_vel),
-                    )
-                else:
-                    tracker.set_cartesian_reference(Affine(pack_Rp(target_rot, target_xyz)))
-
-                plan_active_index = min(
-                    active_cartesian_trajectory.waypoint_index_at(elapsed),
-                    horizon - 1,
-                )
                 cmd_state = 1.0 if plan.gripper[plan_active_index] >= 0.5 else 0.0
                 if gripper is not None and cmd_state != stage_state["gripper_cmd"]:
                     width = (cfg.gripper.open_width_m if cmd_state == 1.0
@@ -1494,12 +1706,8 @@ def main(cfg: DictConfig) -> int:
                 plan.sequence, plan_active_index, horizon, hold_s,
             )
 
-            # 5. Hold final pose for hold_s seconds so the arm settles before the
-            #    next observation capture.
-            final_xyz, final_rot = active_cartesian_trajectory.interpolate(
-                active_cartesian_trajectory.duration
-            )
-            final_xyz = np.clip(final_xyz, workspace_lo_np, workspace_hi_np)
+            # 5. Hold final reference for hold_s seconds so the arm settles before
+            #    the next observation capture.
             hold_end = time.monotonic() + hold_s
             next_tick = time.monotonic()
 
@@ -1510,7 +1718,7 @@ def main(cfg: DictConfig) -> int:
                 if stage_state["epoch"] != plan_epoch:
                     stage_transitioned = True
                     break
-                tracker.set_cartesian_reference(Affine(pack_Rp(final_rot, final_xyz)))
+                _final_command()
                 _record_tick(enabled=True)
                 next_tick += execution_dt
                 sleep_time = next_tick - time.monotonic()

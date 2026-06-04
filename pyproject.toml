@@ -24,11 +24,24 @@ camera = [
     "pyzed",
     "opencv-python>=4.5",
 ]
+# Inverse-kinematics stack for the joint tracker (deploy.tracker=joint). Heavy
+# (jax + pyroki), so kept opt-in: `uv sync --extra ik`. Run the deploy process
+# with JAX_PLATFORMS=cpu — CPU jax is plenty for ~25 waypoint solves per plan and
+# avoids GPU init/contention stalling the realtime franky control loop.
+ik = [
+    "jax",
+    "jaxlie",
+    "jaxls",
+    "pyroki",
+]
 
 [tool.uv.sources]
 zero-franky = { path = "../zero_franky", editable = true }
 pyzed = { url = "https://download.stereolabs.com/zedsdk/5.2/whl/linux_x86_64/pyzed-5.2-cp312-cp312-linux_x86_64.whl" }
 franky-control = { url = "https://github.com/nickswalker/franky/releases/download/wheels-libfranka-0.21.1/franky_control-1.1.3+impedance.libfranka.0.21.1-cp312-cp312-manylinux_2_28_x86_64.whl" }
+# pyroki and jaxls are git-only; jaxlie resolves from PyPI.
+pyroki = { git = "https://github.com/chungmin99/pyroki.git" }
+jaxls = { git = "https://github.com/brentyi/jaxls.git" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
