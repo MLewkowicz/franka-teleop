@@ -145,6 +145,15 @@ class ZedCamera:
         self._depth_mat = sl.Mat()
         self._pointcloud_mat = sl.Mat()
 
+        # Latest full RGB+depth frame from the background loop (protected by
+        # _frame_lock). Off by default; enable with enable_frame_stream() so the
+        # loop also publishes the newest frame for get_latest_frame() consumers
+        # (e.g. the diffuser-actor deploy worker, which must NOT call grab_frame()
+        # while the background loop is running — concurrent grab() is unsafe).
+        self._frame_lock = threading.Lock()
+        self._stream_latest = False
+        self._latest_frame = None  # (rgb, depth, monotonic_ts) or None
+
         # Latest point cloud state (protected by _pc_lock)
         self._pc_lock = threading.Lock()
         self._pointcloud_enabled = False
@@ -259,6 +268,25 @@ class ZedCamera:
         )
         dist = np.array(cal.disto[:5], dtype=np.float64)
         return K, dist
+
+    def enable_frame_stream(self, enabled: bool = True):
+        """Have the background loop publish the newest (rgb, depth) for
+        get_latest_frame(). Lets a consumer read frames WITHOUT calling
+        grab_frame() (which would be a second, unsafe concurrent grab()).
+        Call before/after run(); the loop picks it up on the next iteration.
+        """
+        self._stream_latest = bool(enabled)
+
+    def get_latest_frame(self):
+        """Return the newest (rgb, depth) published by the background loop, or
+        None if streaming isn't enabled yet / no frame captured. Copies out
+        under the lock so the caller owns the arrays.
+        """
+        with self._frame_lock:
+            if self._latest_frame is None:
+                return None
+            rgb, depth, _ts = self._latest_frame
+            return rgb, depth
 
     def grab_frame(self):
         """Synchronously grab one (rgb, depth) frame. Returns None on failure.
