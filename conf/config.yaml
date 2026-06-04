@@ -228,6 +228,13 @@ deploy:
 
   steering:
     enabled: true                 # flip to true (or override on CLI) to steer
+    # Which placement to steer toward (the bimodal policy's "place" is overloaded):
+    #   rack    — mode B: invert the glass onto the wine rack (the params directly
+    #             below: target_euler, rot_reverse_direction, position).
+    #   cabinet — mode A: place the glass UPRIGHT into the cabinet (the `cabinet:`
+    #             block further down overrides the rotation target + position).
+    # Switch with this one line; the inactive mode's params are preserved.
+    place_mode: cabinet
     # Absolute target orientation, Euler XYZ radians, SAME convention as
     # obs.ee_pose[3:6] (ee_rot_to_euler_xyz). Inverted-place value from the
     # mode-B demos; refine by jogging to the inverted pose and reading ee euler.
@@ -421,6 +428,30 @@ deploy:
       map_size: 100
       workspace_bounds_min: [0.45, -0.50, -0.15]  # value-map grid bounds (covers all boxes)
       workspace_bounds_max: [1.00,  0.80,  0.75]
+
+    # ===== CABINET (mode A — upright placement) =====================
+    # Active only when place_mode=cabinet. Overrides the rotation target +
+    # direction above and supplies a gentle point-attractor position target.
+    # Grid bounds / map_size / gripper bounds are inherited from `position`.
+    cabinet:
+      # Upright place orientation: mean of 58 cabinet_*.h5 demos' final EE pose
+      # (vs the inverted rack target [-1.35,1.31,1.41]). Refine by jogging to the
+      # upright cabinet-place pose and reading ee euler.
+      target_euler: [-1.47, 0.93, -1.59]
+      rot_reverse_direction: false   # upright is a SHORT rotation from grasp — short way
+      guidance_strength: 0.3         # rotation pull strength (reuses the SLERP machinery)
+      position:
+        # Gentle pull toward the cabinet placement point (mean of the cabinet
+        # demos: [0.63,0.27,0.75], ~15cm above the box_002 center). Mostly gives
+        # the +y bias that disambiguates cabinet-vs-rack; the policy does the
+        # actual placement. No avoidance walls — pure point attractor.
+        target: [0.63, 0.27, 0.75]
+        seed_extent_m: 0.04          # affordance seed cube edge (m) at the target
+        guidance_strength: 0.1       # GENTLE (vs rack's 0.2)
+        delta_norm_cap: 0.04
+        start_guidance_timestep: 10000
+        distance: { enabled: true, full: 0.40, near: 0.05, floor: 0.0 }
+        basin_latch_radius_m: 0.08   # hand off to the policy once near the target
 
   # Median-filter isolated outlier waypoints from the policy's plan before
   # execution. Temporary mitigation for cross-modal gripper-coupled teleports

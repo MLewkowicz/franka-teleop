@@ -358,6 +358,47 @@ def build_place_value_map(
     return vm
 
 
+def build_center_attractor_value_map(
+    center_world: np.ndarray,
+    *,
+    ws_min: np.ndarray = DEFAULT_WS_MIN,
+    ws_max: np.ndarray = DEFAULT_WS_MAX,
+    map_size: int = DEFAULT_MAP_SIZE,
+    seed_extent_m: float = 0.04,
+    instruction: str = "place: upright into cabinet",
+):
+    """A gentle point-attractor value map: a small affordance cube at
+    `center_world` and NO avoidance. After smooth(), the EDT radiates from the
+    seed so the cost gradient points toward the center from anywhere — a soft
+    pull toward the target point. Used for the upright cabinet placement (mode A),
+    where we just want to bias the EE toward the cabinet region (the +y mode
+    disambiguation) and let the policy do the actual placement; contrast with the
+    rack value map (front-face affordance + obstacle walls).
+    """
+    from voxposer.value_map import ValueMap
+
+    ws_min = np.asarray(ws_min, dtype=np.float32)
+    ws_max = np.asarray(ws_max, dtype=np.float32)
+    center_world = np.asarray(center_world, dtype=np.float32)
+
+    mask = np.zeros((map_size, map_size, map_size), dtype=bool)
+    half = np.array([seed_extent_m / 2.0] * 3, dtype=np.float32)
+    _fill_slab(mask, center_world - half, center_world + half, ws_min, ws_max, map_size)
+    affordance = mask.astype(np.float32)
+
+    vm = ValueMap(
+        affordance=affordance,
+        workspace_bounds_min=ws_min,
+        workspace_bounds_max=ws_max,
+        map_size=map_size,
+        instruction=instruction,
+        avoidance=None,
+    )
+    vm.smooth()  # EDT-expand the seed into a radiating attractor field
+    vm.precompute_gradients(avoidance_weight=0.0)
+    return vm
+
+
 def gradient_field_tensor(vm: Any, device: str = "cuda"):
     """Stack a ValueMap's precomputed cost gradients into a (M, M, M, 3) tensor.
 
