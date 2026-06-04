@@ -46,6 +46,7 @@ from steering.target_rotation import TargetRotationSteering, _euler_to_matrix
 
 from clear_franka.value_maps import (
     RACK,
+    build_center_attractor_value_map,
     build_place_value_map,
     front_face_center,
     gradient_field_tensor,
@@ -60,6 +61,25 @@ class CombinedBoxSteering(BaseSteering):
 
     def __init__(self, cfg: Any) -> None:
         super().__init__(cfg)
+
+        # Place mode selects the whole steering profile:
+        #   rack    (mode B) — inverted glass onto the wine rack: near-180° flip
+        #     rotation target + front-face affordance + obstacle walls.
+        #   cabinet (mode A) — upright glass into the cabinet: upright rotation
+        #     target + a gentle point-attractor at the cabinet placement point
+        #     (no walls). The `cabinet` block overrides target_euler /
+        #     rot_reverse_direction and supplies `cabinet.position`; everything
+        #     else (scene bounds, gripper bounds, scalers, SLERP machinery) is
+        #     shared. Switch modes with one line: `place_mode: rack|cabinet`.
+        self._place_mode = str(cfg.get("place_mode", "rack")).lower()
+        ccfg = dict(cfg.get("cabinet", {}))
+        if self._place_mode == "cabinet":
+            cfg = dict(cfg)  # shallow copy; override the rotation knobs the branches read
+            if ccfg.get("target_euler") is not None:
+                cfg["target_euler"] = ccfg["target_euler"]
+            cfg["rot_reverse_direction"] = bool(ccfg.get("rot_reverse_direction", False))
+            if ccfg.get("guidance_strength") is not None:
+                cfg["guidance_strength"] = ccfg["guidance_strength"]
 
         # Rotation branch — TargetRotationSteering is kept for its bookkeeping
         # (target_euler → R_target_world, set_current_gripper_rotation → the live
@@ -106,57 +126,75 @@ class CombinedBoxSteering(BaseSteering):
         # vs the committed axis) from triggering a ~360° spin at the basin.
         self._rot_reverse_min_angle = float(cfg.get("rot_reverse_min_angle_rad", 1.2))
 
+        # Shared scene params live in the rack `position` block (grid bounds,
+        # map size, gripper bounds). Mode-specific position params come from the
+        # ACTIVE block: rack=`position`, cabinet=`cabinet.position`, with fallback
+        # to the rack block (via _pp) for anything the cabinet block omits.
         pcfg = dict(cfg.get("position", {}))
         ws_min = np.asarray(pcfg["workspace_bounds_min"], dtype=np.float32)
         ws_max = np.asarray(pcfg["workspace_bounds_max"], dtype=np.float32)
         map_size = int(pcfg.get("map_size", 100))
 
-        boxes = load_boxes(pcfg["boxes_path"])
-        face_thickness_m = float(pcfg.get("face_thickness_m", 0.04))
-        forward_extend_m = float(pcfg.get("forward_extend_m", 0.06))
-        basin_y_offset_m = float(pcfg.get("basin_y_offset_m", 0.0))
-        basin_z_offset_m = float(pcfg.get("basin_z_offset_m", 0.0))
-        rack_name = pcfg.get("rack", RACK)
-        vm = build_place_value_map(
-            boxes,
-            ws_min=ws_min,
-            ws_max=ws_max,
-            map_size=map_size,
-            avoidance_weight=float(pcfg.get("avoidance_weight", 2.0)),
-            obstacle_sigma=float(pcfg.get("obstacle_sigma", 1.0)),
-            suppress_affordance_in_obstacles=bool(
-                pcfg.get("suppress_affordance_in_obstacles", False)),
-            face_thickness_m=face_thickness_m,
-            forward_extend_m=forward_extend_m,
-            obstacle_back_extend_m=float(pcfg.get("obstacle_back_extend_m", 0.0)),
-            wall_x_offset_m=float(pcfg.get("wall_x_offset_m", 0.0)),
-            avoidance_carve_radius_m=float(pcfg.get("avoidance_carve_radius_m", 0.0)),
-            affordance_y_extent_m=(
-                float(pcfg["affordance_y_extent_m"])
-                if pcfg.get("affordance_y_extent_m") is not None else None),
-            affordance_z_extent_m=(
-                float(pcfg["affordance_z_extent_m"])
-                if pcfg.get("affordance_z_extent_m") is not None else None),
-            include_underneath_wall=bool(
-                pcfg.get("include_underneath_wall", True)),
-            basin_y_offset_m=basin_y_offset_m,
-            basin_z_offset_m=basin_z_offset_m,
-            rack=rack_name,
-        )
+        if self._place_mode == "cabinet":
+            # Gentle point-attractor at the cabinet placement point, no walls.
+            cpos = dict(ccfg.get("position", {}))
+            pos_params = cpos
+            target = np.asarray(cpos["target"], dtype=np.float32)
+            vm = build_center_attractor_value_map(
+                target, ws_min=ws_min, ws_max=ws_max, map_size=map_size,
+                seed_extent_m=float(cpos.get("seed_extent_m", 0.04)),
+            )
+            self._stage_target_world = target
+        else:
+            pos_params = pcfg
+            boxes = load_boxes(pcfg["boxes_path"])
+            face_thickness_m = float(pcfg.get("face_thickness_m", 0.04))
+            forward_extend_m = float(pcfg.get("forward_extend_m", 0.06))
+            basin_y_offset_m = float(pcfg.get("basin_y_offset_m", 0.0))
+            basin_z_offset_m = float(pcfg.get("basin_z_offset_m", 0.0))
+            rack_name = pcfg.get("rack", RACK)
+            vm = build_place_value_map(
+                boxes,
+                ws_min=ws_min,
+                ws_max=ws_max,
+                map_size=map_size,
+                avoidance_weight=float(pcfg.get("avoidance_weight", 2.0)),
+                obstacle_sigma=float(pcfg.get("obstacle_sigma", 1.0)),
+                suppress_affordance_in_obstacles=bool(
+                    pcfg.get("suppress_affordance_in_obstacles", False)),
+                face_thickness_m=face_thickness_m,
+                forward_extend_m=forward_extend_m,
+                obstacle_back_extend_m=float(pcfg.get("obstacle_back_extend_m", 0.0)),
+                wall_x_offset_m=float(pcfg.get("wall_x_offset_m", 0.0)),
+                avoidance_carve_radius_m=float(pcfg.get("avoidance_carve_radius_m", 0.0)),
+                affordance_y_extent_m=(
+                    float(pcfg["affordance_y_extent_m"])
+                    if pcfg.get("affordance_y_extent_m") is not None else None),
+                affordance_z_extent_m=(
+                    float(pcfg["affordance_z_extent_m"])
+                    if pcfg.get("affordance_z_extent_m") is not None else None),
+                include_underneath_wall=bool(
+                    pcfg.get("include_underneath_wall", True)),
+                basin_y_offset_m=basin_y_offset_m,
+                basin_z_offset_m=basin_z_offset_m,
+                rack=rack_name,
+            )
+            # Basin target — center of the rack's front-face affordance slab; the
+            # DistanceScaler ramps the pull DOWN as the EE approaches it.
+            self._stage_target_world = front_face_center(
+                boxes[rack_name]["center"], boxes[rack_name]["size"],
+                face_thickness_m=face_thickness_m,
+                forward_extend_m=forward_extend_m,
+                y_offset_m=basin_y_offset_m,
+                z_offset_m=basin_z_offset_m,
+            )
+
+        def _pp(key, default):
+            """Active-block position param with fallback to the shared rack block."""
+            return pos_params.get(key, pcfg.get(key, default))
+
         self._value_map = vm
         self._grad_field = gradient_field_tensor(vm, self.device)
-
-        # Basin target — center of the rack's front-face affordance slab. The
-        # DistanceScaler ramps the position guidance DOWN as the EE approaches
-        # this point, so the policy can settle into the basin without being
-        # shoved past it.
-        self._stage_target_world = front_face_center(
-            boxes[rack_name]["center"], boxes[rack_name]["size"],
-            face_thickness_m=face_thickness_m,
-            forward_extend_m=forward_extend_m,
-            y_offset_m=basin_y_offset_m,
-            z_offset_m=basin_z_offset_m,
-        )
 
         # gripper_loc_bounds + relative come from the policy yaml (merged in by
         # deploy._build_steering). They drive the model<->world transform that
@@ -175,13 +213,13 @@ class CombinedBoxSteering(BaseSteering):
         # `near`. Keeps the pull strong while the policy is still far away and
         # lets the model settle once it's in the basin (cribbed from
         # VoxPoserSteering's own ctx wiring).
-        dist_cfg = dict(pcfg.get("distance", {}))
+        dist_cfg = dict(_pp("distance", {}))
         self._pos = PositionFieldGuidance(
             horizon=self.horizon,
-            guidance_strength=float(pcfg.get("guidance_strength", 0.05)),
+            guidance_strength=float(_pp("guidance_strength", 0.05)),
             prediction_type="epsilon",
             guidance_mode=self.guidance_mode,
-            start_guidance_timestep=int(pcfg.get("start_guidance_timestep", 10_000)),
+            start_guidance_timestep=int(_pp("start_guidance_timestep", 10_000)),
             coordinates=self._coords,
             map_size=map_size,
             # TimestepScaler ramps from min_scale at low t up to 1.0 at high t —
@@ -209,7 +247,7 @@ class CombinedBoxSteering(BaseSteering):
         # without a cap, the trajectory pegs against the [-1, 1] normalization
         # bounds and lands miles outside the workspace. Cap preserves the
         # descent direction but limits magnitude; tune via cfg.position.
-        self._delta_norm_cap = float(pcfg.get("delta_norm_cap", 0.02))
+        self._delta_norm_cap = float(_pp("delta_norm_cap", 0.02))
 
         # Basin latch — once the *measured* EE first comes within this radius of
         # the basin, the position branch turns OFF for the rest of the stage and
@@ -220,22 +258,25 @@ class CombinedBoxSteering(BaseSteering):
         # basin while the policy tries to align with the rack. The latch hands
         # final alignment entirely to the policy once we've arrived. Set to 0 to
         # disable (fall back to pure DistanceScaler behavior). Cleared on reset().
-        self._basin_latch_radius_m = float(pcfg.get("basin_latch_radius_m", 0.10))
+        self._basin_latch_radius_m = float(_pp("basin_latch_radius_m", 0.10))
         self._pos_latched = False
 
         # Log the first few pos_delta magnitudes so the user can see the field
         # actually nudging the trajectory (not destabilizing it). Tunable so we
         # can quiet it once the steering is tuned.
-        self._diag_remaining = int(pcfg.get("diag_log_calls", 30))
+        self._diag_remaining = int(_pp("diag_log_calls", 30))
 
         logger.info(
-            "CombinedBoxSteering: mode=%s pos_strength=%s start_t=%s map_size=%d "
-            "delta_norm_cap=%s ws=[%s, %s]",
+            "CombinedBoxSteering: place_mode=%s mode=%s target=%s pos_strength=%s "
+            "start_t=%s map_size=%d delta_norm_cap=%s latch=%s ws=[%s, %s]",
+            self._place_mode,
             self.guidance_mode,
-            pcfg.get("guidance_strength", 0.05),
-            pcfg.get("start_guidance_timestep", 10_000),
+            np.array2string(np.asarray(self._stage_target_world), precision=3),
+            _pp("guidance_strength", 0.05),
+            _pp("start_guidance_timestep", 10_000),
             map_size,
             self._delta_norm_cap,
+            self._basin_latch_radius_m,
             np.array2string(ws_min, precision=2),
             np.array2string(ws_max, precision=2),
         )
