@@ -101,6 +101,10 @@ class CombinedBoxSteering(BaseSteering):
         # is the per-plan decision (recomputed in set_current_gripper_rotation).
         self._rot_commit_axis: np.ndarray | None = None
         self._rot_negate = False
+        # Only force the long way while the remaining rotation exceeds this (rad).
+        # Below it, always short way — stops a tiny residual (whose axis can flip
+        # vs the committed axis) from triggering a ~360° spin at the basin.
+        self._rot_reverse_min_angle = float(cfg.get("rot_reverse_min_angle_rad", 1.2))
 
         pcfg = dict(cfg.get("position", {}))
         ws_min = np.asarray(pcfg["workspace_bounds_min"], dtype=np.float32)
@@ -270,8 +274,13 @@ class CombinedBoxSteering(BaseSteering):
             self._rot_commit_axis = (
                 -axis_w if self._rot_reverse_direction else axis_w
             )
-        # Long way when the short-way axis opposes the committed direction.
-        self._rot_negate = bool(np.dot(axis_w, self._rot_commit_axis) < 0.0)
+        if angle < self._rot_reverse_min_angle:
+            # Close to target — always short way. Forcing the long way around a
+            # small residual here would command a ~360° spin and fold the arm.
+            self._rot_negate = False
+        else:
+            # Long way when the short-way axis opposes the committed direction.
+            self._rot_negate = bool(np.dot(axis_w, self._rot_commit_axis) < 0.0)
 
     def reset(self) -> None:
         self._rot.reset()

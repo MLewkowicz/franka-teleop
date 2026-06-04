@@ -106,6 +106,15 @@ class ZedCamera:
         self._depth_mat = sl.Mat()
         self._pointcloud_mat = sl.Mat()
 
+        # Latest full RGB+depth frame from the background loop (protected by
+        # _frame_lock). Off by default; enable with enable_frame_stream() so the
+        # loop also publishes the newest frame for get_latest_frame() consumers
+        # (e.g. the diffuser-actor deploy worker, which must NOT call grab_frame()
+        # while the background loop is running — concurrent grab() is unsafe).
+        self._frame_lock = threading.Lock()
+        self._stream_latest = False
+        self._latest_frame = None  # (rgb, depth, monotonic_ts) or None
+
         # Latest point cloud state (protected by _pc_lock)
         self._pc_lock = threading.Lock()
         self._pointcloud_enabled = False
@@ -234,6 +243,25 @@ class ZedCamera:
         dist = np.array(cal.disto[:5], dtype=np.float64)
         return K, dist
 
+    def enable_frame_stream(self, enabled: bool = True):
+        """Have the background loop publish the newest (rgb, depth) for
+        get_latest_frame(). Lets a consumer read frames WITHOUT calling
+        grab_frame() (which would be a second, unsafe concurrent grab()).
+        Call before/after run(); the loop picks it up on the next iteration.
+        """
+        self._stream_latest = bool(enabled)
+
+    def get_latest_frame(self):
+        """Return the newest (rgb, depth) published by the background loop, or
+        None if streaming isn't enabled yet / no frame captured. Copies out
+        under the lock so the caller owns the arrays.
+        """
+        with self._frame_lock:
+            if self._latest_frame is None:
+                return None
+            rgb, depth, _ts = self._latest_frame
+            return rgb, depth
+
     def grab_frame(self):
         """Synchronously grab one (rgb, depth) frame. Returns None on failure.
 
@@ -323,41 +351,42 @@ class ZedCamera:
 
             with self._rec_lock:
                 recording = self._recording
-                if not recording and not should_capture_pointcloud:
-                    continue
+                svo = self._svo_recording
+            stream = self._stream_latest
+            if not recording and not should_capture_pointcloud and not stream:
+                continue
 
-                if recording:
-                    if self._svo_recording:
-                        # ZED SDK writes the SVO frame automatically on grab().
-                        self._frame_count += 1
-                    else:
-                        ts = now - self._start_time
+            # Retrieve RGB+depth once if anyone needs it (HDF5 recording OR the
+            # latest-frame stream). SVO recording is written by the SDK on grab()
+            # and needs no retrieve unless we're also streaming.
+            rgb = depth = None
+            if (recording and not svo) or stream:
+                self._zed.retrieve_image(self._rgb_mat, sl.VIEW.LEFT)
+                self._zed.retrieve_measure(self._depth_mat, sl.MEASURE.DEPTH)
+                rgb = self._rgb_mat.get_data()[:, :, :3][:, :, ::-1].copy()  # BGRA→RGB
+                depth = self._depth_mat.get_data().copy()
+                if stream:
+                    with self._frame_lock:
+                        self._latest_frame = (rgb, depth, now)
 
-                        # Retrieve left RGB (BGRA) and depth
-                        self._zed.retrieve_image(self._rgb_mat, sl.VIEW.LEFT)
-                        self._zed.retrieve_measure(self._depth_mat, sl.MEASURE.DEPTH)
+            if recording:
+                with self._rec_lock:
+                    if self._recording:  # re-check; stop_recording may have raced
+                        if self._svo_recording:
+                            self._frame_count += 1
+                        elif rgb is not None:
+                            i = self._frame_count
+                            f = self._video_file
+                            f["rgb"].resize(i + 1, axis=0)
+                            f["rgb"][i] = rgb
+                            f["depth"].resize(i + 1, axis=0)
+                            f["depth"][i] = depth
+                            f["timestamps"].resize(i + 1, axis=0)
+                            f["timestamps"][i] = now - self._start_time
+                            self._frame_count = i + 1
 
-                        rgb = self._rgb_mat.get_data()[:, :, :3]    # BGRA → BGR
-                        rgb = rgb[:, :, ::-1].copy()                 # BGR → RGB
-                        depth = self._depth_mat.get_data().copy()
-
-                        # Append to HDF5 datasets
-                        i = self._frame_count
-                        f = self._video_file
-
-                        f["rgb"].resize(i + 1, axis=0)
-                        f["rgb"][i] = rgb
-
-                        f["depth"].resize(i + 1, axis=0)
-                        f["depth"][i] = depth
-
-                        f["timestamps"].resize(i + 1, axis=0)
-                        f["timestamps"][i] = ts
-
-                        self._frame_count = i + 1
-
-                if should_capture_pointcloud:
-                    self._retrieve_pointcloud(now)
+            if should_capture_pointcloud:
+                self._retrieve_pointcloud(now)
 
     def _should_capture_pointcloud(self, now: float) -> bool:
         with self._pc_lock:

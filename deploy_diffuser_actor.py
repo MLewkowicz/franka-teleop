@@ -829,10 +829,16 @@ def _start_inference_worker(
                 ee_pos, ee_rot, _O_T_EE = _read_ee_pose_from_state(state)
                 T_g2b = _make_T_gripper_to_base(ee_pos, ee_rot)
 
-                hand_frame = cam_hand.grab_frame()
-                tp_frame = cam_tp.grab_frame()
+                # Read the newest frame published by each camera's background
+                # capture loop (cam.run() + enable_frame_stream() in main). We do
+                # NOT call grab_frame() here: the loop is running, and a second
+                # concurrent grab() is unsafe. The loop also records the 30fps
+                # video, so one grab feeds both obs and the recording.
+                hand_frame = cam_hand.get_latest_frame()
+                tp_frame = cam_tp.get_latest_frame()
                 if hand_frame is None or tp_frame is None:
-                    logger.warning("Camera grab failed — skipping inference")
+                    logger.warning("No camera frame yet — waiting")
+                    time.sleep(0.05)
                     request_event.set()
                     continue
                 rgb_hand_full, depth_hand_full = hand_frame
@@ -1003,6 +1009,13 @@ def main(cfg: DictConfig) -> int:
     steering, steer_stage_indices = _build_steering(
         cfg.deploy, policy, policy_relative, policy_loc_bounds
     )
+    # Stages where the gripper is MANUAL-ONLY: the policy plan's gripper channel
+    # is ignored and only the SpaceMouse chord (both buttons) opens/closes it.
+    # Default = the place stage (1), so the glass is held until the user commands
+    # the release into the rack slot — the policy never auto-opens at the basin.
+    manual_gripper_stages = {
+        int(s) for s in cfg.deploy.get("manual_gripper_stages", [1])
+    }
     if steering is not None:
         kind = type(steering).__name__
         logger.info(
@@ -1021,10 +1034,11 @@ def main(cfg: DictConfig) -> int:
 
     # ----- cameras -----
     # make_zed_camera() returns an already-opened ZedCamera (it calls
-    # zed.open() inside __init__). We use synchronous grab_frame() per tick,
-    # so we deliberately do NOT call .run() — that would start a background
-    # capture thread and grab_frame() warns it must not run concurrently with
-    # it (see camera.py:237 docstring).
+    # zed.open() inside __init__). Below (inside the ExitStack) we call .run() +
+    # enable_frame_stream() so the background loop publishes the newest frame for
+    # the worker (get_latest_frame) AND records 30fps video off the same grab —
+    # so we no longer use synchronous grab_frame() (which can't run concurrently
+    # with the background loop).
     cam_hand, cam_tp, pre_hand, pre_tp = _setup_cameras(cfg)
 
     # ----- gripper (init pattern mirrors teleop.py:184-200) -----
@@ -1149,15 +1163,18 @@ def main(cfg: DictConfig) -> int:
     # Logs the executed session to data_dir/episode_*.h5 in the exact format the
     # teleop/replay tools write, so a deploy run can be re-run with
     #   uv run python main.py mode=replay replay.episode=<file>
-    # Cameras are deliberately NOT recorded: the inference worker grabs ZED
-    # frames synchronously (no .run()), which would conflict with the recorder's
-    # background camera capture. The joint trajectory is all replay needs.
+    # Cameras ARE recorded now: the worker reads frames from each camera's
+    # background loop (cam.run() + enable_frame_stream above), so the recorder
+    # can drive start_recording/stop_recording on both cameras for 30fps video
+    # off that same background grab — no conflicting synchronous grab.
     recorder = None
     deploy_trace = None
     if bool(cfg.deploy.get("record_trajectory", False)):
         recorder = TrajectoryRecorder(
             save_dir=cfg.data_dir,
-            cameras={},
+            cameras={"hand": cam_hand, "third_person": cam_tp},
+            record_svo=bool(cfg.recorder.get("record_svo", False)),
+            svo_compression=str(cfg.recorder.get("svo_compression", "H264")),
             metadata={
                 "control_mode": "diffuser_actor_deploy",
                 "policy_config": str(cfg.deploy.policy_config),
@@ -1171,6 +1188,13 @@ def main(cfg: DictConfig) -> int:
     with contextlib.ExitStack() as stack:
         stack.enter_context(cam_hand)
         stack.enter_context(cam_tp)
+        # Run the background capture loops and have them publish the newest frame
+        # for the inference worker (get_latest_frame). This replaces the worker's
+        # synchronous grab_frame() and lets the SAME background grab feed both the
+        # observation and the 30fps video recording (no concurrent grab()).
+        for _cam in (cam_hand, cam_tp):
+            _cam.enable_frame_stream()
+            _cam.run()
         if gripper is not None:
             stack.enter_context(gripper)
         if mouse is not None:
@@ -1237,6 +1261,12 @@ def main(cfg: DictConfig) -> int:
         ))
         robot.start_state_stream(timeout_ms=250)
         stack.callback(robot.stop_state_stream)
+        # Set True once the kill-key save/discard prompt has finalized the
+        # recording, so the ExitStack callbacks below don't re-save (or recreate
+        # a just-discarded) trace. Normal exits (Ctrl-C / completion) leave this
+        # False and save everything as before.
+        _recording_finalized = {"done": False}
+        _trace_path = None
         if recorder is not None:
             # __exit__ calls close()→stop()→_save_episode, so the h5 is written
             # on any exit path (Ctrl-C, completion, fault).
@@ -1247,12 +1277,15 @@ def main(cfg: DictConfig) -> int:
             if deploy_trace is not None:
                 deploy_trace.start()
                 _trace_path = Path(cfg.data_dir) / f"episode_{recorder._start_wall}_deploy.h5"
-                stack.callback(
-                    lambda: logger.info(
+
+                def _save_trace_on_exit():
+                    if _recording_finalized["done"]:
+                        return
+                    logger.info(
                         "Saved deploy trace (%d plans) to %s",
                         deploy_trace.save(_trace_path), _trace_path,
                     )
-                )
+                stack.callback(_save_trace_on_exit)
         inference_thread = _start_inference_worker(
             policy=policy,
             policy_lock=policy_lock,
@@ -1284,6 +1317,29 @@ def main(cfg: DictConfig) -> int:
             deploy_trace=deploy_trace,
         )
         stack.callback(lambda: (stop_event.set(), enabled_event.set(), inference_thread.join(timeout=1.0)))
+
+        # ----- keyboard kill key -----
+        # A background reader watches stdin; pressing [k] or [q] (or bare Enter)
+        # then return sets kill_event. The main loop then halts inference, holds
+        # the pose, and prompts to save or discard the recording. Separate from
+        # the SpaceMouse gestures (which keep doing stage/teleop/gripper).
+        kill_event = threading.Event()
+
+        def _keyboard_listener():
+            try:
+                for line in sys.stdin:
+                    if stop_event.is_set():
+                        break
+                    if line.strip().lower() in ("k", "q", ""):
+                        kill_event.set()
+                        break
+            except Exception:
+                pass
+
+        if recorder is not None:
+            threading.Thread(target=_keyboard_listener, daemon=True).start()
+            logger.info("[KILL KEY] press 'k' (or Enter) then return to stop the "
+                        "rollout and choose save/discard.")
 
         prev_left = 0
         prev_right = 0
@@ -1429,8 +1485,56 @@ def main(cfg: DictConfig) -> int:
                 robot_abs_time=float(teleop_state["abs_time"]),
             )
 
+        def finalize_recording(save: bool) -> None:
+            """Stop + save the recording, then keep or delete it. Called from the
+            kill-key handler. Collects every artifact (robot h5, both camera
+            videos, deploy trace); on discard, unlinks them. Idempotent."""
+            if _recording_finalized["done"]:
+                return
+            _recording_finalized["done"] = True
+            enabled_event.clear()
+            paths: list[Path] = []
+            if recorder is not None:
+                recorder.stop()  # writes robot h5 + closes both camera videos
+                if recorder.last_saved_path is not None:
+                    paths.append(Path(recorder.last_saved_path))
+                    base = recorder._episode_base
+                    ext = "svo2" if recorder._record_svo else "hdf5"
+                    for cam in ("hand", "third_person"):
+                        paths.append(Path(cfg.data_dir) / f"{base}_{cam}_video.{ext}")
+            if deploy_trace is not None and _trace_path is not None:
+                n = deploy_trace.save(_trace_path)
+                logger.info("Saved deploy trace (%d plans) to %s", n, _trace_path)
+                paths.append(Path(_trace_path))
+            if save:
+                kept = [p.name for p in paths if p.exists()]
+                logger.info("[ROLLOUT] SAVED %d file(s): %s", len(kept), ", ".join(kept))
+            else:
+                deleted = 0
+                for p in paths:
+                    try:
+                        if p.exists():
+                            p.unlink()
+                            deleted += 1
+                    except OSError as e:
+                        logger.warning("Could not delete %s: %s", p, e)
+                logger.info("[ROLLOUT] DISCARDED %d file(s)", deleted)
+
         while not stop_event.is_set():
             rate.start_tick()
+            # ---------- kill key: halt, hold pose, prompt save/discard ----------
+            if kill_event.is_set():
+                logger.info("[KILL] rollout stopped — holding pose.")
+                enabled_event.clear()
+                try:
+                    ans = input(
+                        "\n[ROLLOUT] save or discard? [s]ave / [d]iscard: "
+                    ).strip().lower()
+                except EOFError:
+                    ans = "s"
+                finalize_recording(save=not ans.startswith("d"))
+                stop_event.set()
+                break
             # ---------- button polling ----------
             if mouse is not None:
                 sample = mouse.get_controller_state()
@@ -1478,14 +1582,17 @@ def main(cfg: DictConfig) -> int:
                         suppress_right_until_release = True
                         right_press_time = None
 
-                    # Chord rising edge -> toggle gripper (TELEOP only).
+                    # Chord rising edge -> toggle gripper. Allowed in TELEOP, and
+                    # in INFERENCE during a manual-gripper stage (place) so the user
+                    # commands the glass release at the basin while the policy runs.
                     if chord and not prev_chord:
                         left_used_in_chord = True
                         right_used_in_chord = True
-                        if mode == TELEOP:
+                        if mode == TELEOP or stage_idx in manual_gripper_stages:
                             _toggle_gripper_teleop()
                         else:
-                            logger.info("  (chord ignored — gripper toggles in TELEOP only)")
+                            logger.info("  (chord ignored — gripper toggles in TELEOP "
+                                        "or the place stage only)")
 
                     # Tap on release -> condition + enter INFERENCE.
                     if (not left) and prev_left:
@@ -1758,14 +1865,18 @@ def main(cfg: DictConfig) -> int:
                         measured_rot=_ee_rot,
                     )
 
-                cmd_state = 1.0 if active_plan.gripper[active_index] >= 0.5 else 0.0
-                if gripper is not None and cmd_state != stage_state["gripper_cmd"]:
-                    width = (cfg.gripper.open_width_m if cmd_state == 1.0
-                             else cfg.gripper.close_width_m)
-                    logger.info(f"  gripper → {'OPEN' if cmd_state == 1.0 else 'CLOSE'}")
-                    gripper.move_width(width, wait=False)
-                    visualizer.update_gripper_width(width, max_width_m=cfg.gripper.max_width_m)
-                    stage_state["gripper_cmd"] = cmd_state
+                # Plan-driven gripper — skipped in manual-only stages (place), where
+                # the gripper holds its current state and only the SpaceMouse chord
+                # opens it, so the user controls the release into the rack slot.
+                if active_plan.stage_idx not in manual_gripper_stages:
+                    cmd_state = 1.0 if active_plan.gripper[active_index] >= 0.5 else 0.0
+                    if gripper is not None and cmd_state != stage_state["gripper_cmd"]:
+                        width = (cfg.gripper.open_width_m if cmd_state == 1.0
+                                 else cfg.gripper.close_width_m)
+                        logger.info(f"  gripper → {'OPEN' if cmd_state == 1.0 else 'CLOSE'}")
+                        gripper.move_width(width, wait=False)
+                        visualizer.update_gripper_width(width, max_width_m=cfg.gripper.max_width_m)
+                        stage_state["gripper_cmd"] = cmd_state
 
                 final_dist = float(np.linalg.norm(
                     active_plan.trajectory[-1, :3] - ee_pos

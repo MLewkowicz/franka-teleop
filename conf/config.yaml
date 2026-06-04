@@ -154,6 +154,12 @@ deploy:
   control_hz: 10                                  # Nominal DiffuserActor waypoint rate used to interpret action horizon timing.
   execution_hz: 100                              # Cartesian reference streaming rate; samples the retimed interpolation.
   record_trajectory: true                       # If true, log the executed session to data_dir/episode_*.h5 (same format as mode=replay), replayable via main.py mode=replay.
+  # Stages where the gripper is MANUAL-ONLY: the policy plan's gripper channel is
+  # ignored and only the SpaceMouse chord (both buttons) opens/closes it.
+  # [] (current) = the policy predicts/drives the gripper in EVERY stage (default
+  # behavior). Set e.g. [1] to make the place stage manual-only (glass held at the
+  # basin until you chord-open it; the policy never auto-opens there).
+  manual_gripper_stages: []
   max_linear_vel_m_s: 0.03                      # Open-loop retime speed limit for Cartesian translation.
   max_angular_vel_rad_s: 0.25                   # Open-loop retime speed limit for Cartesian orientation.
   # ---- Host-side terminal-convergence aids (feat/cartesian-integral-ff) ----
@@ -182,7 +188,7 @@ deploy:
   # residual_wrench/stiffness), not a transient. Higher rotational stiffness
   # directly shrinks that offset (~33% less at 60). If it oscillates, back off;
   # the fuller fix is the integral feedforward (integral_enabled, feat branch).
-  rotational_stiffness: 60.0
+  rotational_stiffness: 40.0
   # Null-space biasing for the impedance controller. When stiffness > 0 the
   # controller resolves the 7-DOF→6-DOF redundancy by biasing the joint config
   # toward `nullspace_target` (7-vector). Useful for poses near the rack where
@@ -244,7 +250,7 @@ deploy:
     # ~0.6), use a lower strength + ramp_floor=0.0 (so wp[0] gets no pull, wp[H-1]
     # gets full) + a low start_guidance_timestep (only nudge in the low-noise band
     # where mode basins separate). Crank back up if the rotation isn't completing.
-    guidance_strength: 0.3          # 0.4 stalled with eul[0] ~40° from target; smooth-handoff
+    guidance_strength: 0.4          # 0.4 stalled with eul[0] ~40° from target; smooth-handoff
                                     # + delta_norm_cap now bound the per-step jump, so the
                                     # earlier "0.6 snapped instantly" failure mode is gated.
     guidance_mode: dps              # "epsilon" (ε-delta) or "dps" (stronger, x-space)
@@ -268,6 +274,12 @@ deploy:
                                     # higher = more rotation per plan (faster convergence,
                                     # bigger per-step jump). Convergence accumulates across
                                     # plans, so <1 is fine. Raise toward 0.7 if still short.
+    rot_reverse_min_angle_rad: 1.2  # only force the LONG way while the remaining rotation
+                                    # is bigger than this (the genuine ~176° flip). Once the
+                                    # wrist is within this of the target, always take the
+                                    # short way — otherwise a tiny residual whose axis flips
+                                    # vs the committed axis triggers a ~360° spin (the arm
+                                    # folds chasing it at the basin). Big flip is unaffected.
     stage_indices: [1]              # steer the place stage only
     horizon: 20
     device: cuda
@@ -329,13 +341,15 @@ deploy:
       # out the pull re-engages and the EE oscillates in/out of the basin while
       # the policy aligns with the rack. The latch hands final alignment to the
       # policy once we've arrived. Set 0 to disable (pure DistanceScaler).
-      # Shrunk 0.10 → 0.05: at 0.10 the latch handed off to the policy while the
-      # EE was still ~10cm below the basin in z (it fires as soon as the 3D
-      # distance drops under the radius, which x/y convergence alone achieves).
-      # 0.05 keeps the position pull active until the EE is genuinely near the
-      # basin so z can finish climbing. The latch is one-way (never re-engages),
-      # so a smaller radius does NOT reintroduce in/out oscillation.
-      basin_latch_radius_m: 0.05
+      # Set to ~the distance at which the EE actually SETTLES from the basin. The
+      # basin is pulled ~8cm out in front of the rack face on purpose (so the pull
+      # holds the EE out at the face instead of drifting back under the shelf),
+      # so the EE equilibrium sits ~7-8cm from the basin (mostly in x) and never
+      # reaches it — at 0.05 the latch never fired. 0.08 fires right at that
+      # settle point, handing position off to the policy there WITHOUT moving the
+      # basin (keeping its pull). One-way latch → no in/out oscillation. If the
+      # settle distance changes, retune this to match it.
+      basin_latch_radius_m: 0.08
       start_guidance_timestep: 10000  # apply for t <= this; lower to focus low-t
       avoidance_weight: 420         # strength of the front-face wall vs the rack affordance
       # Avoidance is built as a *wall* at the front (-x) face of each obstacle
@@ -392,8 +406,10 @@ deploy:
       # has a residual −y pull off the basin (EE settled ~3cm more negative than
       # the basin, drifting toward the rack middle), so aim +y of the slot center
       # to land the EE in-slot. basin y = box_001 center (−0.064) + offset.
-      basin_y_offset_m: 0.03        # +y toward cabinet → basin y = −0.034
-      basin_z_offset_m: 0.03        # +3cm in z over rack center → basin z = 0.55
+      basin_y_offset_m: 0.02        # +y toward cabinet → basin y = −0.034
+      basin_z_offset_m: -0.08      # basin z = 0.455 (rack center 0.52 − 6.5cm). The inverted
+                                    # glass bottom sits ~7cm ABOVE the EE; aiming the EE here
+                                    # puts the glass bottom (0.455+0.07≈0.525) at the slot.
       # CRITICAL: clip the affordance seed to a small window in y/z around the
       # basin center. EDT gradients point to the *nearest* seed voxel — with a
       # seed spanning the whole rack y range (0.20m wide), a predicted waypoint
