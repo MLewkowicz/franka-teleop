@@ -165,9 +165,28 @@ deploy:
     num_seeds: 4                                  # IK random restarts per waypoint (in addition to the chained seed).
     max_iterations: 30                            # Levenberg-Marquardt iterations per solve.
     cost_threshold: 1.0e-3                         # waypoints with final IK cost above this are treated as unreachable; the plan is truncated there. Calibrate from the FK round-trip test (reachable cost ~0).
-  joint_retime:                                   # per-joint velocity / acceleration limits for the joint-space TOPPRA retime. Tune on-robot via replay first.
-    max_joint_vel:   [0.5, 0.5, 0.5, 0.5, 1.0, 1.0, 1.0]    # rad/s (~15-25% of FR3 hardware max).
-    max_joint_accel: [3.0, 3.0, 3.0, 3.0, 4.0, 4.0, 4.0]    # rad/s^2.
+    tcp_compensation: true                        # measure FK_urdf vs robot O_T_EE at startup and fold the constant offset into IK targets so the robot's O_T_EE (the policy's training frame) lands on the plan pose.
+  # The joint trajectory inherits the Cartesian retime's waypoints AND timing
+  # (max_linear_vel_m_s / max_angular_vel_rad_s above), so the EE moves at the
+  # same speed as the cartesian tracker. max_joint_vel is only a safety cap:
+  # segments whose implied joint speed exceeds it (e.g. near singularities) are
+  # stretched, never sped up.
+  joint_retime:
+    max_joint_vel:   [0.5, 0.5, 0.5, 0.5, 1.0, 1.0, 1.0]    # rad/s safety cap (~15-25% of FR3 hardware max).
+  # Terminal settle gate (joint tracker). Replaces the fixed hold_s wait: the
+  # final joint reference is held — with a joint-space integrator cancelling the
+  # impedance controller's friction/gravity steady-state offset — until the
+  # measured O_T_EE is within tolerance of the plan's final pose, so every
+  # replan (and grasp) starts from a converged pose. Logs SETTLED/TIMEOUT per plan.
+  settle:
+    pos_tol_m: 0.004                              # position tolerance vs the plan's final target (m).
+    rot_tol_rad: 0.035                            # orientation tolerance (rad, ~2 deg).
+    min_hold_s: 0.5                               # always hold at least this long (camera/arm settling).
+    timeout_s: 2.5                                # give up waiting and replan (logged as a warning).
+    consecutive_ticks: 5                          # ticks within tolerance required before declaring settled.
+    integral_gain: 1.0                            # [1/s] joint-space integral gain; 0 disables the integrator.
+    integral_max_rad: 0.05                        # anti-windup clamp on the per-joint correction (rad).
+    integral_deadband_rad: 0.0005                 # stop integrating joints within this error (avoids hunting).
   control_hz: 10                                  # Nominal DiffuserActor waypoint rate used to interpret action horizon timing.
   execution_hz: 100                              # Cartesian reference streaming rate; samples the retimed interpolation.
   record_trajectory: true                       # If true, log the executed session to data_dir/episode_*.h5 (same format as mode=replay), replayable via main.py mode=replay.

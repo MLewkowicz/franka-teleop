@@ -428,40 +428,56 @@ def _make_cartesian_trajectory_for_plan(
 
 def _make_joint_trajectory_for_plan(
     plan: InferencePlan,
-    start_index: int,
-    plan_dt: float,
+    cartesian_trajectory,
     ik,
-    euler_to_matrix_fn,
     *,
     current_q: np.ndarray,
     max_joint_vel: np.ndarray,
-    max_joint_accel: np.ndarray,
     lower_limits: np.ndarray,
     upper_limits: np.ndarray,
     cost_threshold: float,
+    tcp_corr: np.ndarray | None = None,
 ):
-    """Convert the plan suffix into a retimed joint-space trajectory via IK.
+    """Convert a retimed Cartesian reference trajectory into a joint one via IK.
 
-    The joint-tracker analogue of :func:`_make_cartesian_trajectory_for_plan`.
-    Each Cartesian waypoint (EE pose in the ``fr3_link0`` frame) is solved to a
-    joint config with seed chaining (``ik.solve_chained``) so the redundant arm
-    stays on one IK branch. The measured ``current_q`` is prepended as the bridge
-    waypoint so the executor's first ``set_joint_reference`` equals the current
-    configuration (no jump), then the path is retimed in joint space under
-    per-joint velocity/acceleration limits.
+    Takes the *same* bridge-prepended, EE-speed-retimed ``CartesianTrajectory``
+    the Cartesian tracker would stream (so the joint tracker inherits identical
+    waypoints AND identical timing — the EE moves at the configured Cartesian
+    speed caps, not at TOPPRA-time-optimal joint speed). Each plan waypoint is
+    solved with seed chaining (``ik.solve_chained``) so the redundant arm stays
+    on one IK branch; waypoint 0 (the bridge) is the measured ``current_q``
+    directly, no IK round-trip.
 
-    Returns ``(Trajectory, gripper_index_map)`` where ``gripper_index_map[k]`` is
-    the original-plan gripper index for joint-trajectory waypoint ``k`` (the bridge
-    is k=0). Returns ``(None, None)`` when no waypoint is reachable, signalling the
-    caller to hold the current config and replan.
+    ``tcp_corr`` is an optional constant 4x4 tool correction measured at startup
+    (``FK_urdf(q)^-1 @ O_T_EE``). Targets are right-multiplied by its inverse so
+    the *robot's* O_T_EE — the frame the policy was trained on — lands on the
+    plan pose, even if the URDF TCP and the robot's configured EE differ.
+
+    Returns ``(Trajectory, info)`` where ``info`` carries ``n_good`` (plan
+    waypoints kept after reachability truncation), ``final_target_pos/rot`` (the
+    plan pose, policy frame, the settle gate should converge to), and ``stretch``
+    (max per-segment slowdown applied to respect ``max_joint_vel``). Returns
+    ``(None, None)`` when no waypoint is reachable.
     """
     from clear_franka.joint_trajectory import Trajectory
 
-    suffix = plan.trajectory[start_index:, :6]
-    if len(suffix) == 0:
+    # Plan waypoints + timing from the Cartesian retime (index 0 is the bridge).
+    cart_pos = np.asarray(cartesian_trajectory.positions, dtype=np.float64)
+    cart_rot = cartesian_trajectory.rotations.as_matrix().astype(np.float64)
+    times = np.asarray(cartesian_trajectory.waypts_time, dtype=np.float64).copy()
+    pos = cart_pos[1:]
+    rot = cart_rot[1:]
+    if len(pos) == 0:
         return None, None
-    pos = np.asarray(suffix[:, :3], dtype=np.float64)
-    rot = np.stack([euler_to_matrix_fn(e) for e in suffix[:, 3:6]], axis=0)
+
+    # Express policy-frame targets in the URDF-TCP frame the IK realizes.
+    if tcp_corr is not None:
+        corr_inv = np.linalg.inv(np.asarray(tcp_corr, dtype=np.float64))
+        T = np.tile(np.eye(4), (len(pos), 1, 1))
+        T[:, :3, :3] = rot
+        T[:, :3, 3] = pos
+        T = T @ corr_inv[None, :, :]
+        pos, rot = T[:, :3, 3].copy(), T[:, :3, :3].copy()
 
     current_q = np.asarray(current_q, dtype=np.float64).reshape(7)
     q_plan, cost = ik.solve_chained(pos, rot, current_q)
@@ -489,26 +505,35 @@ def _make_joint_trajectory_for_plan(
         )
         return None, None
 
-    q_good = q_plan[:n_good]
-    # Prepend the measured config as the bridge waypoint (zero round-trip error).
-    q_waypts = np.vstack([current_q[None, :], q_good])
-    # gripper map: bridge (k=0) holds the gripper state of plan[start_index]; each
-    # subsequent waypoint k maps to original plan index start_index + (k-1).
-    gripper_map = np.concatenate([
-        [start_index],
-        start_index + np.arange(n_good),
-    ]).astype(int)
+    # Bridge (measured q) + reachable prefix, on the Cartesian retime's clock.
+    q_waypts = np.vstack([current_q[None, :], q_plan[:n_good]])
+    times = times[: n_good + 1]
 
-    if len(q_waypts) == 1:  # defensive; n_good>=1 guarantees >=2, but keep parity
-        q_waypts = np.vstack([q_waypts, q_waypts])
-        gripper_map = np.concatenate([gripper_map, gripper_map[-1:]])
-    times = np.arange(len(q_waypts), dtype=np.float64) * float(plan_dt)
+    # Joint-velocity safety cap: the Cartesian timing almost always implies slow
+    # joint motion, but near singularities a small EE step can demand a large
+    # joint step. Stretch only the violating segments (preserves the profile).
+    max_joint_vel = np.asarray(max_joint_vel, dtype=np.float64)
+    seg_dt = np.diff(times)
+    seg_dq = np.abs(np.diff(q_waypts, axis=0))
+    ratios = (seg_dq / np.maximum(seg_dt[:, None], 1e-6)) / max_joint_vel[None, :]
+    seg_stretch = np.maximum(ratios.max(axis=1), 1.0)
+    stretch = float(seg_stretch.max())
+    if stretch > 1.0 + 1e-6:
+        times = np.concatenate([[times[0]], times[0] + np.cumsum(seg_dt * seg_stretch)])
+        logger.warning(
+            "  plan %d JOINT-IK: joint-velocity cap stretched %d segment(s) "
+            "(max factor %.2f)",
+            plan.sequence, int(np.sum(seg_stretch > 1.0 + 1e-6)), stretch,
+        )
 
-    trajectory = Trajectory(q_waypts, times)
-    # sample_uniform=False preserves the waypoint count (and thus the gripper_map
-    # alignment) while assigning velocity/accel-feasible timestamps.
-    retimed = trajectory.retime(max_joint_vel, max_joint_accel, sample_uniform=False)
-    return retimed, gripper_map
+    info = {
+        "n_good": n_good,
+        # Settle gate target: the plan pose in the policy frame (robot O_T_EE).
+        "final_target_pos": cart_pos[n_good].copy(),
+        "final_target_rot": cart_rot[n_good].copy(),
+        "stretch": stretch,
+    }
+    return Trajectory(q_waypts, times), info
 
 
 def _sample_cartesian_trajectory_positions(
@@ -1154,6 +1179,43 @@ def main(cfg: DictConfig) -> int:
             logger.info("Joint tracker IK ready.")
         robot.start_state_stream(timeout_ms=250)
         stack.callback(robot.stop_state_stream)
+        # Joint mode: measure the constant offset between the URDF TCP (what IK
+        # realizes) and the robot's configured O_T_EE (the frame the policy was
+        # trained on, and what the Cartesian tracker used to track directly). Any
+        # mismatch here is a *systematic* grasp offset in joint mode, so we fold
+        # it into the IK targets: with correction T_c = FK_urdf(q)^-1 @ O_T_EE,
+        # asking IK for `target @ T_c^-1` puts the robot's O_T_EE on `target`.
+        tcp_corr_T = None
+        if tracker_mode == "joint":
+            _st0 = robot.latest_state or robot.wait_for_state(timeout=2.0)
+            if _st0 is None:
+                logger.warning("Joint tracker: no robot state for TCP check — skipping compensation.")
+            else:
+                _q0 = np.asarray(_st0["q"], dtype=np.float64)
+                _m_pos, _m_rot, _ = _read_ee_pose_from_state(_st0)
+                _f_pos, _f_rot = ik.fk_ee(_q0)
+                _T_fk = np.eye(4); _T_fk[:3, :3] = _f_rot; _T_fk[:3, 3] = _f_pos
+                _T_ms = np.eye(4); _T_ms[:3, :3] = _m_rot; _T_ms[:3, 3] = _m_pos
+                _T_c = np.linalg.inv(_T_fk) @ _T_ms
+                _d_mm = float(np.linalg.norm(_T_c[:3, 3])) * 1e3
+                _d_deg = float(np.degrees(np.arccos(np.clip(
+                    (np.trace(_T_c[:3, :3]) - 1.0) / 2.0, -1.0, 1.0))))
+                logger.info(
+                    "Joint tracker TCP check: URDF FK vs robot O_T_EE offset = "
+                    "%.2f mm / %.3f deg", _d_mm, _d_deg,
+                )
+                if _d_mm > 20.0 or _d_deg > 10.0:
+                    logger.warning(
+                        "TCP offset is LARGE — the Cortado URDF TCP and the robot's "
+                        "configured EE disagree badly; fix the URDF/Desk EE config. "
+                        "Compensating for this run."
+                    )
+                if bool(cfg.deploy.get("ik", {}).get("tcp_compensation", True)):
+                    if _d_mm > 0.5 or _d_deg > 0.1:
+                        tcp_corr_T = _T_c
+                        logger.info("Joint tracker: TCP compensation ENABLED.")
+                    else:
+                        logger.info("Joint tracker: TCP offset negligible — no compensation needed.")
         if recorder is not None:
             # __exit__ calls close()→stop()→_save_episode, so the h5 is written
             # on any exit path (Ctrl-C, completion, fault).
@@ -1184,7 +1246,6 @@ def main(cfg: DictConfig) -> int:
         sample = None
         active_cartesian_trajectory = None
         active_joint_trajectory = None
-        active_gripper_map = None
         _teleop_joint_warned = [False]
         next_tick = time.monotonic()
         last_viz_update = 0.0
@@ -1210,14 +1271,28 @@ def main(cfg: DictConfig) -> int:
         hold_s = float(cfg.deploy.get("hold_s", 0.5))
 
         # Joint-tracker per-plan params (only used when tracker_mode == "joint").
+        # max_joint_vel is a SAFETY CAP only: the joint trajectory inherits the
+        # Cartesian retime's timing (same EE speed as the cartesian tracker);
+        # violating segments are stretched, never sped up.
         _jr_cfg = cfg.deploy.get("joint_retime", {})
         joint_max_vel = np.asarray(
             _jr_cfg.get("max_joint_vel", [0.5, 0.5, 0.5, 0.5, 1.0, 1.0, 1.0]), dtype=np.float64
         )
-        joint_max_accel = np.asarray(
-            _jr_cfg.get("max_joint_accel", [3.0, 3.0, 3.0, 3.0, 4.0, 4.0, 4.0]), dtype=np.float64
-        )
         ik_cost_threshold = float(cfg.deploy.get("ik", {}).get("cost_threshold", 1e-3))
+        # Terminal settle gate (joint tracker): instead of a fixed hold_s, hold the
+        # final joint reference — with a joint-space integrator cancelling the
+        # impedance controller's friction/gravity steady-state offset — until the
+        # measured O_T_EE is within tolerance of the plan's final target pose, so
+        # every replan (and grasp) starts from a converged pose.
+        _settle_cfg = cfg.deploy.get("settle", {})
+        settle_pos_tol_m = float(_settle_cfg.get("pos_tol_m", 0.004))
+        settle_rot_tol_rad = float(_settle_cfg.get("rot_tol_rad", 0.035))
+        settle_min_hold_s = float(_settle_cfg.get("min_hold_s", hold_s))
+        settle_timeout_s = float(_settle_cfg.get("timeout_s", 2.5))
+        settle_consecutive = int(_settle_cfg.get("consecutive_ticks", 5))
+        settle_ki = float(_settle_cfg.get("integral_gain", 1.0))
+        settle_imax_rad = float(_settle_cfg.get("integral_max_rad", 0.05))
+        settle_deadband_rad = float(_settle_cfg.get("integral_deadband_rad", 5e-4))
         # Buffered joint limits handed to the IK reachability/limit check (same
         # buffer the impedance soft-stop uses, so IK never proposes a config the
         # controller would then fight at its limit).
@@ -1228,7 +1303,7 @@ def main(cfg: DictConfig) -> int:
         # ----- mode transitions -----
         def _enter_inference(prim: int, label: str) -> None:
             nonlocal mode, stage_idx, active_cartesian_trajectory, infer_sequence
-            nonlocal active_joint_trajectory, active_gripper_map
+            nonlocal active_joint_trajectory
             transitioning = mode == INFERENCE and stage_idx != prim
             mode = INFERENCE
             # Don't clear active_cartesian_trajectory here when transitioning
@@ -1237,7 +1312,6 @@ def main(cfg: DictConfig) -> int:
             if not transitioning:
                 active_cartesian_trajectory = None
                 active_joint_trajectory = None
-                active_gripper_map = None
             visualizer.clear_plan_waypoints()
             policy.set_primitive(prim)
             policy.set_object(0)
@@ -1250,14 +1324,13 @@ def main(cfg: DictConfig) -> int:
 
         def _enter_teleop() -> None:
             nonlocal mode, active_cartesian_trajectory
-            nonlocal active_joint_trajectory, active_gripper_map
+            nonlocal active_joint_trajectory
             if mode == TELEOP:
                 return
             mode = TELEOP
             stage_state["epoch"] += 1
             active_cartesian_trajectory = None
             active_joint_trajectory = None
-            active_gripper_map = None
             visualizer.clear_plan_waypoints()
             logger.info("[TELEOP] take over — jog; tap L=grasp R=place, chord=gripper")
 
@@ -1519,18 +1592,24 @@ def main(cfg: DictConfig) -> int:
             #    configuration as a bridge so the first command equals the current
             #    state (no sudden jump to plan[0]). `_command(elapsed)` issues the
             #    reference and returns (target EE xyz, target EE rot, plan index) for
-            #    the shared gripper / tracking-error / viz tail below.
+            #    the shared gripper / tracking-error / viz tail below. `_hold_done`
+            #    decides when the terminal hold may end (fixed hold_s for cartesian;
+            #    settle-within-tolerance for joint).
+            #
+            #    The Cartesian retime is built in BOTH modes: the joint tracker
+            #    inherits its waypoints and timing, so the EE moves at the same
+            #    configured Cartesian speed caps regardless of tracker.
+            active_cartesian_trajectory = _make_cartesian_trajectory_for_plan(
+                plan, 0, plan_dt, euler_xyz_to_matrix,
+                max_linear_vel=plan_max_linear_vel_m_s,
+                max_angular_vel=plan_max_angular_vel_rad_s,
+                min_segment_dt=execution_dt,
+                max_linear_accel=plan_max_linear_accel,
+                max_angular_accel=plan_max_angular_accel,
+                current_ee_pos=ee_pos,
+                current_ee_euler=ee_euler,
+            )
             if tracker_mode == "cartesian":
-                active_cartesian_trajectory = _make_cartesian_trajectory_for_plan(
-                    plan, 0, plan_dt, euler_xyz_to_matrix,
-                    max_linear_vel=plan_max_linear_vel_m_s,
-                    max_angular_vel=plan_max_angular_vel_rad_s,
-                    min_segment_dt=execution_dt,
-                    max_linear_accel=plan_max_linear_accel,
-                    max_angular_accel=plan_max_angular_accel,
-                    current_ee_pos=ee_pos,
-                    current_ee_euler=ee_euler,
-                )
                 _traj = active_cartesian_trajectory
                 plan_duration = _traj.duration
                 visualizer.update_interpolated_plan_path(
@@ -1554,20 +1633,23 @@ def main(cfg: DictConfig) -> int:
                     fxyz, frot = _traj.interpolate(_traj.duration)
                     fxyz = np.clip(fxyz, workspace_lo_np, workspace_hi_np)
                     tracker.set_cartesian_reference(Affine(pack_Rp(frot, fxyz)))
+
+                def _hold_done(t0):
+                    return time.monotonic() - t0 >= hold_s
             else:
                 # Bridge from the *current* measured config (arm has been holding
                 # during the blocking inference, so read it fresh, not the obs-time
                 # state captured seconds ago).
                 _cur_state = robot.latest_state or state
                 _cur_q = np.asarray(_cur_state["q"], dtype=np.float64)
-                active_joint_trajectory, active_gripper_map = _make_joint_trajectory_for_plan(
-                    plan, 0, plan_dt, ik, euler_xyz_to_matrix,
+                active_joint_trajectory, _jt_info = _make_joint_trajectory_for_plan(
+                    plan, active_cartesian_trajectory, ik,
                     current_q=_cur_q,
                     max_joint_vel=joint_max_vel,
-                    max_joint_accel=joint_max_accel,
                     lower_limits=_ik_lower,
                     upper_limits=_ik_upper,
                     cost_threshold=ik_cost_threshold,
+                    tcp_corr=tcp_corr_T,
                 )
                 if active_joint_trajectory is None:
                     # No reachable waypoint: hold the current config for hold_s and
@@ -1584,12 +1666,22 @@ def main(cfg: DictConfig) -> int:
                     rate.finish_tick()
                     continue
                 _jt = active_joint_trajectory
-                _gmap = active_gripper_map
                 _jt_deriv = _jt._spline.derivative()
                 _jt_t0, _jt_t1 = float(_jt.waypts_time[0]), float(_jt.waypts_time[-1])
                 plan_duration = _jt_t1 - _jt_t0
+                _q_final = _jt.waypts[-1].copy()
+                _final_tpos = _jt_info["final_target_pos"]
+                _final_trot = _jt_info["final_target_rot"]
                 _wp_pos, _ = ik.fk_ee(_jt.waypts)
                 visualizer.update_interpolated_plan_path(np.asarray(_wp_pos, dtype=np.float64))
+
+                def _fk_policy_frame(q):
+                    """Commanded EE pose in the policy/O_T_EE frame (for error/viz)."""
+                    txyz, trot = ik.fk_ee(q)
+                    if tcp_corr_T is not None:
+                        txyz = trot @ tcp_corr_T[:3, 3] + txyz
+                        trot = trot @ tcp_corr_T[:3, :3]
+                    return txyz, trot
 
                 def _command(elapsed):
                     q = _jt.interpolate(elapsed).reshape(7)
@@ -1597,14 +1689,71 @@ def main(cfg: DictConfig) -> int:
                         _jt_deriv(np.clip(elapsed, _jt_t0, _jt_t1)), dtype=float
                     ).reshape(7)
                     tracker.set_joint_reference(q.tolist(), velocity=dq.tolist())
-                    txyz, trot = ik.fk_ee(q)  # commanded EE pose, for error/viz
-                    wp = _jt.waypoint_index_at(elapsed)
-                    aidx = min(int(_gmap[min(wp, len(_gmap) - 1)]), horizon - 1)
+                    txyz, trot = _fk_policy_frame(q)
+                    # Same gripper indexing as the cartesian tracker: nearest
+                    # waypoint on the bridge-prepended trajectory, clamped — fires
+                    # one plan step early, pre-compensating gripper actuation lag.
+                    aidx = min(_jt.waypoint_index_at(elapsed), horizon - 1)
                     return txyz, trot, aidx
 
+                # Terminal settle: hold the final joint reference with a slow
+                # joint-space integrator that cancels the impedance controller's
+                # friction/gravity steady-state offset, and gate the replan on the
+                # measured O_T_EE being within tolerance of the plan's final pose.
+                _settle = {
+                    "integ": np.zeros(7), "last_t": None, "ok": 0,
+                    "pos_err": float("nan"), "rot_err": float("nan"),
+                }
+
                 def _final_command():
-                    qf = _jt.interpolate(_jt_t1).reshape(7)
-                    tracker.set_joint_reference(qf.tolist())
+                    now = time.monotonic()
+                    dt_i = execution_dt if _settle["last_t"] is None \
+                        else max(now - _settle["last_t"], 0.0)
+                    _settle["last_t"] = now
+                    meas = robot.latest_state
+                    if meas is not None:
+                        q_meas = np.asarray(meas["q"], dtype=np.float64)
+                        e = _q_final - q_meas
+                        if settle_ki > 0.0:
+                            active = np.abs(e) > settle_deadband_rad
+                            _settle["integ"] = np.clip(
+                                _settle["integ"] + settle_ki * np.where(active, e, 0.0) * dt_i,
+                                -settle_imax_rad, settle_imax_rad,
+                            )
+                        ee_pos_m, ee_rot_m, _ = _read_ee_pose_from_state(meas)
+                        perr = float(np.linalg.norm(_final_tpos - ee_pos_m))
+                        R_e = _final_trot @ ee_rot_m.T
+                        rerr = float(np.arccos(np.clip(
+                            (np.trace(R_e) - 1.0) / 2.0, -1.0, 1.0)))
+                        _settle["pos_err"], _settle["rot_err"] = perr, rerr
+                        _settle["ok"] = (
+                            _settle["ok"] + 1
+                            if (perr <= settle_pos_tol_m and rerr <= settle_rot_tol_rad)
+                            else 0
+                        )
+                    tracker.set_joint_reference((_q_final + _settle["integ"]).tolist())
+
+                def _hold_done(t0):
+                    el = time.monotonic() - t0
+                    if el < settle_min_hold_s:
+                        return False
+                    if _settle["ok"] >= settle_consecutive:
+                        logger.info(
+                            "  plan %d SETTLED in %.2fs (pos_err=%.1fmm rot_err=%.2fdeg)",
+                            plan.sequence, el,
+                            _settle["pos_err"] * 1e3, np.degrees(_settle["rot_err"]),
+                        )
+                        return True
+                    if el >= settle_timeout_s:
+                        logger.warning(
+                            "  plan %d settle TIMEOUT after %.2fs "
+                            "(pos_err=%.1fmm rot_err=%.2fdeg, tol=%.1fmm/%.2fdeg) — replanning anyway",
+                            plan.sequence, el,
+                            _settle["pos_err"] * 1e3, np.degrees(_settle["rot_err"]),
+                            settle_pos_tol_m * 1e3, np.degrees(settle_rot_tol_rad),
+                        )
+                        return True
+                    return False
 
             visualizer.update_plan_waypoints(plan.trajectory, 0)
             logger.info(
@@ -1706,12 +1855,13 @@ def main(cfg: DictConfig) -> int:
                 plan.sequence, plan_active_index, horizon, hold_s,
             )
 
-            # 5. Hold final reference for hold_s seconds so the arm settles before
-            #    the next observation capture.
-            hold_end = time.monotonic() + hold_s
+            # 5. Terminal hold so the arm settles before the next observation
+            #    capture. Cartesian: fixed hold_s. Joint: settle-until-tolerance
+            #    (integrator-assisted; see _final_command/_hold_done above).
+            hold_started = time.monotonic()
             next_tick = time.monotonic()
 
-            while not stop_event.is_set() and time.monotonic() < hold_end:
+            while not stop_event.is_set() and not _hold_done(hold_started):
                 _poll_buttons()
                 if mode == TELEOP:
                     break
