@@ -10,7 +10,6 @@ from urllib.parse import unquote, urlparse
 import numpy as np
 
 from clear_franka.geometry import load_T_cam2base, load_T_cam2gripper
-from clear_franka.workspace_boxes import WorkspaceBoxEditor
 
 
 DEFAULT_ARM_JOINT_NAMES = tuple(f"fr3_joint{i}" for i in range(1, 8))
@@ -246,20 +245,6 @@ class CortadoViserVisualizer:
         closed_fraction = 1.0 - opening_width_m / float(max_width_m)
         self._cfg[self._gripper_joint_index] = closed_fraction * DEFAULT_GRIPPER_JOINT_CLOSED
         self.urdf.update_cfg(self._cfg)
-
-    def enable_workspace_box_editor(
-        self,
-        json_path: str | Path = "data/workspace_boxes.json",
-        **kwargs,
-    ) -> WorkspaceBoxEditor:
-        self.workspace_box_editor = WorkspaceBoxEditor(self, json_path=json_path, **kwargs)
-        print(f"  [viser] Workspace box editor saving to {self.workspace_box_editor.path}")
-        return self.workspace_box_editor
-
-    def get_workspace_boxes(self) -> list[dict]:
-        if self.workspace_box_editor is None:
-            return []
-        return self.workspace_box_editor.boxes
 
     def add_camera_frame(
         self,
