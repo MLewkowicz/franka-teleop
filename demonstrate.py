@@ -12,10 +12,10 @@ import json
 import os
 import time
 
-import hydra
 import numpy as np
 from franky import JointMotion, JointState, PilotButton, RobotWebSession
-from omegaconf import DictConfig
+
+from clear_franka.config import ConfigDict, load_app_config
 
 from clear_franka.franka import (
     DEFAULT_LOWER_JOINT_LIMITS,
@@ -29,7 +29,7 @@ from clear_franka.robotiq_net_proxy import RobotiqGripperProxy
 from clear_franka.utils import LoopRatePrinter, announce
 
 
-def _desk_credentials(cfg: DictConfig) -> tuple[str, str, str]:
+def _desk_credentials(cfg: ConfigDict) -> tuple[str, str, str]:
     desk_cfg = cfg.get("desk", {})
     hostname = str(desk_cfg.get("hostname", cfg.robot.ip))
     username = desk_cfg.get("username") or os.environ.get("FRANKA_DESK_USERNAME")
@@ -60,7 +60,7 @@ def _toggle_gripper(gripper, gripper_open: bool, gripper_cfg, visualizer=None) -
     return not gripper_open
 
 
-def _setup_cameras(cfg: DictConfig, record_cameras: bool, pointcloud_enabled: bool, pointcloud_source: str):
+def _setup_cameras(cfg: ConfigDict, record_cameras: bool, pointcloud_enabled: bool, pointcloud_source: str):
     cameras = {}
     pointcloud_camera = None
     if pointcloud_enabled or (
@@ -98,7 +98,7 @@ def _setup_cameras(cfg: DictConfig, record_cameras: bool, pointcloud_enabled: bo
     return cameras, pointcloud_camera, pointcloud_enabled
 
 
-def _metadata_for_cameras(cameras: dict, cfg: DictConfig, vc) -> dict:
+def _metadata_for_cameras(cameras: dict, cfg: ConfigDict, vc) -> dict:
     metadata = {}
     for cam_name in cameras:
         ext_path = cfg.get("cameras", {}).get(cam_name, {}).get(
@@ -113,7 +113,7 @@ def _metadata_for_cameras(cameras: dict, cfg: DictConfig, vc) -> dict:
     return metadata
 
 
-def run_demonstrate(cfg: DictConfig):
+def run_demonstrate(cfg: ConfigDict):
     from zero_franky import Robot
     from zero_franky.tracker_policies import hold_current_joint
 
@@ -371,8 +371,7 @@ def run_demonstrate(cfg: DictConfig):
                     stop_tracker_motion(robot, session, join_timeout=1.0, idle_timeout_s=2.0)
 
 
-@hydra.main(version_base=None, config_path="conf", config_name="config")
-def main(cfg: DictConfig):
+def main(cfg: ConfigDict):
     from zero_franky import setup_zero_franky
 
     setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port, pub_port=cfg.zero_franky.pub_port)
@@ -380,4 +379,4 @@ def main(cfg: DictConfig):
 
 
 if __name__ == "__main__":
-    main()
+    main(load_app_config(__file__))

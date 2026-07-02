@@ -26,13 +26,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 import viser
-from omegaconf import DictConfig
 from scipy.spatial.transform import Rotation as R
 
 from zero_franky import Robot
 from zero_franky.tracker_policies import hold_current_joint
 
 from clear_franka.camera import ZedCamera, get_camera_config
+from clear_franka.config import ConfigDict, load_app_config
 from clear_franka.geometry import (
     average_transforms as _average_transforms,
     invert_transform as _invert_transform,
@@ -94,7 +94,7 @@ def _solve_board2base(R_gripper2base_list, t_gripper2base_list, R_target2cam_lis
 # ---------------------------------------------------------------------------
 
 
-def _build_board(cfg: DictConfig):
+def _build_board(cfg: ConfigDict):
     aruco_dict = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, cfg.dictionary))
     board = cv2.aruco.CharucoBoard(
         size=(cfg.squares_x, cfg.squares_y),
@@ -432,7 +432,7 @@ def _capture_kinesthetic(robot, camera, joint_stiffnesses, cal, detector, board,
     return samples
 
 
-def _demonstration_joint_friction_kwargs(cfg: DictConfig) -> dict:
+def _demonstration_joint_friction_kwargs(cfg: ConfigDict) -> dict:
     """Resolve the same config-driven friction parameters used by demonstrate.py."""
     kwargs = joint_friction_kwargs(cfg.demonstrate)
     if kwargs:
@@ -451,7 +451,7 @@ def _demonstration_joint_friction_kwargs(cfg: DictConfig) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def run_calibration(cfg: DictConfig):
+def run_calibration(cfg: ConfigDict):
     cal = cfg.calibration
     camera_mount = cal.get("camera_mount", "third_person")
     if camera_mount not in ("third_person", "hand"):
@@ -633,3 +633,11 @@ def run_calibration(cfg: DictConfig):
     with out_path.open("w") as f:
         json.dump(payload, f, indent=2)
     logger.info("Wrote %s", out_path)
+
+
+if __name__ == "__main__":
+    from zero_franky import setup_zero_franky
+
+    cfg = load_app_config(__file__)
+    setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port, pub_port=cfg.zero_franky.pub_port)
+    run_calibration(cfg)

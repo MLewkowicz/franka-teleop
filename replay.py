@@ -5,8 +5,8 @@ from pathlib import Path
 
 import h5py
 import numpy as np
-from omegaconf import DictConfig
 
+from clear_franka.config import ConfigDict, load_app_config
 from zero_franky import Robot
 from franky import JointMotion, JointState
 
@@ -43,7 +43,7 @@ def prompt_reverse_reset() -> bool:
 def play_joint_trajectory(
     *,
     robot: Robot,
-    rc: DictConfig,
+    rc: ConfigDict,
     gc,
     stiffness: np.ndarray,
     timestamps: np.ndarray,
@@ -142,7 +142,7 @@ def play_with_recovery(**kwargs):
             print("  Recovering and retrying...")
 
 
-def run_replay(cfg: DictConfig):
+def run_replay(cfg: ConfigDict):
     rc = cfg.replay
     gc = cfg.get("gripper", {})
 
@@ -316,3 +316,11 @@ def run_replay(cfg: DictConfig):
             gripper.disconnect()
         for cam in cameras.values():
             cam.close()
+
+
+if __name__ == "__main__":
+    from zero_franky import setup_zero_franky
+
+    cfg = load_app_config(__file__)
+    setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port, pub_port=cfg.zero_franky.pub_port)
+    run_replay(cfg)
