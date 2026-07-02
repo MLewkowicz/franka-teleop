@@ -38,7 +38,7 @@ RESET_LONG_PRESS_S = 0.8
 
 def run_teleop(cfg: DictConfig):
     from zero_franky import Robot
-    from franky import Affine, JointMotion, JointState, JointStopMotion, Twist
+    from franky import Affine, JointMotion, JointState, JointStopMotion, PostureTask, Twist
 
     tc = cfg.teleop
     sc = tc.spacemouse
@@ -277,11 +277,17 @@ def run_teleop(cfg: DictConfig):
             left_press_time = None
             left_used_in_record = False
 
+            nullspace_stiffness = float(tc.nullspace_stiffness)
+            nullspace_tasks = (
+                [PostureTask(target=reset_joint_config.tolist(), stiffness=nullspace_stiffness)]
+                if nullspace_stiffness > 0
+                else None
+            )
             session = robot.start_cartesian_impedance_session(
                 period=0.001,
                 translational_stiffness=tc.translational_stiffness,
                 rotational_stiffness=tc.rotational_stiffness,
-                nullspace_stiffness=tc.nullspace_stiffness,
+                nullspace_tasks=nullspace_tasks,
                 lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
                 upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
             )
