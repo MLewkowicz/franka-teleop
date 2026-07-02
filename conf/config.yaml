@@ -19,12 +19,19 @@ teleop:
   nullspace_stiffness: 2.0
   reset_joint_config: [-0.06217873,  0.11705305, -0.5995304 , -2.72505689,  1.98229098, 1.78315043,  0.44959301]
   record: joints                # joints = joint data only; all = joint data + cameras
+  input_device: spacemouse       # spacemouse | oculus
   spacemouse:
     control_rate: 120
     smoothing_factor: 0.3
     softmax_temp: 0.85
     translation_deadband: 0.08
     rotation_deadband: 0.08
+  oculus:
+    control_rate: 50
+    right_controller: true
+    ip_address: null             # null = USB; set to headset IP for wireless ADB
+    pos_offset_gain: 3.0         # scales clutch position offset (m) into ~[-1, 1]
+    rot_offset_gain: 1.0         # scales clutch rotation offset (rad) into ~[-1, 1]
 
 demonstrate:
   joint_stiffness: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]

@@ -2,15 +2,18 @@
 name = "franka-teleop"
 version = "0.1.0"
 description = "Teleoperation and trajectory recording for Franka Emika robots"
-requires-python = ">=3.12"
+requires-python = "==3.12.*"
 dependencies = [
-    "zero-franky",
     "franky-control",
+    "zero-franky",
     "numpy>=1.20",
     "h5py>=3.0",
     "hydra-core>=1.3",
     "robot-descriptions",
     "threedmouse",
+    "oculus_reader",
+    "ruckig",
+    "toppra",
     "trimesh",
     "viser",
     "xacrodoc",
@@ -25,8 +28,9 @@ camera = [
 
 [tool.uv.sources]
 zero-franky = { path = "../zero_franky", editable = true }
+oculus_reader = { git = "https://github.com/jborbik/oculus_reader" }
 pyzed = { url = "https://download.stereolabs.com/zedsdk/5.2/whl/linux_x86_64/pyzed-5.2-cp312-cp312-linux_x86_64.whl" }
-franky-control = { url = "https://github.com/nickswalker/franky/releases/download/wheels-libfranka-0.21.1/franky_control-1.1.3+impedance.libfranka.0.21.1-cp312-cp312-manylinux_2_28_x86_64.whl" }
+franky-control = { url = "https://github.com/nickswalker/franky/releases/download/wheels-libfranka-0.21.2/franky_control-1.1.4+impedance.libfranka.0.21.2-cp312-cp312-manylinux_2_28_x86_64.whl" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]

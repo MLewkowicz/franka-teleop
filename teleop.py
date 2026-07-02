@@ -6,6 +6,10 @@ Hold the left button to reset to the configured start joint config.
 Tap the right button to toggle the gripper open/closed.
 Tap both buttons together to start/stop recording.
 Press Ctrl-C to stop.
+
+Set `teleop.input_device=oculus` to drive the same controls from an Oculus/Meta
+Quest VR controller instead (see `oculus_controller.py`): grip = left button,
+index trigger = right button.
 """
 
 import contextlib
@@ -52,17 +56,32 @@ def run_teleop(cfg: DictConfig):
     robot = Robot(cfg.robot.ip)
     robot.recover_from_errors()
 
-    mouse = ThreeDMouse(control_rate=sc.control_rate)
-    mouse._frame_rotation_linear = np.array([
-        [0, 1, 0],
-        [-1, 0, 0],
-        [0, 0, 1],
-    ], dtype=float)
-    mouse._frame_rotation_angular = np.array([
-        [1, 0, 0],
-        [0, 1, 0],
-        [0, 0, -1],
-    ], dtype=float)
+    input_device = str(tc.get("input_device", "spacemouse"))
+    if input_device == "oculus":
+        from oculus_controller import OculusController
+
+        oc = tc.oculus
+        mouse = OculusController(
+            control_rate=oc.control_rate,
+            right_controller=bool(oc.get("right_controller", True)),
+            ip_address=oc.get("ip_address", None),
+            pos_offset_gain=float(oc.get("pos_offset_gain", 3.0)),
+            rot_offset_gain=float(oc.get("rot_offset_gain", 1.0)),
+        )
+    elif input_device == "spacemouse":
+        mouse = ThreeDMouse(control_rate=sc.control_rate)
+        mouse._frame_rotation_linear = np.array([
+            [0, 1, 0],
+            [-1, 0, 0],
+            [0, 0, 1],
+        ], dtype=float)
+        mouse._frame_rotation_angular = np.array([
+            [1, 0, 0],
+            [0, 1, 0],
+            [0, 0, -1],
+        ], dtype=float)
+    else:
+        raise ValueError(f"Unknown teleop.input_device: {input_device!r}")
     mouse.run()
 
     input_filter = ThreeDMouseFilter(
@@ -200,7 +219,7 @@ def run_teleop(cfg: DictConfig):
             print(f"  [viser] {pointcloud_source} ZED point cloud enabled.")
 
 
-    print("SpaceMouse teleop ready.")
+    print(f"{'Oculus' if input_device == 'oculus' else 'SpaceMouse'} teleop ready.")
     print("  Tap LEFT to toggle motion on/off.")
     print(f"  Hold LEFT ({RESET_LONG_PRESS_S}s) to reset to start joint config.")
     if gripper is not None:
