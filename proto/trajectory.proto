@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package franka_teleop.v1;
+
+message Vector3 {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+}
+
+message Quaternion {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+  double w = 4;
+}
+
+message Pose {
+  Vector3 position_m = 1;
+  Quaternion orientation = 2;
+  string parent_frame = 3;
+  string child_frame = 4;
+}
+
+message Twist {
+  Vector3 linear_m_s = 1;
+  Vector3 angular_rad_s = 2;
+  string frame = 3;
+}
+
+message JointState {
+  repeated double position_rad = 1;
+  repeated double velocity_rad_s = 2;
+  repeated double effort_nm = 3;
+}
+
+message GripperState {
+  optional double width_m = 1;
+  optional double velocity_m_s = 2;
+  optional double force_n = 3;
+  optional bool commanded_open = 4;
+}
+
+message ControlInput {
+  Twist commanded_twist = 1;
+  uint32 buttons = 2;
+  bool enabled = 3;
+}
+
+message TrajectorySample {
+  uint64 sequence = 1;
+  uint64 episode_time_ns = 2;
+  optional double robot_time_s = 3;
+  JointState joints = 4;
+  Pose end_effector_pose = 5;
+  GripperState gripper = 6;
+  ControlInput control = 7;
+}

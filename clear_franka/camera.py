@@ -1,17 +1,10 @@
-"""ZED 2i camera capture and recording for teleoperation.
-
-Runs camera capture in a background daemon thread. Records RGB + depth
-frames to a separate HDF5 video file, synchronized with trajectory
-recording via a shared monotonic clock epoch.
-"""
+"""ZED 2i camera capture and native SVO2 recording for teleoperation."""
 
 import logging
 import threading
 import time
-from pathlib import Path
 from typing import Optional
 
-import h5py
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -53,7 +46,7 @@ def enabled_camera_names(cfg, include: tuple[str, ...] = ()) -> list[str]:
 
 
 class ZedCamera:
-    """Threaded ZED camera capture with HDF5 video recording."""
+    """Threaded ZED camera capture with native SVO2 recording."""
 
     def __init__(self, resolution="HD720", fps=30, depth_mode="PERFORMANCE",
                  serial_number=None, camera_id=None):
@@ -97,9 +90,9 @@ class ZedCamera:
         self._rec_lock = threading.Lock()
         self._recording = False
         self._svo_recording = False
-        self._video_file: Optional[h5py.File] = None
-        self._start_time = 0.0
         self._frame_count = 0
+        self._first_clock_anchor = None
+        self._last_clock_anchor = None
 
         # Pre-allocate retrieval buffers
         self._rgb_mat = sl.Mat()
@@ -130,54 +123,30 @@ class ZedCamera:
     # Recording control
     # ------------------------------------------------------------------
 
-    def start_recording(self, video_path: str, start_time: float,
-                        svo: bool = False, svo_compression: str = "H264"):
-        """Begin recording frames to disk.
+    def start_recording(self, video_path: str, svo_compression: str = "H264"):
+        """Begin recording native stereo frames to an SVO2 file.
 
         Args:
-            video_path: Output path. HDF5 (.hdf5) or SVO2 (.svo2) depending on ``svo``.
-            start_time: The time.monotonic() epoch shared with the trajectory
-                        recorder, for synchronized timestamps.
-            svo: If True, record a native ZED SVO2 file instead of HDF5.
-            svo_compression: SVO compression mode name (H264, H265, LOSSLESS,
-                             H264_LOSSLESS, H265_LOSSLESS). Ignored when svo=False.
+            video_path: Output SVO2 path.
+            svo_compression: H264, H265, LOSSLESS, H264_LOSSLESS, or H265_LOSSLESS.
         """
         with self._rec_lock:
             if self._recording:
                 return
 
-            if svo:
-                sl = self._sl
-                recording_params = sl.RecordingParameters()
-                recording_params.video_filename = video_path
-                recording_params.compression_mode = getattr(
-                    sl.SVO_COMPRESSION_MODE, svo_compression
-                )
-                err = self._zed.enable_recording(recording_params)
-                if err != sl.ERROR_CODE.SUCCESS:
-                    raise RuntimeError(f"Failed to start SVO recording: {err}")
-                self._svo_recording = True
-                self._video_file = None
-            else:
-                h, w = self._img_h, self._img_w
-                f = h5py.File(video_path, "w")
-                f.create_dataset(
-                    "rgb", shape=(0, h, w, 3), maxshape=(None, h, w, 3),
-                    dtype=np.uint8, chunks=(1, h, w, 3), compression="lzf",
-                )
-                f.create_dataset(
-                    "depth", shape=(0, h, w), maxshape=(None, h, w),
-                    dtype=np.float32, chunks=(1, h, w), compression="lzf",
-                )
-                f.create_dataset(
-                    "timestamps", shape=(0,), maxshape=(None,),
-                    dtype=np.float64, chunks=(256,),
-                )
-                self._svo_recording = False
-                self._video_file = f
-
-            self._start_time = start_time
+            sl = self._sl
+            recording_params = sl.RecordingParameters()
+            recording_params.video_filename = video_path
+            recording_params.compression_mode = getattr(
+                sl.SVO_COMPRESSION_MODE, svo_compression
+            )
+            err = self._zed.enable_recording(recording_params)
+            if err != sl.ERROR_CODE.SUCCESS:
+                raise RuntimeError(f"Failed to start SVO recording: {err}")
+            self._svo_recording = True
             self._frame_count = 0
+            self._first_clock_anchor = None
+            self._last_clock_anchor = None
             self._recording = True
             logger.info("  [camera] Recording started: %s", video_path)
 
@@ -185,35 +154,23 @@ class ZedCamera:
         """Stop recording and close the video file.
 
         Returns:
-            (camera_timestamps, frame_count) or (None, 0) if not recording.
-            camera_timestamps is None for SVO recordings (timestamps are
-            embedded in the SVO file).
+            Frame count and first/last ZED-image-to-host-monotonic clock anchors.
         """
         with self._rec_lock:
             if not self._recording:
-                return None, 0
+                return {"frame_count": 0}
             self._recording = False
-            svo = self._svo_recording
             self._svo_recording = False
 
-            f = self._video_file
-            self._video_file = None
-
         n = self._frame_count
-        if svo:
-            self._zed.disable_recording()
-            logger.info("  [camera] SVO recording stopped, %d frames", n)
-            return None, n
-
-        # Read back timestamps (file access outside lock is fine since
-        # the capture loop won't touch it after _recording is False).
-        if n > 0:
-            timestamps = f["timestamps"][:n]
-        else:
-            timestamps = None
-        f.close()
-        logger.info("  [camera] Recording stopped, %d frames", n)
-        return timestamps, n
+        self._zed.disable_recording()
+        logger.info("  [camera] SVO recording stopped, %d frames", n)
+        result = {"frame_count": n}
+        for label, anchor in (("first", self._first_clock_anchor), ("last", self._last_clock_anchor)):
+            if anchor is not None:
+                result[f"{label}_zed_image_time_ns"] = anchor[0]
+                result[f"{label}_host_monotonic_time_ns"] = anchor[1]
+        return result
 
     # ------------------------------------------------------------------
     # Synchronous access (used by calibration; safe before run() is called)
@@ -310,34 +267,13 @@ class ZedCamera:
                     continue
 
                 if recording:
-                    if self._svo_recording:
-                        # ZED SDK writes the SVO frame automatically on grab().
-                        self._frame_count += 1
-                    else:
-                        ts = now - self._start_time
-
-                        # Retrieve left RGB (BGRA) and depth
-                        self._zed.retrieve_image(self._rgb_mat, sl.VIEW.LEFT)
-                        self._zed.retrieve_measure(self._depth_mat, sl.MEASURE.DEPTH)
-
-                        rgb = self._rgb_mat.get_data()[:, :, :3]    # BGRA → BGR
-                        rgb = rgb[:, :, ::-1].copy()                 # BGR → RGB
-                        depth = self._depth_mat.get_data().copy()
-
-                        # Append to HDF5 datasets
-                        i = self._frame_count
-                        f = self._video_file
-
-                        f["rgb"].resize(i + 1, axis=0)
-                        f["rgb"][i] = rgb
-
-                        f["depth"].resize(i + 1, axis=0)
-                        f["depth"][i] = depth
-
-                        f["timestamps"].resize(i + 1, axis=0)
-                        f["timestamps"][i] = ts
-
-                        self._frame_count = i + 1
+                    # ZED SDK writes the SVO frame automatically on grab().
+                    self._frame_count += 1
+                    image_time_ns = self._zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_nanoseconds()
+                    anchor = (int(image_time_ns), time.monotonic_ns())
+                    if self._first_clock_anchor is None:
+                        self._first_clock_anchor = anchor
+                    self._last_clock_anchor = anchor
 
                 if should_capture_pointcloud:
                     self._retrieve_pointcloud(now)

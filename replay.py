@@ -3,8 +3,11 @@
 import time
 from pathlib import Path
 
-import h5py
 import numpy as np
+from mcap.reader import make_reader
+from mcap_protobuf.decoder import DecoderFactory
+
+from clear_franka.recorder import TRAJECTORY_TOPIC
 
 from clear_franka.config import ConfigDict, load_app_config
 from zero_franky import Robot
@@ -15,19 +18,76 @@ from clear_franka.franka import DEFAULT_LOWER_JOINT_LIMITS, DEFAULT_UPPER_JOINT_
 
 def find_latest_episode(data_dir: str) -> Path:
     data_path = Path(data_dir)
-    episodes = sorted(data_path.glob("episode_*.h5"))
+    episodes = sorted(data_path.glob("episode_*.mcap"))
     if not episodes:
         raise FileNotFoundError(f"No episodes found in {data_dir}")
     return episodes[-1]
 
 
 def load_episode(path: Path) -> dict:
-    data = {}
-    with h5py.File(path, "r") as f:
-        for key in f.keys():
-            if isinstance(f[key], h5py.Dataset):
-                data[key] = f[key][:]
-        data["attrs"] = dict(f.attrs)
+    samples = []
+    attrs = {}
+    with open(path, "rb") as stream:
+        reader = make_reader(stream, decoder_factories=[DecoderFactory()])
+        for metadata in reader.iter_metadata():
+            attrs.update(metadata.metadata)
+        for _, _, _, sample in reader.iter_decoded_messages(topics=[TRAJECTORY_TOPIC]):
+            samples.append(sample)
+    if not samples:
+        raise ValueError(f"No {TRAJECTORY_TOPIC} samples found in {path}")
+
+    def optional(sample, field):
+        return getattr(sample, field) if sample.HasField(field) else np.nan
+
+    def rotation_matrix(q):
+        x, y, z, w = q.x, q.y, q.z, q.w
+        return np.array([
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ])
+
+    def joint_vector(values):
+        return list(values) if values else [np.nan] * 7
+
+    data = {
+        "timestamps": np.asarray([sample.episode_time_ns / 1e9 for sample in samples]),
+        "robot_abs_time": np.asarray([optional(sample, "robot_time_s") for sample in samples]),
+        "joint_pos": np.asarray([joint_vector(sample.joints.position_rad) for sample in samples]),
+        "joint_vel": np.asarray([joint_vector(sample.joints.velocity_rad_s) for sample in samples]),
+        "ee_pos": np.asarray([
+            [sample.end_effector_pose.position_m.x,
+             sample.end_effector_pose.position_m.y,
+             sample.end_effector_pose.position_m.z]
+            if sample.HasField("end_effector_pose") else [np.nan] * 3
+            for sample in samples
+        ]),
+        "ee_rot": np.asarray([
+            rotation_matrix(sample.end_effector_pose.orientation)
+            if sample.HasField("end_effector_pose") else np.full((3, 3), np.nan)
+            for sample in samples
+        ]),
+        "cmd_linear_vel": np.asarray([
+            [sample.control.commanded_twist.linear_m_s.x,
+             sample.control.commanded_twist.linear_m_s.y,
+             sample.control.commanded_twist.linear_m_s.z]
+            for sample in samples
+        ]),
+        "cmd_angular_vel": np.asarray([
+            [sample.control.commanded_twist.angular_rad_s.x,
+             sample.control.commanded_twist.angular_rad_s.y,
+             sample.control.commanded_twist.angular_rad_s.z]
+            for sample in samples
+        ]),
+        "buttons": np.asarray([sample.control.buttons for sample in samples]),
+        "enabled": np.asarray([sample.control.enabled for sample in samples]),
+        "gripper_open": np.asarray([
+            float(sample.gripper.commanded_open)
+            if sample.HasField("gripper") and sample.gripper.HasField("commanded_open") else np.nan
+            for sample in samples
+        ]),
+    }
+    data["attrs"] = attrs
     return data
 
 
@@ -192,16 +252,11 @@ def run_replay(cfg: ConfigDict):
     gripper = None
     if has_gripper_data and gc.get("enabled", False):
         try:
-            from clear_franka.robotiq_net_proxy import RobotiqGripperProxy
+            from zero_franky.robotiq import RobotiqGripperProxy
 
             gripper = RobotiqGripperProxy(
                 server_host=gc.host,
                 server_port=int(gc.port),
-                com_port=gc.com_port,
-                device_id=int(gc.device_id),
-                connection_type=gc.connection_type,
-                tcp_host=gc.tcp_host,
-                tcp_port=int(gc.tcp_port),
                 auto_activate=True,
             )
         except Exception as e:
