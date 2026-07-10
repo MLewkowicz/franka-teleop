@@ -61,11 +61,6 @@ gripper:
   enabled: true
   host: "172.16.0.1"
   port: 18815
-  com_port: auto
-  device_id: 9
-  connection_type: RTU    # RTU | RTU_VIA_TCP
-  tcp_host: "127.0.0.1"
-  tcp_port: 54321
   initial_open: true
   open_width_m: 0.085
   close_width_m: 0.0
