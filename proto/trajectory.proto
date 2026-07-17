@@ -28,6 +28,15 @@ message Twist {
   string frame = 3;
 }
 
+// libfranka's model-based estimate of external force/torque acting on the
+// robot (from joint torque sensing + dynamics model), not a calibrated F/T
+// sensor reading.
+message Wrench {
+  Vector3 force_n = 1;
+  Vector3 torque_nm = 2;
+  string frame = 3;
+}
+
 message JointState {
   repeated double position_rad = 1;
   repeated double velocity_rad_s = 2;
@@ -39,6 +48,9 @@ message GripperState {
   optional double velocity_m_s = 2;
   optional double force_n = 3;
   optional bool commanded_open = 4;
+  optional double motor_current_ma = 5;
+  optional int32 object_detection = 6;  // gOBJ: 0=moving 1=stopped-opening 2=stopped-closing 3=at-target
+  optional double measured_age_s = 7;   // age of width_m/motor_current_ma/object_detection at capture time
 }
 
 message ControlInput {
@@ -55,4 +67,21 @@ message TrajectorySample {
   Pose end_effector_pose = 5;
   GripperState gripper = 6;
   ControlInput control = 7;
+  // K_F_ext_hat_K: external wrench in the stiffness/tool frame (== end_effector_pose's
+  // frame here). Rotate by end_effector_pose.orientation to get the base-frame wrench.
+  Wrench external_wrench = 8;
+  Twist measured_twist = 9;  // O_dP_EE_est: estimated EE velocity, base frame
+}
+
+// RL bookkeeping for one control step, written only during policy rollouts (never
+// during plain teleop demonstration recording). Joined to its TrajectorySample by
+// `sequence` within the same episode, rather than folded into TrajectorySample
+// itself, since these fields are meaningless outside a rollout.
+message RolloutStep {
+  uint64 sequence = 1;
+  double reward = 2;
+  bool terminal = 3;
+  string termination_reason = 4;  // "success" | "timeout" | "manual_abort"; empty when not terminal
+  bool is_intervention = 5;       // true when the TrajectorySample.control this step applied was a human override
+  ControlInput policy_action = 6; // what the policy proposed this step, whether or not it was applied
 }

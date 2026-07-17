@@ -18,14 +18,17 @@ from clear_franka.proto.trajectory_pb2 import (
     JointState,
     Pose,
     Quaternion,
+    RolloutStep,
     TrajectorySample,
     Twist,
     Vector3,
+    Wrench,
 )
 
 
 EPISODE_SCHEMA_VERSION = "1.0"
 TRAJECTORY_TOPIC = "/franka/trajectory"
+ROLLOUT_TOPIC = "/franka/rollout"
 
 
 def _safe_name(name: str) -> str:
@@ -46,6 +49,16 @@ def _finite_float(value):
 def _vector3(value) -> Vector3:
     values = np.asarray(value, dtype=float)
     return Vector3(x=values[0], y=values[1], z=values[2])
+
+
+def _wrench(value, frame: str) -> Wrench | None:
+    """Build a Wrench from a 6-vector [Fx, Fy, Fz, Tx, Ty, Tz], or None if unavailable."""
+    if value is None:
+        return None
+    values = np.asarray(value, dtype=float)
+    if values.shape != (6,) or not np.all(np.isfinite(values)):
+        return None
+    return Wrench(force_n=_vector3(values[:3]), torque_nm=_vector3(values[3:]), frame=frame)
 
 
 def _quaternion(rotation) -> Quaternion:
@@ -72,7 +85,7 @@ class TrajectoryRecorder:
     """Record one episode to MCAP without doing file I/O in the control loop."""
 
     def __init__(self, save_dir="./data", metadata=None, cameras=None,
-                 svo_compression="H264"):
+                 svo_compression="H264", camera_format="svo"):
         self._save_dir = Path(save_dir)
         self._metadata = metadata or {}
         if cameras is None:
@@ -81,6 +94,7 @@ class TrajectoryRecorder:
             cameras = {getattr(cam, "camera_id", f"camera_{i}"): cam for i, cam in enumerate(cameras)}
         self._cameras = dict(cameras)
         self._svo_compression = svo_compression
+        self._camera_format = camera_format
         self._recording = False
         self._count = 0
         self._start_monotonic_ns = 0
@@ -98,6 +112,10 @@ class TrajectoryRecorder:
     def toggle(self):
         self.stop() if self._recording else self.start()
 
+    def _video_filename(self, camera_name: str) -> str:
+        extension = "svo2" if self._camera_format == "svo" else "mp4"
+        return f"episode_{self._start_name}_{_safe_name(camera_name)}_video.{extension}"
+
     def start(self):
         if self._recording:
             return
@@ -114,8 +132,8 @@ class TrajectoryRecorder:
 
         try:
             for name, camera in self._cameras.items():
-                path = self._save_dir / f"episode_{self._start_name}_{_safe_name(name)}_video.svo2"
-                camera.start_recording(str(path), svo_compression=self._svo_compression)
+                path = self._save_dir / self._video_filename(name)
+                camera.start_recording(str(path), svo_compression=self._svo_compression, format=self._camera_format)
         except Exception:
             self._queue.put(None)
             self._thread.join()
@@ -141,10 +159,15 @@ class TrajectoryRecorder:
         print(f"  [recorder] SAVED {self._count} steps to {self._path}")
 
     def step(self, ee_pos, ee_rot, cmd_linear_vel, cmd_angular_vel,
-             buttons, enabled, joint_pos=None, joint_vel=None, gripper_open=None,
+             buttons, enabled, joint_pos=None, joint_vel=None, joint_effort=None,
+             gripper_open=None, measured_width_m=None, motor_current_ma=None,
+             object_detection=None, measured_age_s=None,
+             ext_wrench=None, measured_linear_vel=None, measured_angular_vel=None,
              robot_abs_time=None):
+        """Record one robot observation+action sample. Returns its sequence number
+        (for joining a later log_rollout_step() call to it), or None if not recording."""
         if not self._recording:
-            return
+            return None
         elapsed_ns = time.monotonic_ns() - self._start_monotonic_ns
         pose = None if ee_pos is None or ee_rot is None else Pose(
             position_m=_vector3(ee_pos),
@@ -158,6 +181,7 @@ class TrajectoryRecorder:
             joints=JointState(
                 position_rad=_values(joint_pos),
                 velocity_rad_s=_values(joint_vel),
+                effort_nm=_values(joint_effort),
             ),
             control=ControlInput(
                 commanded_twist=Twist(
@@ -171,14 +195,65 @@ class TrajectoryRecorder:
         )
         if pose is not None:
             sample.end_effector_pose.CopyFrom(pose)
+        wrench = _wrench(ext_wrench, "stiffness")
+        if wrench is not None:
+            sample.external_wrench.CopyFrom(wrench)
+        if measured_linear_vel is not None and measured_angular_vel is not None:
+            sample.measured_twist.CopyFrom(Twist(
+                linear_m_s=_vector3(measured_linear_vel),
+                angular_rad_s=_vector3(measured_angular_vel),
+                frame="base",
+            ))
         robot_time = _finite_float(robot_abs_time)
         if robot_time is not None:
             sample.robot_time_s = robot_time
         gripper_command = _finite_float(gripper_open)
-        if gripper_command is not None:
-            sample.gripper.CopyFrom(GripperState(commanded_open=bool(round(gripper_command))))
+        measured_width = _finite_float(measured_width_m)
+        motor_current = _finite_float(motor_current_ma)
+        measured_age = _finite_float(measured_age_s)
+        if any(v is not None for v in (gripper_command, measured_width, motor_current, object_detection)):
+            gripper_state = GripperState()
+            if gripper_command is not None:
+                gripper_state.commanded_open = bool(round(gripper_command))
+            if measured_width is not None:
+                gripper_state.width_m = measured_width
+            if motor_current is not None:
+                gripper_state.motor_current_ma = motor_current
+            if object_detection is not None:
+                gripper_state.object_detection = int(object_detection)
+            if measured_age is not None:
+                gripper_state.measured_age_s = measured_age
+            sample.gripper.CopyFrom(gripper_state)
         self._queue.put(("sample", elapsed_ns, sample))
         self._count += 1
+        return sample.sequence
+
+    def log_rollout_step(self, sequence, reward, terminal=False, termination_reason="",
+                          is_intervention=False, policy_linear_vel=None, policy_angular_vel=None,
+                          policy_buttons=0, policy_enabled=False):
+        """Attach RL bookkeeping to the TrajectorySample with the given `sequence`
+        (as returned by step()). Only ever called from rollout.py, never teleop.py."""
+        if not self._recording:
+            return
+        elapsed_ns = time.monotonic_ns() - self._start_monotonic_ns
+        rollout_step = RolloutStep(
+            sequence=int(sequence),
+            reward=float(reward),
+            terminal=bool(terminal),
+            termination_reason=str(termination_reason),
+            is_intervention=bool(is_intervention),
+        )
+        if policy_linear_vel is not None and policy_angular_vel is not None:
+            rollout_step.policy_action.CopyFrom(ControlInput(
+                commanded_twist=Twist(
+                    linear_m_s=_vector3(policy_linear_vel),
+                    angular_rad_s=_vector3(policy_angular_vel),
+                    frame="base",
+                ),
+                buttons=int(policy_buttons),
+                enabled=bool(policy_enabled),
+            ))
+        self._queue.put(("rollout", elapsed_ns, rollout_step))
 
     def _episode_metadata(self):
         data = {
@@ -195,7 +270,8 @@ class TrajectoryRecorder:
             data[str(key)] = value if isinstance(value, str) else json.dumps(value)
         for name, camera in self._cameras.items():
             prefix = f"camera.{_safe_name(name)}"
-            data[f"{prefix}.video_file"] = f"episode_{self._start_name}_{_safe_name(name)}_video.svo2"
+            data[f"{prefix}.video_file"] = self._video_filename(name)
+            data[f"{prefix}.video_format"] = self._camera_format
             data[f"{prefix}.id"] = str(getattr(camera, "camera_id", name))
             data[f"{prefix}.serial_number"] = str(getattr(camera, "serial_number", "") or "")
             data[f"{prefix}.resolution"] = str(camera.resolution)
@@ -213,6 +289,12 @@ class TrajectoryRecorder:
                     message_encoding=MessageEncoding.Protobuf,
                     schema_id=schema_id,
                 )
+                rollout_schema_id = register_schema(writer, RolloutStep)
+                rollout_channel_id = writer.register_channel(
+                    topic=ROLLOUT_TOPIC,
+                    message_encoding=MessageEncoding.Protobuf,
+                    schema_id=rollout_schema_id,
+                )
                 writer.add_metadata("episode", self._episode_metadata())
                 while True:
                     item = self._queue.get()
@@ -228,6 +310,16 @@ class TrajectoryRecorder:
                             publish_time=timestamp_ns,
                             sequence=sample.sequence,
                             data=sample.SerializeToString(),
+                        )
+                    elif kind == "rollout":
+                        _, elapsed_ns, rollout_step = item
+                        timestamp_ns = self._start_wall_ns + elapsed_ns
+                        writer.add_message(
+                            channel_id=rollout_channel_id,
+                            log_time=timestamp_ns,
+                            publish_time=timestamp_ns,
+                            sequence=rollout_step.sequence,
+                            data=rollout_step.SerializeToString(),
                         )
                     else:
                         _, duration_ns, camera_summaries = item

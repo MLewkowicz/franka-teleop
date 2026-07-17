@@ -10,6 +10,45 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+class _FfmpegFrameWriter:
+    """Pipes raw BGR frames to a system `ffmpeg` subprocess for H.26x encoding.
+
+    cv2.VideoWriter can't do this: the FFmpeg bundled in the opencv-python wheel
+    omits libx264/libx265 (excluded from the prebuilt wheel), so h264/h265 fourccs
+    silently fail to open. The system ffmpeg (`apt install ffmpeg` on Ubuntu) has
+    both, so we drive it directly instead.
+    """
+
+    def __init__(self, path: str, width: int, height: int, fps: int,
+                 codec: str = "libx265", preset: str = "veryfast", crf: int = 28):
+        import shutil
+        import subprocess
+
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if ffmpeg_bin is None:
+            raise RuntimeError(
+                "ffmpeg not found on PATH; install it for RGB video recording (e.g. `sudo apt install ffmpeg`)"
+            )
+        cmd = [
+            ffmpeg_bin, "-y", "-loglevel", "error",
+            "-f", "rawvideo", "-vcodec", "rawvideo",
+            "-pix_fmt", "bgr24", "-s", f"{width}x{height}", "-r", str(fps),
+            "-i", "-",
+            "-an", "-vcodec", codec, "-pix_fmt", "yuv420p",
+            "-preset", preset, "-crf", str(crf),
+            path,
+        ]
+        self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+
+    def write(self, frame_bgr) -> None:
+        self._proc.stdin.write(frame_bgr.tobytes())
+
+    def release(self) -> None:
+        if self._proc.stdin is not None:
+            self._proc.stdin.close()
+        self._proc.wait(timeout=30)
+
+
 def get_camera_config(cfg, name: str = "third_person") -> dict:
     named = cfg.get("cameras", {}).get(name, {})
     return {
@@ -90,6 +129,8 @@ class ZedCamera:
         self._rec_lock = threading.Lock()
         self._recording = False
         self._svo_recording = False
+        self._record_format = "svo"
+        self._video_writer = None
         self._frame_count = 0
         self._first_clock_anchor = None
         self._last_clock_anchor = None
@@ -123,32 +164,44 @@ class ZedCamera:
     # Recording control
     # ------------------------------------------------------------------
 
-    def start_recording(self, video_path: str, svo_compression: str = "H264"):
-        """Begin recording native stereo frames to an SVO2 file.
+    def start_recording(self, video_path: str, svo_compression: str = "H264", format: str = "svo"):
+        """Begin recording camera video.
 
         Args:
-            video_path: Output SVO2 path.
+            video_path: Output path (.svo2 for format="svo"; a video container, e.g. .mp4,
+                for format="rgb").
             svo_compression: H264, H265, LOSSLESS, H264_LOSSLESS, or H265_LOSSLESS.
+                Only used for format="svo".
+            format: "svo" records the native stereo pair (depth reconstructable later,
+                larger files). "rgb" records only the left view as an H.265 color video
+                (via a piped system ffmpeg) — no depth, smaller files.
         """
         with self._rec_lock:
             if self._recording:
                 return
 
-            sl = self._sl
-            recording_params = sl.RecordingParameters()
-            recording_params.video_filename = video_path
-            recording_params.compression_mode = getattr(
-                sl.SVO_COMPRESSION_MODE, svo_compression
-            )
-            err = self._zed.enable_recording(recording_params)
-            if err != sl.ERROR_CODE.SUCCESS:
-                raise RuntimeError(f"Failed to start SVO recording: {err}")
-            self._svo_recording = True
+            if format == "svo":
+                sl = self._sl
+                recording_params = sl.RecordingParameters()
+                recording_params.video_filename = video_path
+                recording_params.compression_mode = getattr(
+                    sl.SVO_COMPRESSION_MODE, svo_compression
+                )
+                err = self._zed.enable_recording(recording_params)
+                if err != sl.ERROR_CODE.SUCCESS:
+                    raise RuntimeError(f"Failed to start SVO recording: {err}")
+                self._svo_recording = True
+            elif format == "rgb":
+                self._video_writer = _FfmpegFrameWriter(video_path, self._img_w, self._img_h, self._fps)
+            else:
+                raise ValueError(f"Unknown camera recording format: {format!r}")
+
+            self._record_format = format
             self._frame_count = 0
             self._first_clock_anchor = None
             self._last_clock_anchor = None
             self._recording = True
-            logger.info("  [camera] Recording started: %s", video_path)
+            logger.info("  [camera] Recording started (%s): %s", format, video_path)
 
     def stop_recording(self):
         """Stop recording and close the video file.
@@ -160,11 +213,16 @@ class ZedCamera:
             if not self._recording:
                 return {"frame_count": 0}
             self._recording = False
+            record_format = self._record_format
             self._svo_recording = False
 
         n = self._frame_count
-        self._zed.disable_recording()
-        logger.info("  [camera] SVO recording stopped, %d frames", n)
+        if record_format == "svo":
+            self._zed.disable_recording()
+        elif self._video_writer is not None:
+            self._video_writer.release()
+            self._video_writer = None
+        logger.info("  [camera] Recording stopped (%s), %d frames", record_format, n)
         result = {"frame_count": n}
         for label, anchor in (("first", self._first_clock_anchor), ("last", self._last_clock_anchor)):
             if anchor is not None:
@@ -267,7 +325,11 @@ class ZedCamera:
                     continue
 
                 if recording:
-                    # ZED SDK writes the SVO frame automatically on grab().
+                    if self._record_format == "rgb":
+                        self._zed.retrieve_image(self._rgb_mat, sl.VIEW.LEFT)
+                        frame_bgr = np.ascontiguousarray(self._rgb_mat.get_data()[:, :, :3])
+                        self._video_writer.write(frame_bgr)
+                    # else: ZED SDK writes the SVO frame automatically on grab().
                     self._frame_count += 1
                     image_time_ns = self._zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_nanoseconds()
                     anchor = (int(image_time_ns), time.monotonic_ns())

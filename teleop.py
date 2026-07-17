@@ -96,7 +96,8 @@ def run_teleop(cfg: ConfigDict):
     )
 
     record_mode = str(tc.get("record", "joints"))
-    record_cameras = record_mode == "all"
+    record_cameras = record_mode in ("rgb", "rgbd")
+    camera_format = "rgb" if record_mode == "rgb" else "svo"
 
     cameras = {}
     pointcloud_camera = None
@@ -155,9 +156,11 @@ def run_teleop(cfg: ConfigDict):
         },
         cameras=cameras if record_cameras else {},
         svo_compression=str(recorder_cfg.get("svo_compression", "H264")),
+        camera_format=camera_format,
     )
 
     gripper = None
+    gripper_state_cache = None
     gripper_open = bool(gc.get("initial_open", True))
     if gc.get("enabled", False):
         try:
@@ -166,6 +169,7 @@ def run_teleop(cfg: ConfigDict):
                 server_port=int(gc.port),
                 auto_activate=True,
             )
+            gripper_state_cache = gripper.state_cache()
             print("Robotiq gripper proxy ready.")
         except Exception as e:
             print(f"  [gripper] Failed to initialize: {e}")
@@ -371,6 +375,9 @@ def run_teleop(cfg: ConfigDict):
                         joint_pos = np.asarray(teleop_state["q"], dtype=float)
                         latest_joint_pos = joint_pos.copy()
                         joint_vel = np.asarray(teleop_state["dq"], dtype=float)
+                        joint_effort = np.asarray(teleop_state["tau_ext_hat_filtered"], dtype=float)
+                        ext_wrench = np.asarray(teleop_state["K_F_ext_hat_K"], dtype=float)
+                        measured_twist = np.asarray(teleop_state["O_dP_EE_est"], dtype=float)
                         measured_pose = np.asarray(teleop_state["O_T_EE"], dtype=float).reshape(4, 4)
                         robot_abs_time = float(teleop_state["abs_time"])
                         robot_pos = measured_pose[:3, 3]
@@ -419,6 +426,13 @@ def run_teleop(cfg: ConfigDict):
                             except Exception as exc:
                                 print(f"\n  [tracker] set_cartesian_reference failed: {exc}")
 
+                        if gripper_state_cache is not None:
+                            measured_width_m, motor_current_ma, object_detection, gripper_state_age_s = (
+                                gripper_state_cache.latest_telemetry(max_width_m=gc.get("max_width_m", 0.085))
+                            )
+                        else:
+                            measured_width_m = motor_current_ma = object_detection = gripper_state_age_s = None
+
                         recorder.step(
                             ee_pos=robot_pos,
                             ee_rot=robot_rot,
@@ -428,7 +442,15 @@ def run_teleop(cfg: ConfigDict):
                             enabled=enabled,
                             joint_pos=joint_pos,
                             joint_vel=joint_vel,
+                            joint_effort=joint_effort,
                             gripper_open=gripper_open if gripper is not None else None,
+                            measured_width_m=measured_width_m,
+                            motor_current_ma=motor_current_ma,
+                            object_detection=object_detection,
+                            measured_age_s=gripper_state_age_s,
+                            ext_wrench=ext_wrench,
+                            measured_linear_vel=measured_twist[:3],
+                            measured_angular_vel=measured_twist[3:],
                             robot_abs_time=robot_abs_time,
                         )
                         loop_rate.finish_tick()

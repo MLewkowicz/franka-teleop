@@ -130,7 +130,8 @@ def run_demonstrate(cfg: ConfigDict):
     pointcloud_enabled = bool(vc.get("enabled", False) and pc.get("enabled", False))
 
     record_mode = str(dc.get("record", tc.get("record", "joints")))
-    record_cameras = record_mode == "all"
+    record_cameras = record_mode in ("rgb", "rgbd")
+    camera_format = "rgb" if record_mode == "rgb" else "svo"
     reset_joint_config = np.asarray(tc.reset_joint_config, dtype=float)
     joint_stiffness = dc.joint_stiffness
     period = 0.001
@@ -160,6 +161,7 @@ def run_demonstrate(cfg: ConfigDict):
         },
         cameras=cameras if record_cameras else {},
         svo_compression=str(recorder_cfg.get("svo_compression", "H264")),
+        camera_format=camera_format,
     )
 
     gripper = None
