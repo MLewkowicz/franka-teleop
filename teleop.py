@@ -23,7 +23,7 @@ from threed_mouse.geometry import pack_Rp, so3_exp
 from threed_mouse.threedmousefilter import ThreeDMouseFilter
 
 from clear_franka.recorder import TrajectoryRecorder
-from clear_franka.robotiq_net_proxy import RobotiqGripperProxy
+from zero_franky.robotiq import RobotiqGripperProxy
 from clear_franka.utils import LoopRatePrinter
 
 from clear_franka.franka import (
@@ -154,7 +154,6 @@ def run_teleop(cfg: ConfigDict):
             **extrinsics_metadata,
         },
         cameras=cameras if record_cameras else {},
-        record_svo=bool(recorder_cfg.get("record_svo", False)),
         svo_compression=str(recorder_cfg.get("svo_compression", "H264")),
     )
 
@@ -165,11 +164,6 @@ def run_teleop(cfg: ConfigDict):
             gripper = RobotiqGripperProxy(
                 server_host=gc.host,
                 server_port=int(gc.port),
-                com_port=gc.com_port,
-                device_id=int(gc.device_id),
-                connection_type=gc.connection_type,
-                tcp_host=gc.tcp_host,
-                tcp_port=int(gc.tcp_port),
                 auto_activate=True,
             )
             print("Robotiq gripper proxy ready.")
@@ -278,8 +272,8 @@ def run_teleop(cfg: ConfigDict):
             left_used_in_record = False
 
             nullspace_stiffness = float(tc.nullspace_stiffness)
-            nullspace_tasks = (
-                [PostureTask(target=reset_joint_config.tolist(), stiffness=nullspace_stiffness)]
+            posture_task = (
+                PostureTask(target=reset_joint_config.tolist(), stiffness=nullspace_stiffness)
                 if nullspace_stiffness > 0
                 else None
             )
@@ -287,7 +281,7 @@ def run_teleop(cfg: ConfigDict):
                 period=0.001,
                 translational_stiffness=tc.translational_stiffness,
                 rotational_stiffness=tc.rotational_stiffness,
-                nullspace_tasks=nullspace_tasks,
+                posture_task=posture_task,
                 lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
                 upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
             )

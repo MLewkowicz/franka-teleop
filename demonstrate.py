@@ -25,7 +25,7 @@ from clear_franka.franka import (
     wait_for_motion_idle,
 )
 from clear_franka.recorder import TrajectoryRecorder
-from clear_franka.robotiq_net_proxy import RobotiqGripperProxy
+from zero_franky.robotiq import RobotiqGripperProxy
 from clear_franka.utils import LoopRatePrinter, announce
 
 
@@ -168,11 +168,6 @@ def run_demonstrate(cfg: ConfigDict):
         gripper = RobotiqGripperProxy(
             server_host=gc.host,
             server_port=int(gc.port),
-            com_port=gc.com_port,
-            device_id=int(gc.device_id),
-            connection_type=gc.connection_type,
-            tcp_host=gc.tcp_host,
-            tcp_port=int(gc.tcp_port),
             auto_activate=True,
         )
         print("Robotiq gripper proxy ready.")
