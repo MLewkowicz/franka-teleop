@@ -281,7 +281,7 @@ def run_teleop(cfg: ConfigDict):
                 if nullspace_stiffness > 0
                 else None
             )
-            session = robot.start_cartesian_impedance_session(
+            session = robot.start_cartesian_impedance_tracker(
                 period=0.001,
                 translational_stiffness=tc.translational_stiffness,
                 rotational_stiffness=tc.rotational_stiffness,
@@ -419,12 +419,12 @@ def run_teleop(cfg: ConfigDict):
                                 w_world = base_rot @ w
 
                             try:
-                                session.set_cartesian_reference(
+                                session.set_target(
                                     Affine(pack_Rp(target_rot, target_pos)),
                                     Twist(v_world, w_world),
                                 )
                             except Exception as exc:
-                                print(f"\n  [tracker] set_cartesian_reference failed: {exc}")
+                                print(f"\n  [tracker] set_target failed: {exc}")
 
                         if gripper_state_cache is not None:
                             measured_width_m, motor_current_ma, object_detection, gripper_state_age_s = (

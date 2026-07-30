@@ -258,7 +258,7 @@ def run_demonstrate(cfg: ConfigDict):
                 print("  Reset complete.")
                 suppress_cross_until_release = True
 
-            session = robot.start_joint_impedance_session(
+            session = robot.start_joint_impedance_tracker(
                 hold_current_joint,
                 period=period,
                 stiffness=[float(v) for v in joint_stiffness],

@@ -348,7 +348,7 @@ def _capture_kinesthetic(robot, camera, joint_stiffnesses, cal, detector, board,
         Q     — abort
     """
 
-    with robot.start_joint_impedance_session(
+    with robot.start_joint_impedance_tracker(
         hold_current_joint,
         period=0.001,
         stiffness=joint_stiffnesses,

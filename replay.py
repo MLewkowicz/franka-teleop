@@ -118,9 +118,9 @@ def play_joint_trajectory(
 ):
     n_steps = len(timestamps)
 
-    with robot.start_joint_impedance_session(
+    with robot.start_joint_impedance_tracker(
         period=rc.period,
-        stiffness=stiffness.tolist(),
+        stiffness=stiffness,
         lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
         upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
     ) as session:
@@ -139,15 +139,15 @@ def play_joint_trajectory(
 
             if step >= n_steps - 1:
                 print(f"  {complete_message}")
-                session.set_joint_reference(joint_pos[-1].tolist())
+                session.set_target(joint_pos[-1])
                 break
 
             q = joint_pos[step]
             if has_joint_vel:
                 dq = joint_vel[step] * rc.speed
-                session.set_joint_reference(q.tolist(), velocity=dq.tolist())
+                session.set_target(q, dq=dq)
             else:
-                session.set_joint_reference(q.tolist())
+                session.set_target(q)
 
             if gripper is not None and np.isfinite(gripper_open_data[step]):
                 current_gripper_open = bool(round(float(gripper_open_data[step])))

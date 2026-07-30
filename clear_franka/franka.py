@@ -7,7 +7,7 @@ DEFAULT_UPPER_JOINT_LIMITS = [2.9007, 1.8361, 2.9007, -0.1169, 2.8763, 4.6216, 3
 
 
 def joint_friction_kwargs(cfg, speed: float = 1.0) -> dict:
-    """Build the franky ``friction=`` kwarg for a ``start_*_impedance_session`` call.
+    """Build the franky ``friction=`` kwarg for a ``start_*_impedance_tracker`` call.
 
     franky takes a single ``FrictionCompensationParams`` (coulomb, viscous,
     max_torque, velocity_epsilon) instead of the old flat ``friction_coulomb`` /
