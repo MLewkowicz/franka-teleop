@@ -61,12 +61,17 @@ def get_camera_config(cfg, name: str = "third_person") -> dict:
     }
 
 
-def make_zed_camera(cfg, name: str = "third_person"):
+def make_zed_camera(cfg, name: str = "third_person", depth_mode: str | None = None):
+    """Build a camera from config. `depth_mode` overrides the configured mode.
+
+    Depth costs real time inside `grab()` — NEURAL runs a network per frame per
+    camera — so callers that only need color should pass "NONE".
+    """
     camera_cfg = get_camera_config(cfg, name)
     return ZedCamera(
         resolution=camera_cfg["resolution"],
         fps=camera_cfg["fps"],
-        depth_mode=camera_cfg["depth_mode"],
+        depth_mode=depth_mode or camera_cfg["depth_mode"],
         serial_number=camera_cfg["serial_number"],
         camera_id=camera_cfg["name"],
     )
@@ -149,6 +154,12 @@ class ZedCamera:
         self._pointcloud_max_distance_m = 3.0
         self._last_pointcloud_time = 0.0
         self._latest_pointcloud = None
+
+        self._rgb_lock = threading.Lock()
+        self._rgb_stream_enabled = False
+        self._rgb_period = 0.0
+        self._last_rgb_time = 0.0
+        self._latest_rgb = None
 
         # Resolve image dimensions from camera config
         cam_info = self._zed.get_camera_information()
@@ -294,6 +305,39 @@ class ZedCamera:
             points, colors, timestamp = self._latest_pointcloud
             return points.copy(), colors.copy(), timestamp
 
+    def start_rgb_stream(self, update_hz: float = 0.0) -> None:
+        """Enable background capture of the latest left-view RGB frame.
+
+        Unlike `grab_frame`, this is safe to use alongside `run()` and recording:
+        the capture thread retrieves the left view once per grab and shares it.
+
+        Args:
+            update_hz: 0 or less stores every grabbed frame, which is the default
+                and what live inference wants. Only set a rate when deliberately
+                sampling below the camera fps — rate-limiting at exactly the fps
+                lets grab jitter drop alternate frames, halving the effective rate.
+        """
+        with self._rgb_lock:
+            self._rgb_stream_enabled = True
+            self._rgb_period = 0.0 if update_hz <= 0 else 1.0 / update_hz
+
+    def stop_rgb_stream(self) -> None:
+        with self._rgb_lock:
+            self._rgb_stream_enabled = False
+            self._latest_rgb = None
+
+    def get_latest_rgb(self):
+        """Return the latest (rgb, timestamp) tuple, or None.
+
+        `rgb` is HxWx3 uint8 in RGB order; `timestamp` is `time.monotonic()` at
+        capture, so callers can check staleness.
+        """
+        with self._rgb_lock:
+            if self._latest_rgb is None:
+                return None
+            rgb, timestamp = self._latest_rgb
+            return rgb.copy(), timestamp
+
     # ------------------------------------------------------------------
     # Thread lifecycle
     # ------------------------------------------------------------------
@@ -318,18 +362,30 @@ class ZedCamera:
 
             now = time.monotonic()
             should_capture_pointcloud = self._should_capture_pointcloud(now)
+            should_capture_rgb = self._should_capture_rgb(now)
 
             with self._rec_lock:
                 recording = self._recording
-                if not recording and not should_capture_pointcloud:
+                if not recording and not should_capture_pointcloud and not should_capture_rgb:
                     continue
 
+                # Retrieve the left view at most once and fan it out to whoever
+                # wants it. get_data() is BGRA: ffmpeg is fed bgr24, while the
+                # stream stores RGB to match grab_frame's convention.
+                rgb_recording = recording and self._record_format == "rgb"
+                if rgb_recording or should_capture_rgb:
+                    self._zed.retrieve_image(self._rgb_mat, sl.VIEW.LEFT)
+                    bgra = self._rgb_mat.get_data()
+                    if rgb_recording:
+                        self._video_writer.write(np.ascontiguousarray(bgra[:, :, :3]))
+                    if should_capture_rgb:
+                        rgb = np.ascontiguousarray(bgra[:, :, :3][:, :, ::-1])
+                        with self._rgb_lock:
+                            self._latest_rgb = (rgb, now)
+
                 if recording:
-                    if self._record_format == "rgb":
-                        self._zed.retrieve_image(self._rgb_mat, sl.VIEW.LEFT)
-                        frame_bgr = np.ascontiguousarray(self._rgb_mat.get_data()[:, :, :3])
-                        self._video_writer.write(frame_bgr)
-                    # else: ZED SDK writes the SVO frame automatically on grab().
+                    # SVO frames are written automatically by the SDK on grab();
+                    # the rgb format was already handled above.
                     self._frame_count += 1
                     image_time_ns = self._zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_nanoseconds()
                     anchor = (int(image_time_ns), time.monotonic_ns())
@@ -347,6 +403,15 @@ class ZedCamera:
             if now - self._last_pointcloud_time < self._pointcloud_period:
                 return False
             self._last_pointcloud_time = now
+            return True
+
+    def _should_capture_rgb(self, now: float) -> bool:
+        with self._rgb_lock:
+            if not self._rgb_stream_enabled:
+                return False
+            if now - self._last_rgb_time < self._rgb_period:
+                return False
+            self._last_rgb_time = now
             return True
 
     def _retrieve_pointcloud(self, timestamp: float) -> None:
