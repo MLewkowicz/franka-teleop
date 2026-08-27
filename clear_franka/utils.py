@@ -49,7 +49,6 @@ class LoopRatePrinter:
         self._tick_times = []
         self._tick_durations = []
         self._stage_durations = {}
-        self._tick_stage_total = 0.0
         self._last_tick_start = None
         self._last_print = 0.0
         self._last_line_len = 0
@@ -57,7 +56,6 @@ class LoopRatePrinter:
     def start_tick(self) -> float:
         now = time.monotonic()
         self._last_tick_start = now
-        self._tick_stage_total = 0.0
         return now
 
     def finish_tick(self) -> None:
@@ -66,9 +64,6 @@ class LoopRatePrinter:
             return
 
         tick_duration = now - self._last_tick_start
-        unaccounted = max(0.0, tick_duration - self._tick_stage_total)
-        if unaccounted > 0.0:
-            self.record_stage("unaccounted", unaccounted)
         self._tick_times.append(now)
         self._tick_durations.append(tick_duration)
 
@@ -92,9 +87,8 @@ class LoopRatePrinter:
         for name, durations in self._stage_durations.items():
             if not durations:
                 continue
-            latest_stage_ms = durations[-1] * 1000.0
             avg_stage_ms = np.mean(durations) * 1000.0
-            stage_parts.append((avg_stage_ms, f"{name} {latest_stage_ms:.1f}/{avg_stage_ms:.1f}"))
+            stage_parts.append((avg_stage_ms, f"{name} {avg_stage_ms:.1f}"))
         stages = " | " + ", ".join(
             part for _avg, part in sorted(stage_parts, reverse=True)[:6]
         ) if stage_parts else ""
@@ -115,7 +109,6 @@ class LoopRatePrinter:
             return func(*args, **kwargs)
         finally:
             duration = time.monotonic() - start
-            self._tick_stage_total += duration
             self.record_stage(name, duration)
 
     @contextmanager
@@ -125,7 +118,6 @@ class LoopRatePrinter:
             yield
         finally:
             duration = time.monotonic() - start
-            self._tick_stage_total += duration
             self.record_stage(name, duration)
 
     def newline(self) -> None:
