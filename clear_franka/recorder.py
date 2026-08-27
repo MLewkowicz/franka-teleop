@@ -112,6 +112,9 @@ class TrajectoryRecorder:
     def toggle(self):
         self.stop() if self._recording else self.start()
 
+    def set_metadata(self, **entries):
+        self._metadata.update(entries)
+
     def _video_filename(self, camera_name: str) -> str:
         extension = "svo2" if self._camera_format == "svo" else "mp4"
         return f"episode_{self._start_name}_{_safe_name(camera_name)}_video.{extension}"
