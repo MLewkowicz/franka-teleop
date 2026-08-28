@@ -13,7 +13,11 @@ from clear_franka.config import ConfigDict, load_app_config
 from zero_franky import Robot
 from franky import JointMotion, JointState
 
-from clear_franka.franka import DEFAULT_LOWER_JOINT_LIMITS, DEFAULT_UPPER_JOINT_LIMITS
+from clear_franka.franka import (
+    DEFAULT_LOWER_JOINT_LIMITS,
+    DEFAULT_UPPER_JOINT_LIMITS,
+    joint_friction_kwargs,
+)
 
 
 def find_latest_episode(data_dir: str) -> Path:
@@ -123,12 +127,15 @@ def play_joint_trajectory(
         stiffness=stiffness,
         lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
         upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
+        **joint_friction_kwargs(rc, speed=float(rc.speed)),
     ) as session:
         step = 0
         replay_start = None
         last_gripper_open = None
 
         while True:
+            if session.tick() is None:
+                raise RuntimeError("Impedance tracker stopped before replay completed.")
             if replay_start is None:
                 replay_start = time.monotonic()
 
@@ -171,7 +178,9 @@ def play_joint_trajectory(
                         print(f"\n  [gripper] move failed: {e}")
 
             if recorder is not None:
-                teleop_state = robot.get_last_teleop_state()
+                teleop_state = session.state
+                if teleop_state is None:
+                    teleop_state = robot.wait_for_state(timeout=5.0)
                 measured_pose = np.asarray(teleop_state["O_T_EE"], dtype=float).reshape(4, 4)
                 recorder.step(
                     ee_pos=measured_pose[:3, 3],
@@ -186,7 +195,6 @@ def play_joint_trajectory(
                     robot_abs_time=float(teleop_state["abs_time"]),
                 )
 
-            time.sleep(rc.period)
 
     return gripper_open_for_record
 
@@ -365,6 +373,7 @@ def run_replay(cfg: ConfigDict):
     except KeyboardInterrupt:
         print("\n  Replay aborted.")
     finally:
+        robot.stop_state_stream()
         if recorder is not None:
             recorder.close()
         if gripper is not None:
@@ -377,5 +386,5 @@ if __name__ == "__main__":
     from zero_franky import setup_zero_franky
 
     cfg = load_app_config(__file__)
-    setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port, pub_port=cfg.zero_franky.pub_port)
+    setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port)
     run_replay(cfg)

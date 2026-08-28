@@ -236,6 +236,7 @@ def run_demonstrate(cfg: ConfigDict):
         stack.enter_context(recorder)
         web = stack.enter_context(RobotWebSession(hostname, username, password, token_storage=True))
         stack.callback(loop_rate.newline)
+        stack.callback(robot.stop_state_stream)
 
         while True:
             if reset_pending:
@@ -270,6 +271,9 @@ def run_demonstrate(cfg: ConfigDict):
             try:
                 while True:
                     loop_rate.start_tick()
+                    if session.tick() is None:
+                        loop_rate.finish_tick()
+                        break
                     for event in web.poll_buttons(timeout=button_timeout):
                         if event.button == PilotButton.CROSS and suppress_cross_until_release:
                             if not event.pressed:
@@ -322,7 +326,10 @@ def run_demonstrate(cfg: ConfigDict):
                         break
 
 
-                    teleop_state = robot.get_last_teleop_state()
+                    teleop_state = session.state
+                    if teleop_state is None:
+                        loop_rate.finish_tick()
+                        continue
                     joint_pos = np.asarray(teleop_state["q"], dtype=float)
                     joint_vel = np.asarray(teleop_state["dq"], dtype=float)
                     measured_pose = np.asarray(teleop_state["O_T_EE"], dtype=float).reshape(4, 4)
@@ -370,7 +377,7 @@ def run_demonstrate(cfg: ConfigDict):
 def main(cfg: ConfigDict):
     from zero_franky import setup_zero_franky
 
-    setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port, pub_port=cfg.zero_franky.pub_port)
+    setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port)
     run_demonstrate(cfg)
 
 

@@ -278,7 +278,7 @@ camera = [
 
 [package.metadata]
 requires-dist = [
-    { name = "franky-control", url = "https://github.com/nickswalker/franky/releases/download/wheels-libfranka-0.21.2/franky_control-1.1.4+impedance.libfranka.0.21.2-cp312-cp312-manylinux_2_28_x86_64.whl" },
+    { name = "franky-control", specifier = ">=2.0.1.dev7", index = "https://nickswalker.github.io/franky/branches/fork-dev/whl/libfranka-0.21.2/" },
     { name = "mcap", specifier = ">=1.3" },
     { name = "mcap-protobuf-support", specifier = ">=0.5.3" },
     { name = "numpy", specifier = ">=1.20" },
@@ -296,26 +296,21 @@ requires-dist = [
     { name = "websockets" },
     { name = "xacrodoc" },
     { name = "yourdfpy" },
-    { name = "zero-franky", editable = "../zero_franky" },
+    { name = "zero-franky", git = "https://github.com/nickswalker/zero-franky?branch=dev" },
 ]
 provides-extras = ["camera"]
 
 [[package]]
 name = "franky-control"
-version = "1.1.4+impedance.libfranka.0.21.2"
-source = { url = "https://github.com/nickswalker/franky/releases/download/wheels-libfranka-0.21.2/franky_control-1.1.4+impedance.libfranka.0.21.2-cp312-cp312-manylinux_2_28_x86_64.whl" }
+version = "2.0.1.dev8+gdd693b0f.libfranka.0.21.2"
+source = { registry = "https://nickswalker.github.io/franky/branches/fork-dev/whl/libfranka-0.21.2/" }
 dependencies = [
     { name = "numpy" },
     { name = "websockets" },
 ]
 wheels = [
-    { url = "https://github.com/nickswalker/franky/releases/download/wheels-libfranka-0.21.2/franky_control-1.1.4+impedance.libfranka.0.21.2-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:499923e2e90490e3d4838235a59fd4c239f6ddcd44a06970e2c5610d710eac80" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "numpy" },
-    { name = "websockets", specifier = ">=11" },
+    { url = "https://github.com/nickswalker/franky/releases/download/fork-dev-release/franky_control-2.0.1.dev8%2Bgdd693b0f.libfranka.0.21.2-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:4a899435f6a512a5423376dffc9738fbf07053f7dc3e02f0f3a12eef1b772512" },
+    { url = "https://github.com/nickswalker/franky/releases/download/fork-dev-release/franky_control-2.0.1.dev8%2Bgdd693b0f.libfranka.0.21.2-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:a66fd1c5f09a0cbcf612dac426b96a0b756945329972e23efa5c09b7c319092b" },
 ]
 
 [[package]]
@@ -1274,24 +1269,12 @@ wheels = [
 [[package]]
 name = "zero-franky"
 version = "0.1.3"
-source = { editable = "../zero_franky" }
+source = { git = "https://github.com/nickswalker/zero-franky?branch=dev#5dc13db9abcec0b2a38463946f43e2ce2da1e040" }
 dependencies = [
     { name = "cloudpickle" },
     { name = "msgpack" },
     { name = "pyzmq" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "cloudpickle", specifier = ">=2.2.0" },
-    { name = "franky-control", marker = "extra == 'server'", index = "https://nickswalker.github.io/franky/whl/libfranka-0.21.2/" },
-    { name = "msgpack", specifier = ">=1.0.0" },
-    { name = "pyrobotiqgripper", marker = "extra == 'robotiq'" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
-    { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.0.0" },
-    { name = "pyzmq", specifier = ">=25.0.0" },
-]
-provides-extras = ["server", "robotiq", "dev"]
 
 [[package]]
 name = "zstandard"

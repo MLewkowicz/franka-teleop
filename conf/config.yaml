@@ -1,7 +1,6 @@
 zero_franky:
   ip: "172.16.0.1"
   port: 18812
-  pub_port: 18813
 
 robot:
   ip: "172.16.0.2"

@@ -234,6 +234,7 @@ def run_teleop(cfg: ConfigDict):
         for cam in cameras.values():
             stack.enter_context(cam)
         stack.callback(mouse.close)
+        stack.callback(robot.stop_state_stream)
         if gripper is not None:
             stack.enter_context(gripper)
         stack.enter_context(recorder)
@@ -291,12 +292,17 @@ def run_teleop(cfg: ConfigDict):
             )
             try:
                 try:
-                    teleop_state = robot.get_last_teleop_state()
+                    if session.tick() is None:
+                        break
+                    teleop_state = robot.wait_for_state(timeout=5.0)
                     initial_pose = np.asarray(teleop_state["O_T_EE"], dtype=float)
                     target_pos = initial_pose[:3, 3].copy()
                     target_rot = initial_pose[:3, :3].copy()
                     while True:
                         loop_rate.start_tick()
+                        if session.tick() is None:
+                            loop_rate.finish_tick()
+                            break
 
                         sample = mouse.get_controller_state()
                         if sample is None:
@@ -371,7 +377,10 @@ def run_teleop(cfg: ConfigDict):
                         prev_right_button = right_button
                         prev_record_button = record_button
 
-                        teleop_state = robot.get_last_teleop_state()
+                        teleop_state = session.state
+                        if teleop_state is None:
+                            loop_rate.finish_tick()
+                            continue
                         joint_pos = np.asarray(teleop_state["q"], dtype=float)
                         latest_joint_pos = joint_pos.copy()
                         joint_vel = np.asarray(teleop_state["dq"], dtype=float)
@@ -468,5 +477,5 @@ if __name__ == "__main__":
     from zero_franky import setup_zero_franky
 
     cfg = load_app_config(__file__)
-    setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port, pub_port=cfg.zero_franky.pub_port)
+    setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port)
     run_teleop(cfg)
