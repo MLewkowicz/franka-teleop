@@ -126,6 +126,12 @@ class CombinedBoxSteering(BaseSteering):
         # vs the committed axis) from triggering a ~360° spin at the basin.
         self._rot_reverse_min_angle = float(cfg.get("rot_reverse_min_angle_rad", 1.2))
 
+        # When True, reaching the basin / final position stage turns off ALL
+        # steering (rotation too), not just the position branch. `_all_off` is the
+        # latched state (set when the latch fires; cleared on reset()).
+        self._latch_disables_rotation = bool(cfg.get("latch_disables_rotation", False))
+        self._all_off = False
+
         # Shared scene params live in the rack `position` block (grid bounds,
         # map size, gripper bounds). Mode-specific position params come from the
         # ACTIVE block: rack=`position`, cabinet=`cabinet.position`, with fallback
@@ -136,16 +142,61 @@ class CombinedBoxSteering(BaseSteering):
         map_size = int(pcfg.get("map_size", 100))
 
         if self._place_mode == "cabinet":
-            # Gentle point-attractor at the cabinet placement point, no walls.
+            # Point-attractor(s) toward the cabinet, plus an optional avoidance
+            # blob (the closed cabinet to the right). Supports a SEQUENCE of
+            # position stages (`cpos.stages`): the EE advances to the next target
+            # when it arrives within that stage's arrival_radius_m (see
+            # get_guidance); after the last stage it latches off. Lets us split
+            # the placement into e.g. (1) approach in front → (2) onto the surface,
+            # each tunable. Falls back to a single `target` when no stages given.
             cpos = dict(ccfg.get("position", {}))
             pos_params = cpos
-            target = np.asarray(cpos["target"], dtype=np.float32)
-            vm = build_center_attractor_value_map(
-                target, ws_min=ws_min, ws_max=ws_max, map_size=map_size,
-                seed_extent_m=float(cpos.get("seed_extent_m", 0.04)),
-            )
-            self._stage_target_world = target
+            av_cfg = dict(cpos.get("avoidance", {}))
+            avoidance_boxes = None
+            if av_cfg.get("enabled", False) and av_cfg.get("box") is not None:
+                b = av_cfg["box"]
+                avoidance_boxes = [(np.asarray(b["center"], dtype=np.float32),
+                                    np.asarray(b["size"], dtype=np.float32))]
+            seed_extent = float(cpos.get("seed_extent_m", 0.04))
+            av_weight = float(av_cfg.get("weight", 0.0))
+            av_sigma = float(av_cfg.get("sigma", 3.0))
+            stages_cfg = cpos.get("stages", None)
+            # A stage target is either explicit coords (`target: [x,y,z]`) or a
+            # workspace box referenced by name (`target_box: box_004`) → its center.
+            boxes_lookup = None
+            if stages_cfg and any(s.get("target_box") for s in stages_cfg):
+                boxes_lookup = load_boxes(pcfg["boxes_path"])
+
+            def _stage_target(s):
+                if s.get("target_box"):
+                    return np.asarray(
+                        boxes_lookup[s["target_box"]]["center"], dtype=np.float32)
+                return np.asarray(s["target"], dtype=np.float32)
+
+            if stages_cfg:
+                stage_specs = [(_stage_target(s),
+                                float(s.get("arrival_radius_m", 0.08)))
+                               for s in stages_cfg]
+            else:
+                stage_specs = [(np.asarray(cpos["target"], dtype=np.float32),
+                                float(cpos.get("basin_latch_radius_m", 0.10)))]
+            self._cab_stages = []
+            for tgt, radius in stage_specs:
+                vm_i = build_center_attractor_value_map(
+                    tgt, ws_min=ws_min, ws_max=ws_max, map_size=map_size,
+                    seed_extent_m=seed_extent, avoidance_boxes=avoidance_boxes,
+                    avoidance_weight=av_weight, obstacle_sigma=av_sigma)
+                self._cab_stages.append({
+                    "vm": vm_i,
+                    "grad": gradient_field_tensor(vm_i, self.device),
+                    "target": tgt,
+                    "radius": radius,
+                })
+            self._cab_stage_idx = 0
+            vm = self._cab_stages[0]["vm"]
+            self._stage_target_world = self._cab_stages[0]["target"]
         else:
+            self._cab_stages = None
             pos_params = pcfg
             boxes = load_boxes(pcfg["boxes_path"])
             face_thickness_m = float(pcfg.get("face_thickness_m", 0.04))
@@ -326,8 +377,15 @@ class CombinedBoxSteering(BaseSteering):
     def reset(self) -> None:
         self._rot.reset()
         self._pos_latched = False
+        self._all_off = False
         self._rot_commit_axis = None
         self._rot_negate = False
+        # Rewind the cabinet position-stage sequence to the first target.
+        if self._cab_stages is not None:
+            self._cab_stage_idx = 0
+            self._stage.value_map = self._cab_stages[0]["vm"]
+            self._stage.gradient_field = self._cab_stages[0]["grad"]
+            self._stage_target_world = self._cab_stages[0]["target"]
 
     # Lifecycle no-ops for run_experiment / policy compatibility.
     def setup_episode(self, task_name: str):
@@ -465,6 +523,10 @@ class CombinedBoxSteering(BaseSteering):
         model_output: torch.Tensor,
     ) -> torch.Tensor:
         """Rotation delta in [3:9] + value-map position delta in [0:3]."""
+        # ALL steering off (basin reached with latch_disables_rotation) → zeros.
+        if self._all_off:
+            container = model_output if self.guidance_mode != "dps" else current_sample
+            return torch.zeros_like(container)
         # Rotation branch returns a full-size tensor (delta only in [3:9]).
         if self._rot_use_slerp:
             guidance = self._rotation_slerp_guidance(
@@ -475,11 +537,43 @@ class CombinedBoxSteering(BaseSteering):
                 current_sample, timestep, obs_embedding, model_output
             )
 
-        # Basin latch — measured EE is fixed across this plan's denoising loop
-        # (it's the observation pose), so this check is effectively per-plan.
-        # Once we've arrived within the latch radius, drop the position branch
-        # entirely (return rotation-only) and never re-engage it this stage.
-        if self._basin_latch_radius_m > 0.0:
+        # Position-stage progression / basin latch. The measured EE is fixed
+        # across this plan's denoising loop (it's the observation pose), so these
+        # checks are effectively per-plan.
+        if self._cab_stages is not None:
+            # Cabinet: advance through the position-stage sequence as the EE
+            # arrives at each target; latch off after the last. One-way (monotonic).
+            ee = self._coords.current_gripper_pos
+            if not self._pos_latched and ee is not None:
+                cur = self._cab_stages[self._cab_stage_idx]
+                d = float(torch.norm(
+                    ee - torch.as_tensor(cur["target"], dtype=ee.dtype, device=ee.device)
+                ).item())
+                if cur["radius"] > 0.0 and d <= cur["radius"]:
+                    if self._cab_stage_idx + 1 < len(self._cab_stages):
+                        self._cab_stage_idx += 1
+                        nxt = self._cab_stages[self._cab_stage_idx]
+                        self._stage.value_map = nxt["vm"]
+                        self._stage.gradient_field = nxt["grad"]
+                        self._stage_target_world = nxt["target"]
+                        logger.info(
+                            "CombinedBoxSteering: position stage %d reached "
+                            "(d=%.3fm) → advancing to stage %d target=%s",
+                            self._cab_stage_idx, d, self._cab_stage_idx + 1,
+                            np.array2string(nxt["target"], precision=3))
+                    else:
+                        self._pos_latched = True
+                        self._all_off = self._latch_disables_rotation
+                        logger.info(
+                            "CombinedBoxSteering: final position stage reached "
+                            "(d=%.3fm) — %s steering OFF.", d,
+                            "ALL" if self._all_off else "position")
+            if self._all_off:
+                return torch.zeros_like(guidance)
+            if self._pos_latched:
+                return guidance
+        elif self._basin_latch_radius_m > 0.0:
+            # Rack (single target): latch off once within the radius.
             ee = self._coords.current_gripper_pos
             if not self._pos_latched and ee is not None:
                 basin = torch.as_tensor(
@@ -487,12 +581,14 @@ class CombinedBoxSteering(BaseSteering):
                 d = float(torch.norm(ee - basin).item())
                 if d <= self._basin_latch_radius_m:
                     self._pos_latched = True
+                    self._all_off = self._latch_disables_rotation
                     logger.info(
                         "CombinedBoxSteering: basin latch ENGAGED (d=%.3fm <= "
-                        "%.3fm) — position steering OFF for the rest of the stage; "
-                        "rotation steering continues, policy handles rack alignment.",
+                        "%.3fm) — %s steering OFF for the rest of the stage.",
                         d, self._basin_latch_radius_m,
-                    )
+                        "ALL" if self._all_off else "position")
+            if self._all_off:
+                return torch.zeros_like(guidance)
             if self._pos_latched:
                 return guidance
 

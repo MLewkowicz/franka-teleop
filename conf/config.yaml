@@ -70,7 +70,7 @@ cameras:
     serial_number: 37820861
     resolution: HD720
     fps: 30
-    depth_mode: NEURAL
+    depth_mode: PERFORMANCE
     extrinsics_path: "data/extrinsics_third_person.json"
   hand:
     name: hand
@@ -78,7 +78,7 @@ cameras:
     serial_number: 10986074
     resolution: HD720
     fps: 30
-    depth_mode: NEURAL
+    depth_mode: PERFORMANCE
     extrinsics_path: "data/extrinsics_hand.json"
 
 gripper:
@@ -145,17 +145,17 @@ replay:
   speed: 0.25
   period: 0.001
   # Joint impedance gains. Stiffer = better tracking, less compliance.
-  joint_stiffness: [320.0, 320.0, 320.0, 320.0, 120.0, 120.0, 30.0]
-  translational_stiffness: 1200.0                # Cartesian tracker translation stiffness.
-  rotational_stiffness: 40.0                    # Cartesian tracker rotation stiffness.
-  nullspace_stiffness: 10.0                      # Cartesian tracker posture-task stiffness.
+  joint_stiffness: [320.0, 320.0, 320.0, 320.0, 320.0, 320.0, 30.0] # [320.0, 320.0, 320.0, 320.0, 120.0, 120.0, 30.0]
+  translational_stiffness: 1000.0                # Cartesian tracker translation stiffness.
+  rotational_stiffness: 20.0                    # Cartesian tracker rotation stiffness.
+  nullspace_stiffness: 5.0                      # Cartesian tracker posture-task stiffness.
   # nullspace_target defaults to the first joint state in the replayed episode; set to "none" to disable.
   # Pre-positioning move to the first joint configuration of the episode.
   record: true                     # save measured robot state as a new episode
 
 deploy:
   # 3D Diffuser Actor MPC deployment (deploy_diffuser_actor.py).
-  policy_config: "/home/clear/franka-teleop/conf/policy_v8.yaml"
+  policy_config: "/home/clear/franka-teleop/conf/simple_v1.yaml"
   langsteer_path: "/home/clear/LangSteer"
   # Home the arm moves to before inference (and default nullspace posture).
   # Priority: this > home_config in the policy yaml > teleop.reset_joint_config.
@@ -167,9 +167,8 @@ deploy:
   record_trajectory: true                       # If true, log the executed session to data_dir/*.mcap (same format as mode=replay), replayable via main.py mode=replay.
   # Stages where the gripper is MANUAL-ONLY: the policy plan's gripper channel is
   # ignored and only the SpaceMouse chord (both buttons) opens/closes it.
-  # [] (current) = the policy predicts/drives the gripper in EVERY stage (default
-  # behavior). Set e.g. [1] to make the place stage manual-only (glass held at the
-  # basin until you chord-open it; the policy never auto-opens there).
+  # [] = the policy drives the gripper everywhere (follow policy outputs).
+  # [0, 1] = both grasp and place manual; [1] = only place manual.
   manual_gripper_stages: []
   max_linear_vel_m_s: 0.03                      # Open-loop retime speed limit for Cartesian translation.
   max_angular_vel_rad_s: 0.25                   # Open-loop retime speed limit for Cartesian orientation.
@@ -227,7 +226,10 @@ deploy:
   joint_limit_buffer_rad: 0.05            # pad lower/upper limits inward by this
 
   steering:
-    enabled: true                 # flip to true (or override on CLI) to steer
+    enabled: true                  # flip to true (or override on CLI) to steer
+    # When True, reaching the basin / final position stage turns off ALL steering
+    # (rotation too), not just position — so the policy fully takes over there.
+    latch_disables_rotation: true
     # Which placement to steer toward (the bimodal policy's "place" is overloaded):
     #   rack    — mode B: invert the glass onto the wine rack (the params directly
     #             below: target_euler, rot_reverse_direction, position).
@@ -298,7 +300,7 @@ deploy:
     # taken from the policy yaml automatically. Visualize/tune with
     # `uv run python visualize_value_maps.py`.
     position:
-      enabled: true             # flip to true (or override on CLI) to steer position
+      enabled: true              # flip to true (or override on CLI) to steer position
       boxes_path: "/home/clear/franka-teleop/data/workspace_boxes.json"
       # Raw VoxPoser delta = coeff·∇cost in model space. dps_coeff=1/√ᾱ blows
       # up at high t; cost gradients are ~5-10 per model unit; accumulated over
@@ -437,21 +439,44 @@ deploy:
       # Upright place orientation: mean of 58 cabinet_*.h5 demos' final EE pose
       # (vs the inverted rack target [-1.35,1.31,1.41]). Refine by jogging to the
       # upright cabinet-place pose and reading ee euler.
-      target_euler: [-1.47, 0.93, -1.59]
+      target_euler: [-1.47, 0.93, -1.59]   # kept (module requires a target) but INERT
+                                            # while guidance_strength=0 — no rotation steering
       rot_reverse_direction: false   # upright is a SHORT rotation from grasp — short way
-      guidance_strength: 0.3         # rotation pull strength (reuses the SLERP machinery)
+      # Rotation pull strength. 0 = NO rotation steering (this box_004 setting only
+      # steers position). Set ~0.5 to re-enable holding the upright cabinet target.
+      guidance_strength: 0.0
       position:
-        # Gentle pull toward the cabinet placement point (mean of the cabinet
-        # demos: [0.63,0.27,0.75], ~15cm above the box_002 center). Mostly gives
-        # the +y bias that disambiguates cabinet-vs-rack; the policy does the
-        # actual placement. No avoidance walls — pure point attractor.
-        target: [0.63, 0.27, 0.75]
-        seed_extent_m: 0.04          # affordance seed cube edge (m) at the target
-        guidance_strength: 0.1       # GENTLE (vs rack's 0.2)
+        # Position stages: the EE is pulled to each stage's target; on arrival
+        # within arrival_radius_m it advances (one-way); after the LAST stage,
+        # steering latches off. A stage target is either explicit `target: [x,y,z]`
+        # or a workspace box by name `target_box: box_004` (→ its center, so it
+        # tracks edits in the viser box editor). With latch_disables_rotation:true
+        # (top of the steering block) the final latch turns off ALL steering.
+        #
+        # ACTIVE: single stage → steer to box_004 center, then turn off all
+        # steering once within 6cm of it.
+        stages:
+          - { target_box: box_004, arrival_radius_m: 0.06 }
+        # Previous cabinet two-stage approach (kept for reference):
+        #   - { target: [0.4, 0.40, 0.65], arrival_radius_m: 0.05 }   # in front
+        #   - { target: [0.75, 0.17, 0.68], arrival_radius_m: 0.01 }  # onto surface
+        seed_extent_m: 0.04          # affordance seed cube edge (m) at each target
+        guidance_strength: 0.5      # pull strength (shared by both stages)
         delta_norm_cap: 0.04
         start_guidance_timestep: 10000
-        distance: { enabled: true, full: 0.40, near: 0.05, floor: 0.0 }
-        basin_latch_radius_m: 0.08   # hand off to the policy once near the target
+        distance: { enabled: true, full: 0.40, near: 0.05, floor: .3 }
+        # Repulsive blob for the CLOSED cabinet (to the right / −y of the open
+        # cabinet, above the wine rack) so the EE is pushed away from it. Filled
+        # box, Gaussian-smoothed into a repulsion halo. ESTIMATED geometry — a
+        # mirror of the open cabinet (box_002) toward −y, raised into a tall blob
+        # over the rack; ADJUST center/size so it sits flush with the real closed
+        # cabinet (visualize/measure to refine). It must NOT overlap the +y
+        # attractor at y=0.40, or it would fight the pull.
+        avoidance:
+          enabled: true
+          box: { center: [0.68, -0.17, 0.60], size: [0.22, 0.46, 0.24] }
+          weight: 15.0                # avoidance vs affordance in the cost map; raise to push harder
+          sigma: 3.0                 # repulsion halo decay length (voxels)
 
   # Median-filter isolated outlier waypoints from the policy's plan before
   # execution. Temporary mitigation for cross-modal gripper-coupled teleports

@@ -278,6 +278,22 @@ def _build_steering(deploy_cfg: DictConfig, policy, policy_relative, policy_loc_
         return None, set()
 
     container = OmegaConf.to_container(steer_cfg, resolve=True)
+
+    # Resolve place_mode → effective rotation target/direction on the container
+    # BEFORE building either steering class. The cabinet (mode A, upright) block
+    # overrides the rack (mode B, inverted) defaults that live at the top level.
+    # Doing it here — not just inside CombinedBoxSteering — means the rotation
+    # steers to the right placement even when position steering is disabled and
+    # only the plain TargetRotationSteering is built (it reads the top-level
+    # target_euler and knows nothing about place_mode).
+    if str(container.get("place_mode", "rack")).lower() == "cabinet":
+        cab = container.get("cabinet", {}) or {}
+        if cab.get("target_euler") is not None:
+            container["target_euler"] = cab["target_euler"]
+        container["rot_reverse_direction"] = bool(cab.get("rot_reverse_direction", False))
+        if cab.get("guidance_strength") is not None:
+            container["guidance_strength"] = cab["guidance_strength"]
+
     pos_cfg = steer_cfg.get("position", None)
     if pos_cfg and pos_cfg.get("enabled", False):
         from clear_franka.box_field_steering import CombinedBoxSteering
