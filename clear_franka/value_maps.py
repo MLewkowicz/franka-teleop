@@ -365,15 +365,22 @@ def build_center_attractor_value_map(
     ws_max: np.ndarray = DEFAULT_WS_MAX,
     map_size: int = DEFAULT_MAP_SIZE,
     seed_extent_m: float = 0.04,
+    avoidance_boxes: list | None = None,
+    avoidance_weight: float = 0.0,
+    obstacle_sigma: float = 3.0,
     instruction: str = "place: upright into cabinet",
 ):
     """A gentle point-attractor value map: a small affordance cube at
-    `center_world` and NO avoidance. After smooth(), the EDT radiates from the
-    seed so the cost gradient points toward the center from anywhere — a soft
-    pull toward the target point. Used for the upright cabinet placement (mode A),
-    where we just want to bias the EE toward the cabinet region (the +y mode
-    disambiguation) and let the policy do the actual placement; contrast with the
-    rack value map (front-face affordance + obstacle walls).
+    `center_world` pulling the EE toward it, plus OPTIONAL repulsive avoidance
+    blobs. After smooth(), the affordance EDT radiates from the seed (cost
+    gradient points toward the center from anywhere); each avoidance box is
+    filled solid and Gaussian-smoothed into a repulsive halo, so the EE is
+    pushed out of/away from it. Used for the upright cabinet placement (mode A):
+    bias the EE toward the open cabinet (the +y mode disambiguation) while
+    avoiding the closed cabinet to its right; the policy does the actual place.
+
+    `avoidance_boxes`: list of (center (3,), size (3,)) world-frame AABBs.
+    `avoidance_weight`: weight of the avoidance cost vs the affordance (0 = off).
     """
     from voxposer.value_map import ValueMap
 
@@ -386,16 +393,27 @@ def build_center_attractor_value_map(
     _fill_slab(mask, center_world - half, center_world + half, ws_min, ws_max, map_size)
     affordance = mask.astype(np.float32)
 
+    avoidance = None
+    if avoidance_boxes:
+        av = np.zeros((map_size, map_size, map_size), dtype=bool)
+        for center, size in avoidance_boxes:
+            av |= box_voxel_mask(
+                np.asarray(center, dtype=np.float32),
+                np.asarray(size, dtype=np.float32),
+                ws_min, ws_max, map_size,
+            )
+        avoidance = av.astype(np.float32)
+
     vm = ValueMap(
         affordance=affordance,
         workspace_bounds_min=ws_min,
         workspace_bounds_max=ws_max,
         map_size=map_size,
         instruction=instruction,
-        avoidance=None,
+        avoidance=avoidance,
     )
-    vm.smooth()  # EDT-expand the seed into a radiating attractor field
-    vm.precompute_gradients(avoidance_weight=0.0)
+    vm.smooth(obstacle_sigma=obstacle_sigma)  # EDT-expand seed; Gaussian-blur avoidance
+    vm.precompute_gradients(avoidance_weight=avoidance_weight)
     return vm
 
 
