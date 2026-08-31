@@ -1,3 +1,5 @@
+mode: teleop  # teleop or replay
+
 zero_franky:
   ip: "172.16.0.1"
   port: 18812

@@ -16,8 +16,8 @@ import contextlib
 import time
 
 import numpy as np
+from omegaconf import DictConfig
 
-from clear_franka.config import ConfigDict, load_app_config
 from threed_mouse import ThreeDMouse
 from threed_mouse.geometry import pack_Rp, so3_exp
 from threed_mouse.threedmousefilter import ThreeDMouseFilter
@@ -36,7 +36,7 @@ RESET_LONG_PRESS_S = 0.8
 
 
 
-def run_teleop(cfg: ConfigDict):
+def run_teleop(cfg: DictConfig):
     from zero_franky import Robot
     from franky import Affine, JointMotion, JointState, JointStopMotion, PostureTask, Twist
 
@@ -155,6 +155,7 @@ def run_teleop(cfg: ConfigDict):
             **extrinsics_metadata,
         },
         cameras=cameras if record_cameras else {},
+        record_svo=bool(recorder_cfg.get("record_svo", False)),
         svo_compression=str(recorder_cfg.get("svo_compression", "H264")),
         camera_format=camera_format,
     )
@@ -471,11 +472,3 @@ def run_teleop(cfg: ConfigDict):
                     print("  Recovering... tap button to re-enable.")
             finally:
                 stop_tracker_motion(robot, session, join_timeout=1.0, idle_timeout_s=2.0)
-
-
-if __name__ == "__main__":
-    from zero_franky import setup_zero_franky
-
-    cfg = load_app_config(__file__)
-    setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port)
-    run_teleop(cfg)

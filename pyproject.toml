@@ -10,7 +10,7 @@ dependencies = [
     "mcap>=1.3",
     "mcap-protobuf-support>=0.5.3",
     "protobuf>=5.29",
-    "pyyaml>=6.0",
+    "hydra-core>=1.3",
     "robot-descriptions",
     "threedmouse",
     "oculus_reader",
