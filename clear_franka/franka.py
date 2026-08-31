@@ -87,6 +87,7 @@ _FK_EE_LINK = "robotiq_arg2f_tcp"
 _FK_BASE_LINK = "fr3_link0"
 
 _fk_cache: tuple | None = None
+_fk_f_t_ee_cache: np.ndarray | None = None
 
 
 def _get_fk_model() -> tuple:
@@ -112,24 +113,57 @@ def _get_fk_model() -> tuple:
     return _fk_cache
 
 
+def fk_f_t_ee() -> np.ndarray:
+    """Flange-to-TCP offset (fixed; independent of arm config and gripper state).
+
+    Calibrated once against the Cortado URDF (same model `_get_fk_model` loads)
+    by comparing its EE-link pose at a reference configuration against franky's
+    analytic flange pose at that same configuration. Cached so `fk_ee_poses` can
+    use franky's closed-form FK for every row instead of a full URDF graph
+    traversal per row — the traversal is the same one-time cost either way,
+    just paid for one configuration instead of N.
+    """
+    global _fk_f_t_ee_cache
+    if _fk_f_t_ee_cache is not None:
+        return _fk_f_t_ee_cache
+
+    from franky import Affine
+    from franky.kinematics import forward_kinematics
+
+    model, arm_indices, T_root_to_base, cfg0 = _get_fk_model()
+    q_ref = np.zeros(len(arm_indices))
+    cfg = cfg0.copy()
+    cfg[arm_indices] = q_ref
+    model.update_cfg(cfg)
+    o_t_ee_urdf = T_root_to_base @ model.get_transform(_FK_EE_LINK)
+
+    o_t_flange = forward_kinematics(q_ref)
+    f_t_ee = o_t_flange.inverse * Affine(o_t_ee_urdf)
+    _fk_f_t_ee_cache = f_t_ee.matrix
+    return _fk_f_t_ee_cache
+
+
 def fk_ee_poses(joint_pos: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Compute O_T_EE for each row of joint_pos (N, 7).
 
     Returns ee_pos (N, 3) and ee_rot (N, 3, 3) in the fr3_link0 (robot base)
     frame — the same convention as the O_T_EE recorded during demonstration.
-    Lazily loads the Cortado URDF (kinematics only) on first call.
+
+    Uses franky's analytic (no robot connection required) forward kinematics
+    per row; the flange-to-TCP offset is calibrated once against the Cortado
+    URDF (`fk_f_t_ee`) rather than walking the URDF graph for every row.
     """
-    model, arm_indices, T_root_to_base, cfg0 = _get_fk_model()
+    from franky import Affine
+    from franky.kinematics import forward_kinematics
+
+    f_t_ee = Affine(fk_f_t_ee())
     N = joint_pos.shape[0]
     ee_pos = np.empty((N, 3), dtype=np.float64)
     ee_rot = np.empty((N, 3, 3), dtype=np.float64)
-    cfg = cfg0.copy()
     for i in range(N):
-        cfg[arm_indices] = joint_pos[i]
-        model.update_cfg(cfg)
-        T_ee = T_root_to_base @ model.get_transform(_FK_EE_LINK)
-        ee_pos[i] = T_ee[:3, 3]
-        ee_rot[i] = T_ee[:3, :3]
+        T = forward_kinematics(joint_pos[i], f_t_ee=f_t_ee).matrix
+        ee_pos[i] = T[:3, 3]
+        ee_rot[i] = T[:3, :3]
     return ee_pos, ee_rot
 
 

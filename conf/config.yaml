@@ -96,7 +96,19 @@ recorder:
   svo_compression: H265_LOSSLESS  # H264 | H265 | LOSSLESS | H264_LOSSLESS | H265_LOSSLESS
 
 replay:
-  tracker: joint                                # joint or cartesian
+  tracker: ik                                # joint, cartesian, or ik
+  ik_joint_limit_margin: 0.02                   # rad — IK solutions kept this far inside the joint limits
+  # rad — cap on how far any one joint may move between IK waypoints, so a
+  # reconstruction that can only continue by jumping fails loudly instead. Raise it
+  # for coarsely sampled trajectories (a 10 Hz policy plan moves further per
+  # waypoint than a preprocessed demo at preprocess.smooth.dt).
+  ik_max_distance: 0.2
+  # How far an IK solution may miss its waypoint before the solve is abandoned.
+  # Waypoints are normally hit exactly; the tolerance is for the ones near a
+  # singularity or a joint limit where the last fraction is simply unreachable,
+  # and it sits well under what joint impedance tracks to anyway.
+  ik_position_tolerance: 0.001                  # m
+  ik_rotation_tolerance: 0.01                   # rad (~0.6 deg)
   preprocess: true                              # run top-level preprocess pipeline on loaded episode before replay
   # max_linear_vel_m_s: 0.015
   max_linear_vel_m_s: 0.03                      # Open-loop retime speed limit for Cartesian translation.
