@@ -141,6 +141,21 @@ class CartesianTrajectory:
         rotation = self._rotation_interpolator(t_clamped).as_matrix()
         return position, rotation
 
+    def velocity(self, t: float, dt: float = 0.005) -> tuple[np.ndarray, np.ndarray]:
+        """Return linear and base-frame angular velocity at trajectory time t."""
+        t_clamped = float(np.clip(t, self.waypts_time[0], self.waypts_time[-1]))
+        linear = np.asarray(self._position_spline.derivative()(t_clamped), dtype=np.float64).reshape(3)
+
+        t0 = max(self.waypts_time[0], t_clamped - dt)
+        t1 = min(self.waypts_time[-1], t_clamped + dt)
+        if t1 <= t0:
+            return linear, np.zeros(3, dtype=np.float64)
+
+        r0 = self._rotation_interpolator(t0)
+        r1 = self._rotation_interpolator(t1)
+        angular = ((r1 * r0.inv()).as_rotvec() / (t1 - t0)).astype(np.float64)
+        return linear, angular
+
     def retime(
         self,
         *,

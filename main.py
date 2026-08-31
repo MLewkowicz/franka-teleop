@@ -16,7 +16,7 @@ from zero_franky import setup_zero_franky
 
 @hydra.main(version_base=None, config_path="conf", config_name="config")
 def main(cfg: DictConfig):
-    setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port, pub_port=cfg.zero_franky.pub_port)
+    setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port)
 
     if cfg.mode == "teleop":
         from teleop import run_teleop

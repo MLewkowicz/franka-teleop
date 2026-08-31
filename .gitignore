@@ -1,5 +1,6 @@
 outputs/
 data/
 __pycache__/
+*.swp
 *.pyc
 clear_franka/proto/*_pb2.py

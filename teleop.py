@@ -43,6 +43,13 @@ def run_teleop(cfg: DictConfig):
     tc = cfg.teleop
     sc = tc.spacemouse
     reset_joint_config = np.asarray(tc.reset_joint_config, dtype=float)
+    nullspace_target_cfg = tc.get("nullspace_target", None)
+    if nullspace_target_cfg is None:
+        nullspace_target = reset_joint_config
+    elif str(nullspace_target_cfg).lower() == "none":
+        nullspace_target = None
+    else:
+        nullspace_target = np.asarray(nullspace_target_cfg, dtype=float)
     gc = cfg.get("gripper", {})
     vc = cfg.get("visualization", {})
     pointcloud_cfg = vc.get("pointclouds", {})

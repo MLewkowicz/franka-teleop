@@ -9,7 +9,6 @@ Press Ctrl-C to stop.
 
 import contextlib
 import json
-import os
 import time
 
 import hydra
@@ -20,6 +19,7 @@ from omegaconf import DictConfig
 from clear_franka.franka import (
     DEFAULT_LOWER_JOINT_LIMITS,
     DEFAULT_UPPER_JOINT_LIMITS,
+    desk_credentials,
     joint_friction_kwargs,
     stop_tracker_motion,
     wait_for_motion_idle,
@@ -27,19 +27,6 @@ from clear_franka.franka import (
 from clear_franka.recorder import TrajectoryRecorder
 from zero_franky.robotiq import RobotiqGripperProxy
 from clear_franka.utils import LoopRatePrinter, announce
-
-
-def _desk_credentials(cfg: DictConfig) -> tuple[str, str, str]:
-    desk_cfg = cfg.get("desk", {})
-    hostname = str(desk_cfg.get("hostname", cfg.robot.ip))
-    username = desk_cfg.get("username") or os.environ.get("FRANKA_DESK_USERNAME")
-    password = desk_cfg.get("password") or os.environ.get("FRANKA_DESK_PASSWORD")
-    if not username or not password:
-        raise RuntimeError(
-            "Set desk.username/desk.password in Hydra config or "
-            "FRANKA_DESK_USERNAME/FRANKA_DESK_PASSWORD in the environment."
-        )
-    return hostname, str(username), str(password)
 
 
 def _toggle_gripper(gripper, gripper_open: bool, gripper_cfg, visualizer=None) -> bool:
@@ -138,7 +125,12 @@ def run_demonstrate(cfg: DictConfig):
     button_timeout = float(dc.get("button_timeout", period))
     button_debounce_s = float(dc.button_debounce_s)
 
-    hostname, username, password = _desk_credentials(cfg)
+    desk_cfg = cfg.get("desk", {})
+    hostname, username, password = desk_credentials(
+        hostname=str(desk_cfg.get("hostname", cfg.robot.ip)),
+        username=desk_cfg.get("username"),
+        password=desk_cfg.get("password"),
+    )
     robot = Robot(cfg.robot.ip)
     robot.recover_from_errors()
 
