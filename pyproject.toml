@@ -23,12 +23,13 @@ dependencies = [
     "websockets",
     "xacrodoc",
     "yourdfpy",
+    "pyzed",
+    "opencv-python>=4.5",
 ]
 
 [project.optional-dependencies]
 camera = [
-    "pyzed",
-    "opencv-python>=4.5",
+
 ]
 
 [tool.uv.sources]

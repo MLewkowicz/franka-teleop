@@ -263,7 +263,9 @@ dependencies = [
     { name = "mcap-protobuf-support" },
     { name = "numpy" },
     { name = "oculus-reader" },
+    { name = "opencv-python" },
     { name = "protobuf" },
+    { name = "pyzed" },
     { name = "robot-descriptions" },
     { name = "ruckig" },
     { name = "threedmouse" },
@@ -276,12 +278,6 @@ dependencies = [
     { name = "zero-franky" },
 ]
 
-[package.optional-dependencies]
-camera = [
-    { name = "opencv-python" },
-    { name = "pyzed" },
-]
-
 [package.metadata]
 requires-dist = [
     { name = "franky-control", specifier = ">=2.0.1.dev7", index = "https://nickswalker.github.io/franky/branches/fork-dev/whl/libfranka-0.21.2/" },
@@ -290,9 +286,9 @@ requires-dist = [
     { name = "mcap-protobuf-support", specifier = ">=0.5.3" },
     { name = "numpy", specifier = ">=1.20" },
     { name = "oculus-reader", git = "https://github.com/jborbik/oculus_reader" },
-    { name = "opencv-python", marker = "extra == 'camera'", specifier = ">=4.5" },
+    { name = "opencv-python", specifier = ">=4.5" },
     { name = "protobuf", specifier = ">=5.29" },
-    { name = "pyzed", marker = "extra == 'camera'", url = "https://download.stereolabs.com/zedsdk/5.2/whl/linux_x86_64/pyzed-5.2-cp312-cp312-linux_x86_64.whl" },
+    { name = "pyzed", url = "https://download.stereolabs.com/zedsdk/5.2/whl/linux_x86_64/pyzed-5.2-cp312-cp312-linux_x86_64.whl" },
     { name = "robot-descriptions" },
     { name = "ruckig" },
     { name = "threedmouse" },
