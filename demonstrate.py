@@ -13,7 +13,7 @@ import os
 import time
 
 import numpy as np
-from franky import JointMotion, JointState, PilotButton, RobotWebSession
+from franky import JointMotion, JointState, PilotButton, DeskWebSession
 
 from clear_franka.config import ConfigDict, load_app_config
 
@@ -234,7 +234,7 @@ def run_demonstrate(cfg: ConfigDict):
         if gripper is not None:
             stack.enter_context(gripper)
         stack.enter_context(recorder)
-        web = stack.enter_context(RobotWebSession(hostname, username, password, token_storage=True))
+        web = stack.enter_context(DeskWebSession(hostname, username, password, token_storage=True))
         stack.callback(loop_rate.newline)
         stack.callback(robot.stop_state_stream)
 
