@@ -162,7 +162,6 @@ def run_teleop(cfg: DictConfig):
             **extrinsics_metadata,
         },
         cameras=cameras if record_cameras else {},
-        record_svo=bool(recorder_cfg.get("record_svo", False)),
         svo_compression=str(recorder_cfg.get("svo_compression", "H264")),
         camera_format=camera_format,
     )
