@@ -175,7 +175,7 @@ def play_cartesian_trajectory(
     else:
         nullspace_target = np.asarray(nullspace_target_cfg, dtype=float)
 
-    with robot.start_cartesian_impedance_session(
+    with robot.start_cartesian_impedance_tracker(
         period=rc.period,
         translational_stiffness=float(
             rc.get("translational_stiffness", cfg.teleop.translational_stiffness)
@@ -183,15 +183,16 @@ def play_cartesian_trajectory(
         rotational_stiffness=float(
             rc.get("rotational_stiffness", cfg.teleop.rotational_stiffness)
         ),
-        nullspace_tasks=[
+        posture_task=(
             PostureTask(
                 nullspace_target,
                 stiffness=float(
                     rc.get("nullspace_stiffness", cfg.teleop.nullspace_stiffness)
                 ),
-            ),
-            ManipulabilityTask(gain=5.0, max_torque=1.0),
-        ],
+            )
+            if nullspace_target is not None else None
+        ),
+        manipulability_task=ManipulabilityTask(gain=5.0, max_torque=1.0),
         lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
         upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
     ) as session:
@@ -200,6 +201,8 @@ def play_cartesian_trajectory(
         last_gripper_open = None
 
         while True:
+            if session.tick() is None:
+                raise RuntimeError("Impedance tracker stopped before replay completed.")
             if replay_start is None:
                 replay_start = time.monotonic()
 
@@ -210,12 +213,12 @@ def play_cartesian_trajectory(
 
             if elapsed >= timestamps[-1]:
                 print("  Replay complete.")
-                session.set_cartesian_reference(Affine(pack_Rp(ee_rot[-1], ee_pos[-1])))
+                session.set_target(Affine(pack_Rp(ee_rot[-1], ee_pos[-1])))
                 break
 
             target_pos, target_rot = trajectory.interpolate(elapsed)
             linear_vel, angular_vel = trajectory.velocity(elapsed)
-            session.set_cartesian_reference(
+            session.set_target(
                 Affine(pack_Rp(target_rot, target_pos)),
                 Twist(linear_vel * rc.speed, angular_vel * rc.speed),
             )
@@ -256,8 +259,6 @@ def play_cartesian_trajectory(
                     gripper_open=gripper_open_for_record,
                     robot_abs_time=float(teleop_state["abs_time"]),
                 )
-
-            time.sleep(rc.period)
 
     return gripper_open_for_record
 
