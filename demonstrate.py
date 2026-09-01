@@ -26,7 +26,7 @@ from clear_franka.franka import (
 )
 from clear_franka.recorder import TrajectoryRecorder
 from zero_franky.robotiq import RobotiqGripperProxy
-from clear_franka.utils import LoopRatePrinter, announce
+from clear_franka.utils import LoopRatePrinter, announce, resolve_project_path
 
 
 def _toggle_gripper(gripper, gripper_open: bool, gripper_cfg, visualizer=None) -> bool:
@@ -93,7 +93,7 @@ def _metadata_for_cameras(cameras: dict, cfg: DictConfig, vc) -> dict:
             f"./data/extrinsics_{cam_name}.json",
         )
         try:
-            with open(ext_path) as f:
+            with resolve_project_path(ext_path).open("r") as f:
                 metadata[f"extrinsics_{cam_name}"] = f.read()
         except OSError:
             print(f"  [recorder] No extrinsics found for {cam_name} at {ext_path}; not embedded in episode.")

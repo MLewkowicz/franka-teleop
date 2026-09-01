@@ -24,7 +24,7 @@ from threed_mouse.threedmousefilter import ThreeDMouseFilter
 
 from clear_franka.recorder import TrajectoryRecorder
 from zero_franky.robotiq import RobotiqGripperProxy
-from clear_franka.utils import LoopRatePrinter
+from clear_franka.utils import LoopRatePrinter, resolve_project_path
 
 from clear_franka.franka import (
     DEFAULT_LOWER_JOINT_LIMITS,
@@ -147,7 +147,7 @@ def run_teleop(cfg: DictConfig):
         cam_cfg = cfg.get("cameras", {}).get(cam_name, {})
         ext_path = cam_cfg.get("extrinsics_path")
         try:
-            with open(ext_path) as f:
+            with resolve_project_path(ext_path).open("r") as f:
                 extrinsics_metadata[f"extrinsics_{cam_name}"] = f.read()
         except OSError:
             print(f"  [recorder] No extrinsics found for {cam_name} at {ext_path}; not embedded in episode.")

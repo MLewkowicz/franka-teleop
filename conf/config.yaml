@@ -47,7 +47,7 @@ cameras:
     resolution: HD720
     fps: 30
     depth_mode: NEURAL
-    extrinsics_path: "/home/clear/franka-teleop/data/extrinsics_third_person.json"
+    extrinsics_path: "data/extrinsics_third_person.json"
   hand:
     name: hand
     enabled: true
@@ -55,7 +55,7 @@ cameras:
     resolution: HD720
     fps: 30
     depth_mode: NEURAL
-    extrinsics_path: "/home/clear/franka-teleop/data/extrinsics_hand.json"
+    extrinsics_path: "data/extrinsics_hand.json"
 
 gripper:
   enabled: true

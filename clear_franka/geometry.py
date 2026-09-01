@@ -6,6 +6,8 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+from clear_franka.utils import resolve_project_path
+
 
 def pack_Rp(R: np.ndarray, p: np.ndarray) -> np.ndarray:
     """Pack rotation matrix R and position p into a 4x4 homogeneous transform.
@@ -54,7 +56,7 @@ def average_transforms(Ts: list[np.ndarray]) -> np.ndarray:
 
 
 def load_T_cam2base(extrinsics_path: str | Path) -> np.ndarray:
-    with Path(extrinsics_path).expanduser().open("r") as f:
+    with resolve_project_path(extrinsics_path).open("r") as f:
         payload = json.load(f)
     T_cam2base = np.asarray(payload["T_cam2base"], dtype=float)
     if T_cam2base.shape != (4, 4):
@@ -63,7 +65,7 @@ def load_T_cam2base(extrinsics_path: str | Path) -> np.ndarray:
 
 
 def load_T_cam2gripper(extrinsics_path: str | Path) -> np.ndarray:
-    with Path(extrinsics_path).expanduser().open("r") as f:
+    with resolve_project_path(extrinsics_path).open("r") as f:
         payload = json.load(f)
     if "T_cam2gripper" in payload:
         T_cam2gripper = np.asarray(payload["T_cam2gripper"], dtype=float)

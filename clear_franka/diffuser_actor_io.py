@@ -23,6 +23,8 @@ from typing import Optional
 import cv2
 import numpy as np
 
+from clear_franka.utils import resolve_project_path
+
 
 IMG_SIZE = 200  # CalvinDataset crops [:, 20:180, 20:180] → 160×160 at train time
 
@@ -32,7 +34,7 @@ IMG_SIZE = 200  # CalvinDataset crops [:, 20:180, 20:180] → 160×160 at train 
 # ---------------------------------------------------------------------------
 
 def load_extrinsics_json(path: Path | str) -> dict:
-    with open(path) as f:
+    with resolve_project_path(path).open("r") as f:
         return json.load(f)
 
 

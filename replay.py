@@ -20,6 +20,7 @@ from clear_franka.geometry import pack_Rp
 from clear_franka.ik import CartesianIK, ik_frame_from_episode
 from clear_franka.joint_trajectory import Trajectory
 from clear_franka.preprocess import preprocess_episode_arrays
+from clear_franka.utils import resolve_project_path
 
 
 def prompt_reverse_reset() -> bool:
@@ -427,7 +428,7 @@ def run_replay(cfg: DictConfig):
                 "extrinsics_path", f"./data/extrinsics_{cam_name}.json"
             )
             try:
-                with open(ext_path) as f:
+                with resolve_project_path(ext_path).open("r") as f:
                     extrinsics_metadata[f"extrinsics_{cam_name}"] = f.read()
             except OSError:
                 pass
