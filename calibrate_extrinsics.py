@@ -436,10 +436,11 @@ def _demonstration_joint_friction_kwargs(cfg: DictConfig) -> dict:
     """Resolve the same config-driven friction parameters used by demonstrate.py."""
     kwargs = joint_friction_kwargs(cfg.demonstrate)
     if kwargs:
+        friction = kwargs["friction"]
         logger.info(
             "Using demonstrate.joint_friction for calibration: coulomb=%s viscous=%s",
-            kwargs["friction_coulomb"],
-            kwargs["friction_viscous"],
+            friction["coulomb"],
+            friction["viscous"],
         )
     else:
         logger.info("Joint friction compensation disabled for calibration.")
