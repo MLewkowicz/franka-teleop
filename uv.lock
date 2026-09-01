@@ -278,9 +278,14 @@ dependencies = [
     { name = "zero-franky" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
 [package.metadata]
 requires-dist = [
-    { name = "franky-control", specifier = ">=2.0.1.dev7", index = "https://nickswalker.github.io/franky/branches/fork-dev/whl/libfranka-0.21.2/" },
+    { name = "franky-control", specifier = ">=2.0.1.dev9", index = "https://nickswalker.github.io/franky/branches/fork-dev/whl/libfranka-0.21.2/" },
     { name = "hydra-core", specifier = ">=1.3" },
     { name = "mcap", specifier = ">=1.3" },
     { name = "mcap-protobuf-support", specifier = ">=0.5.3" },
@@ -302,17 +307,20 @@ requires-dist = [
 ]
 provides-extras = ["camera"]
 
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=8" }]
+
 [[package]]
 name = "franky-control"
-version = "2.0.1.dev8+gdd693b0f.libfranka.0.21.2"
+version = "2.0.1.dev9+g9069954b.libfranka.0.21.2"
 source = { registry = "https://nickswalker.github.io/franky/branches/fork-dev/whl/libfranka-0.21.2/" }
 dependencies = [
     { name = "numpy" },
     { name = "websockets" },
 ]
 wheels = [
-    { url = "https://github.com/nickswalker/franky/releases/download/fork-dev-release/franky_control-2.0.1.dev8%2Bgdd693b0f.libfranka.0.21.2-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:4a899435f6a512a5423376dffc9738fbf07053f7dc3e02f0f3a12eef1b772512" },
-    { url = "https://github.com/nickswalker/franky/releases/download/fork-dev-release/franky_control-2.0.1.dev8%2Bgdd693b0f.libfranka.0.21.2-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:a66fd1c5f09a0cbcf612dac426b96a0b756945329972e23efa5c09b7c319092b" },
+    { url = "https://github.com/nickswalker/franky/releases/download/fork-dev-release/franky_control-2.0.1.dev9%2Bg9069954b.libfranka.0.21.2-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:44ff695aaf95045374180a7242783838d9d53984ba552ac38325770cafe647ed" },
+    { url = "https://github.com/nickswalker/franky/releases/download/fork-dev-release/franky_control-2.0.1.dev9%2Bg9069954b.libfranka.0.21.2-cp312-cp312-manylinux_2_34_x86_64.whl", hash = "sha256:8b91274f5d4f718a1b8970165b66d7289da8ec88e2d5830447d1298cd7e82192" },
 ]
 
 [[package]]
@@ -410,6 +418,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/b1/84/93bcd1300216ea50811cee96873b84a1bebf8d0489ffaf7f2a3756bab866/imageio-2.37.3.tar.gz", hash = "sha256:bbb37efbfc4c400fcd534b367b91fcd66d5da639aaa138034431a1c5e0a41451", size = 389673, upload-time = "2026-03-09T11:31:12.573Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/49/fa/391e437a34e55095173dca5f24070d89cbc233ff85bf1c29c93248c6588d/imageio-2.37.3-py3-none-any.whl", hash = "sha256:46f5bb8522cd421c0f5ae104d8268f569d856b29eb1a13b92829d1970f32c9f0", size = 317646, upload-time = "2026-03-09T11:31:10.771Z" },
+]
+
+[[package]]
+name = "iniconfig"
+version = "2.3.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/72/34/14ca021ce8e5dfedc35312d08ba8bf51fdd999c576889fc2c24cb97f4f10/iniconfig-2.3.0.tar.gz", hash = "sha256:c76315c77db068650d49c5b56314774a7804df16fee4402c1f19d6d15d8c4730", size = 20503, upload-time = "2025-10-18T21:55:43.219Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cb/b1/3846dd7f199d53cb17f49cba7e651e9ce294d8497c8c150530ed11865bb8/iniconfig-2.3.0-py3-none-any.whl", hash = "sha256:f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12", size = 7484, upload-time = "2025-10-18T21:55:41.639Z" },
 ]
 
 [[package]]
@@ -750,6 +767,15 @@ wheels = [
 ]
 
 [[package]]
+name = "pluggy"
+version = "1.6.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f9/e2/3e91f31a7d2b083fe6ef3fa267035b518369d9511ffab804f839851d2779/pluggy-1.6.0.tar.gz", hash = "sha256:7dcc130b76258d33b90f61b658791dede3486c3e6bfb003ee5c9bfb396dd22f3", size = 69412, upload-time = "2025-05-15T12:30:07.975Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/54/20/4d324d65cc6d9205fabedc306948156824eb9f0ee1633355a8f7ec5c66bf/pluggy-1.6.0-py3-none-any.whl", hash = "sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746", size = 20538, upload-time = "2025-05-15T12:30:06.134Z" },
+]
+
+[[package]]
 name = "protobuf"
 version = "7.36.0"
 source = { registry = "https://pypi.org/simple" }
@@ -820,6 +846,22 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/08/49/f0882556e09add821d42055a6a46aa459ffab5d1c17b97564a827e0500e2/pyspacemouse-2.0.0.tar.gz", hash = "sha256:df025ed74048c621f64ff3fb97493d2f86c2b3b508dda5e2cb901707db1e360f", size = 30965, upload-time = "2026-01-17T13:33:40.815Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/2b/34/4da2b2b942a695a390286b5795c259e25f63f705cb844527c220875c0ecd/pyspacemouse-2.0.0-py3-none-any.whl", hash = "sha256:c48709c37aff54969e52d05eb003357a1a4ed94660caff4c48fee450aab9832e", size = 21389, upload-time = "2026-01-17T13:33:42.314Z" },
+]
+
+[[package]]
+name = "pytest"
+version = "9.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "colorama", marker = "sys_platform == 'win32'" },
+    { name = "iniconfig" },
+    { name = "packaging" },
+    { name = "pluggy" },
+    { name = "pygments" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e4/47/b9efed96c114afcfa3c9d3fe98a76a1d14c74a9e266d397cf6eb64be5e01/pytest-9.1.1.tar.gz", hash = "sha256:1088fbde8f2b49d95a549a195707afa7a76a3ce9bcadc26b6d71f0ffda5fe313", size = 1636369, upload-time = "2026-06-19T10:58:32.857Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/24/25/1de2678b631f5a49215c6c96fff41ba892b0a34df68d6d80292b1b48aa7f/pytest-9.1.1-py3-none-any.whl", hash = "sha256:37a86b45efb9a47a61a36449063e8e18d0cab3161329fc099eb21783169c4f0c", size = 386536, upload-time = "2026-06-19T10:58:31.347Z" },
 ]
 
 [[package]]

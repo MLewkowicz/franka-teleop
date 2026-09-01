@@ -10,21 +10,14 @@ from clear_franka.episode_io import find_latest_episode, load_episode
 
 from zero_franky import Robot
 from franky import Affine, JointMotion, JointState, ManipulabilityTask, PostureTask, Twist
-from franky.kinematics import (
-    IKOptions,
-    RedundancyParameter,
-    forward_kinematics,
-    inverse_kinematics,
-)
-
 from clear_franka.franka import (
     DEFAULT_LOWER_JOINT_LIMITS,
     DEFAULT_UPPER_JOINT_LIMITS,
-    fk_f_t_ee,
     joint_friction_kwargs,
 )
 from clear_franka.cartesian_trajectory import CartesianTrajectory
 from clear_franka.geometry import pack_Rp
+from clear_franka.ik import CartesianIK, ik_frame_from_episode
 from clear_franka.joint_trajectory import Trajectory
 from clear_franka.preprocess import preprocess_episode_arrays
 
@@ -269,251 +262,6 @@ def play_cartesian_trajectory(
     return gripper_open_for_record
 
 
-def episode_ik_frame(episode: dict) -> tuple[np.ndarray | None, Affine | None]:
-    """The seed configuration and tool frame an episode implies, if it has joints.
-
-    IK needs neither — `solve_ik_trajectory` falls back for both — but an episode
-    that does carry joint samples pins them down exactly, so it is worth reading
-    the first sample for. The flange pose `forward_kinematics` derives from that
-    configuration and the tool pose recorded at the same instant differ by
-    precisely the flange-to-TCP offset the poses are expressed in, whichever that
-    is: the controller's F_T_EE for a raw recording, or the URDF's for one whose
-    Cartesian fields preprocessing recomputed by forward kinematics.
-
-    Returns (None, None) when the episode has no usable joint samples.
-    """
-    joint_pos = episode.get("joint_pos")
-    ee_pos, ee_rot = episode.get("ee_pos"), episode.get("ee_rot")
-    if joint_pos is None or ee_pos is None or ee_rot is None:
-        return None, None
-    if not (
-        np.all(np.isfinite(joint_pos[0]))
-        and np.all(np.isfinite(ee_pos[0]))
-        and np.all(np.isfinite(ee_rot[0]))
-    ):
-        return None, None
-    q_seed = np.asarray(joint_pos[0], dtype=float)
-    return q_seed, forward_kinematics(q_seed).inverse * Affine(pack_Rp(ee_rot[0], ee_pos[0]))
-
-
-def _roomiest_configuration(
-    pose: Affine,
-    *,
-    f_t_ee: Affine,
-    options: IKOptions,
-    lower: np.ndarray,
-    upper: np.ndarray,
-    samples: int = 360,
-) -> np.ndarray | None:
-    """A start configuration for `pose`, chosen for room rather than closeness.
-    """
-    best, best_clearance = None, -np.inf
-    for swivel in np.linspace(-np.pi, np.pi, samples, endpoint=False):
-        for q in inverse_kinematics(
-            pose,
-            float(swivel),
-            parameter=RedundancyParameter.Swivel,
-            f_t_ee=f_t_ee,
-            options=options,
-        ):
-            q = np.asarray(q, dtype=float)
-            clearance = float(np.min(np.minimum(q - lower, upper - q)))
-            if clearance > best_clearance:
-                best, best_clearance = q, clearance
-    return best
-
-
-def _pose_error(current: np.ndarray, target: np.ndarray) -> np.ndarray:
-    """The twist (3 translation, 3 rotation) taking pose `current` onto `target`."""
-    error = np.empty(6, dtype=float)
-    error[:3] = target[:3, 3] - current[:3, 3]
-    delta = target[:3, :3] @ current[:3, :3].T
-    axis = np.array([
-        delta[2, 1] - delta[1, 2],
-        delta[0, 2] - delta[2, 0],
-        delta[1, 0] - delta[0, 1],
-    ]) / 2.0
-    sin = np.linalg.norm(axis)
-    error[3:] = axis if sin < 1e-9 else axis * (np.arctan2(sin, (np.trace(delta) - 1.0) / 2.0) / sin)
-    return error
-
-
-def _jacobian(q: np.ndarray, f_t_ee: Affine, step: float = 1e-7) -> np.ndarray:
-    """The 6x7 tool Jacobian at `q`, by finite differences on forward kinematics.
-    """
-    base = forward_kinematics(q, f_t_ee=f_t_ee).matrix
-    jacobian = np.empty((6, 7), dtype=float)
-    for j in range(7):
-        shifted = q.copy()
-        shifted[j] += step
-        jacobian[:, j] = _pose_error(base, forward_kinematics(shifted, f_t_ee=f_t_ee).matrix) / step
-    return jacobian
-
-
-def _limit_repulsion(
-    q: np.ndarray, lower: np.ndarray, upper: np.ndarray, activation: float, gain: float
-) -> np.ndarray:
-    """A nudge away from any joint limit `q` has come within `activation` of.
-    """
-    push = np.zeros(7, dtype=float)
-    if activation <= 0.0 or gain <= 0.0:
-        return push
-    to_lower, to_upper = q - lower, upper - q
-    near = to_lower < activation
-    push[near] += gain * (activation - to_lower[near]) / activation
-    near = to_upper < activation
-    push[near] -= gain * (activation - to_upper[near]) / activation
-    return push
-
-
-def _converge_to_pose(
-    q_start: np.ndarray,
-    target: np.ndarray,
-    *,
-    f_t_ee: Affine,
-    lower: np.ndarray,
-    upper: np.ndarray,
-    max_iterations: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Levenberg-Marquardt onto `target`, from `q_start`, staying within limits.
-
-    Returns the configuration and its residual twist. It iterates until the pose
-    is hit to machine precision or no amount of damping buys further progress, and
-    leaves judging the residual to the caller: near a limit or a singularity the
-    last fraction of a millimetre may simply be unreachable, and that is worth
-    accepting rather than failing over.
-    """
-    q = q_start.copy()
-    error = _pose_error(forward_kinematics(q, f_t_ee=f_t_ee).matrix, target)
-    damping = 1e-4
-    for _ in range(max_iterations):
-        if np.linalg.norm(error) < 1e-9:
-            break
-        jacobian = _jacobian(q, f_t_ee)
-        jjt = jacobian @ jacobian.T
-        for _attempt in range(10):
-            step = jacobian.T @ np.linalg.solve(jjt + damping**2 * np.eye(6), error)
-            candidate = np.clip(q + step, lower, upper)
-            residual = _pose_error(forward_kinematics(candidate, f_t_ee=f_t_ee).matrix, target)
-            if np.linalg.norm(residual) < np.linalg.norm(error):
-                q, error = candidate, residual
-                damping = max(damping * 0.5, 1e-6)
-                break
-            damping *= 4.0
-        else:
-            break  # no damping value made progress; this is as close as it gets
-    return q, error
-
-
-def solve_ik_trajectory(
-    *,
-    timestamps: np.ndarray,
-    ee_pos: np.ndarray,
-    ee_rot: np.ndarray,
-    q_seed: np.ndarray | None = None,
-    f_t_ee: np.ndarray | Affine | None = None,
-    joint_limit_margin: float = 0.02,
-    max_distance: float | None = 0.2,
-    position_tolerance: float = 1e-3,
-    rotation_tolerance: float = 1e-2,
-    limit_activation: float = 0.15,
-    limit_gain: float = 0.02,
-    max_iterations: int = 40,
-) -> np.ndarray:
-    """Convert a Cartesian trajectory into a joint trajectory, waypoint by waypoint.
-
-    Needs only the tool poses: `q_seed` (the posture to start from) and `f_t_ee`
-    (the flange-to-TCP offset the poses are expressed in) both fall back to
-    sensible values when omitted, so a trajectory that was never recorded on
-    joints — a policy rollout, a synthetic path — converts the same as one that
-    was. `episode_ik_frame` reads both off an episode that does carry joints.
-
-    Each waypoint is solved numerically (damped least squares, Levenberg-Marquardt
-    damping) starting from the previous solution.
-    """
-    n_steps = len(ee_pos)
-    margin_lower = np.asarray(DEFAULT_LOWER_JOINT_LIMITS, dtype=float) + joint_limit_margin
-    margin_upper = np.asarray(DEFAULT_UPPER_JOINT_LIMITS, dtype=float) - joint_limit_margin
-
-    if f_t_ee is None:
-        # No robot to ask: the URDF's flange-to-TCP offset, which is what
-        # `clear_franka.franka.fk_ee_poses` computes recorded tool poses with.
-        f_t_ee = Affine(fk_f_t_ee())
-    elif not isinstance(f_t_ee, Affine):
-        f_t_ee = Affine(np.asarray(f_t_ee, dtype=float).reshape(4, 4))
-
-    poses = pack_Rp(ee_rot, ee_pos).reshape(n_steps, 4, 4)
-
-    if q_seed is None:
-        q_prev = _roomiest_configuration(
-            Affine(poses[0]),
-            f_t_ee=f_t_ee,
-            options=IKOptions(joint_limits=(margin_lower, margin_upper)),
-            lower=margin_lower,
-            upper=margin_upper,
-        )
-        if q_prev is None:
-            raise RuntimeError(
-                f"IK failed at the first waypoint (t={timestamps[0]:.3f}s): the pose is "
-                f"out of reach in every configuration within the joint limits."
-            )
-    else:
-        q_prev = np.clip(np.asarray(q_seed, dtype=float), margin_lower, margin_upper)
-
-    joint_pos_ik = np.empty((n_steps, 7), dtype=float)
-    worst_position = worst_rotation = 0.0
-
-    for i in range(n_steps):
-        # Bias the start away from any limit the arm has drifted up against.
-        start = np.clip(
-            q_prev + _limit_repulsion(q_prev, margin_lower, margin_upper, limit_activation, limit_gain),
-            margin_lower,
-            margin_upper,
-        )
-        q_i, residual = _converge_to_pose(
-            start,
-            poses[i],
-            f_t_ee=f_t_ee,
-            lower=margin_lower,
-            upper=margin_upper,
-            max_iterations=max_iterations,
-        )
-        position_error = float(np.linalg.norm(residual[:3]))
-        rotation_error = float(np.linalg.norm(residual[3:]))
-        moved = float(np.max(np.abs(q_i - q_prev)))
-
-        if position_error > position_tolerance or rotation_error > rotation_tolerance:
-            raise RuntimeError(
-                f"IK failed at step {i}/{n_steps} (t={timestamps[i]:.3f}s): closest reachable "
-                f"configuration still misses the pose by {position_error * 1000:.2f} mm / "
-                f"{np.degrees(rotation_error):.2f}deg, outside the "
-                f"{position_tolerance * 1000:.2f} mm / {np.degrees(rotation_tolerance):.2f}deg "
-                f"tolerance. The arm cannot follow the path further from here — check for a "
-                f"joint against its limit (joint_limit_margin={joint_limit_margin} rad)."
-            )
-        # Not at the first waypoint: `max_distance` bounds motion between waypoints
-        # the arm will execute, and nothing has been executed yet. The seed only
-        # chooses a starting posture — the caller pre-positions to `[0]` — so it is
-        # free to sit far from the trajectory, or to come from a config file.
-        if i > 0 and max_distance is not None and moved > max_distance:
-            raise RuntimeError(
-                f"IK failed at step {i}/{n_steps} (t={timestamps[i]:.3f}s): reaching it means "
-                f"moving j{int(np.argmax(np.abs(q_i - q_prev))) + 1} by {moved:.3f} rad in one "
-                f"waypoint, more than max_distance={max_distance} rad. The trajectory either "
-                f"crosses a singularity here or is sampled too coarsely to follow smoothly."
-            )
-
-        joint_pos_ik[i] = q_i
-        q_prev = q_i
-        worst_position = max(worst_position, position_error)
-        worst_rotation = max(worst_rotation, rotation_error)
-
-    if worst_position > 1e-6 or worst_rotation > 1e-6:
-        print(f"  IK worst-case pose residual: {worst_position * 1000:.3f} mm / "
-              f"{np.degrees(worst_rotation):.3f}deg.")
-    return joint_pos_ik
-
-
 def play_with_recovery(*, play_fn=play_joint_trajectory, **kwargs):
     robot = kwargs["robot"]
     while True:
@@ -618,22 +366,24 @@ def run_replay(cfg: DictConfig):
 
     joint_pos_ik = None
     if tracker_mode == "ik":
-        q_seed, f_t_ee = episode_ik_frame(episode)
+        q_seed, f_t_ee = ik_frame_from_episode(episode)
         if q_seed is None:
             reset_joint_config = cfg.teleop.get("reset_joint_config", None)
             if reset_joint_config is not None:
                 q_seed = np.asarray(reset_joint_config, dtype=float)
-        print(f"  Solving IK for {n_steps} waypoints...")
-        joint_pos_ik = solve_ik_trajectory(
-            timestamps=timestamps,
-            ee_pos=ee_pos,
-            ee_rot=ee_rot,
-            q_seed=q_seed,
+        ik = CartesianIK(
             f_t_ee=f_t_ee,
             joint_limit_margin=float(rc.get("ik_joint_limit_margin", 0.02)),
-            max_distance=rc.get("ik_max_distance", 0.2),
             position_tolerance=float(rc.get("ik_position_tolerance", 1e-3)),
             rotation_tolerance=float(rc.get("ik_rotation_tolerance", 1e-2)),
+        )
+        print(f"  Solving IK for {n_steps} waypoints...")
+        joint_pos_ik = ik.solve_trajectory(
+            ee_pos,
+            ee_rot,
+            q_seed=q_seed,
+            timestamps=timestamps,
+            max_distance=rc.get("ik_max_distance", 0.2),
         )
         print("  IK solve complete.")
 

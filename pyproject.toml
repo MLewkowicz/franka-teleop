@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Teleoperation and trajectory recording for Franka Emika robots"
 requires-python = "==3.12.*"
 dependencies = [
-    "franky-control>=2.0.1.dev7",
+    "franky-control>=2.0.1.dev9",  # kinematics.jacobian
     "zero-franky",
     "numpy>=1.20",
     "mcap>=1.3",
@@ -30,6 +30,11 @@ dependencies = [
 [project.optional-dependencies]
 camera = [
 
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
 ]
 
 [tool.uv.sources]
