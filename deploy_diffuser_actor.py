@@ -968,7 +968,7 @@ def main(cfg: DictConfig) -> int:
     from clear_franka.utils import LoopRatePrinter
     from clear_franka.diffuser_actor_io import euler_xyz_to_matrix
     from clear_franka.geometry import pack_Rp
-    from clear_franka.robotiq_net_proxy import RobotiqGripperProxy
+    from zero_franky.robotiq import RobotiqGripperProxy
     from clear_franka.recorder import TrajectoryRecorder
     from clear_franka.visualization import CortadoViserVisualizer
     from threed_mouse import ThreeDMouse
@@ -1029,11 +1029,6 @@ def main(cfg: DictConfig) -> int:
         gripper = RobotiqGripperProxy(
             server_host=gc.host,
             server_port=int(gc.port),
-            com_port=gc.com_port,
-            device_id=int(gc.device_id),
-            connection_type=gc.connection_type,
-            tcp_host=gc.tcp_host,
-            tcp_port=int(gc.tcp_port),
             auto_activate=True,
         )
         # Default open at start (matches training: episodes begin with gripper open).
@@ -1051,8 +1046,7 @@ def main(cfg: DictConfig) -> int:
     )
 
     # ----- robot -----
-    setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port,
-                      pub_port=cfg.zero_franky.pub_port)
+    setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port)
     robot = Robot(cfg.robot.ip)
     robot.recover_from_errors()
     reset_joint_config = np.asarray(cfg.teleop.reset_joint_config, dtype=float)
@@ -1199,14 +1193,15 @@ def main(cfg: DictConfig) -> int:
             "max_torque=%.1f buffer=%.2frad",
             jl_act, jl_stf, jl_dmp, jl_tmx, jl_buf,
         )
-        tracker = stack.enter_context(robot.start_cartesian_impedance_session(
+        tracker = stack.enter_context(robot.start_cartesian_impedance_tracker(
             period=0.001,
             translational_stiffness=cfg.deploy.translational_stiffness,
             rotational_stiffness=cfg.deploy.rotational_stiffness,
-            nullspace_tasks=[
-                PostureTask(_ns_target, stiffness=cfg.deploy.nullspace_stiffness),
-                ManipulabilityTask(gain=5.0, max_torque=1.0),
-            ],
+            posture_task=(
+                PostureTask(_ns_target, stiffness=cfg.deploy.nullspace_stiffness)
+                if _ns_target is not None else None
+            ),
+            manipulability_task=ManipulabilityTask(gain=5.0, max_torque=1.0),
             lower_joint_limits=_lower_lim,
             upper_joint_limits=_upper_lim,
             joint_limit_activation_distance=jl_act,
@@ -1484,12 +1479,12 @@ def main(cfg: DictConfig) -> int:
                     if teleop_workspace_clip:
                         target_pos = np.clip(target_pos, workspace_lo_np, workspace_hi_np)
                     try:
-                        tracker.set_cartesian_reference(
+                        tracker.set_target(
                             Affine(pack_Rp(target_rot, target_pos)),
                             Twist(v_world, w_world),
                         )
                     except Exception as exc:
-                        logger.warning(f"[teleop] set_cartesian_reference failed: {exc}")
+                        logger.warning(f"[teleop] set_target failed: {exc}")
                 _record_tick(enabled=False)
                 rate.finish_tick()
                 next_tick += execution_dt
@@ -1592,7 +1587,7 @@ def main(cfg: DictConfig) -> int:
                 if state is None:
                     state = rate.time_call("state_wait", robot.wait_for_state, 1.0)
                 ee_pos, _ee_rot, _O_T_EE = _read_ee_pose_from_state(state)
-                tracker.set_cartesian_reference(
+                tracker.set_target(
                     Affine(pack_Rp(catchup_target_rot, catchup_target_pos))
                 )
                 if deploy_trace is not None:
@@ -1651,7 +1646,7 @@ def main(cfg: DictConfig) -> int:
                 hi = np.array(cfg.deploy.workspace_hi, dtype=np.float64)
                 target_xyz = np.clip(target_xyz, lo, hi)
 
-                tracker.set_cartesian_reference(Affine(pack_Rp(target_rot, target_xyz)))
+                tracker.set_target(Affine(pack_Rp(target_rot, target_xyz)))
 
                 if deploy_trace is not None:
                     deploy_trace.record_error(
