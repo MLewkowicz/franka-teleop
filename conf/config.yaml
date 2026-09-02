@@ -47,11 +47,6 @@ demonstrate:
     coulomb: [0.5, 0.4, 0.5, 0.4, 0.4, 0.4, 0.2]
     viscous: [0.08, 0.05, 0.08, 0.05, 0.08, 0.08, 0.05]
   button_debounce_s: 0.35
-  # Demonstrations run on the backdrivable joint-impedance tracker (joint_stiffness
-  # above). The Cartesian kinesthetic controller lives on the
-  # feat/demonstrate-cartesian-kinesthetic branch and is NOT wired up here — its
-  # config keys were removed rather than left advertising a controller that
-  # demonstrate.py never reads.
 
 cameras:
   third_person:
@@ -108,25 +103,20 @@ visualization:
 
 recorder:
   svo_compression: H265_LOSSLESS  # H264 | H265 | LOSSLESS | H264_LOSSLESS | H265_LOSSLESS
+  # Camera sidecar format for recorded episodes.
+  #   svo = native stereo SVO2 (depth reconstructable later, larger files)
+  #   rgb = H.265 mp4 of the left view only (no depth, much smaller)
+  # demonstrate picks this from demonstrate/teleop `record`; replay and deploy
+  # read it here.
+  camera_format: svo
 
 replay:
   tracker: ik                                # joint, cartesian, or ik
   ik_joint_limit_margin: 0.02                   # rad — IK solutions kept this far inside the joint limits
-  # rad — cap on how far any one joint may move between IK waypoints, so a
-  # reconstruction that can only continue by jumping fails loudly instead. Raise it
-  # for coarsely sampled trajectories (a 10 Hz policy plan moves further per
-  # waypoint than a preprocessed demo at preprocess.smooth.dt).
   ik_max_distance: 0.2
-  # How far an IK solution may miss its waypoint before the solve is abandoned.
-  # Waypoints are normally hit exactly; the tolerance is for the ones near a
-  # singularity or a joint limit where the last fraction is simply unreachable,
-  # and it sits well under what joint impedance tracks to anyway.
-  ik_position_tolerance: 0.001                  # m
+  ik_position_tolerance: 0.001                  # m, How far an IK solution may miss its waypoint before the solve is abandoned.
   ik_rotation_tolerance: 0.01                   # rad (~0.6 deg)
   preprocess: true                              # run top-level preprocess pipeline on loaded episode before replay
-  # Optional home the arm moves to BEFORE the episode-start pre-position (then it
-  # goes to the episode's first joint config and plays). 7-vector or null to skip.
-  # Capture angles with `python capture_home_config.py`.
   home_config: null
   # max_linear_vel_m_s: 0.015
   max_linear_vel_m_s: 0.03                      # Open-loop retime speed limit for Cartesian translation.
@@ -135,7 +125,7 @@ replay:
   speed: 0.25
   period: 0.001
   # Joint impedance gains. Stiffer = better tracking, less compliance.
-  joint_stiffness: [320.0, 320.0, 320.0, 320.0, 320.0, 320.0, 30.0] # [320.0, 320.0, 320.0, 320.0, 120.0, 120.0, 30.0]
+  joint_stiffness: [320.0, 320.0, 320.0, 320.0, 120.0, 120.0, 30.0]
   translational_stiffness: 1000.0                # Cartesian tracker translation stiffness.
   rotational_stiffness: 20.0                    # Cartesian tracker rotation stiffness.
   nullspace_stiffness: 5.0                      # Cartesian tracker posture-task stiffness.
@@ -153,7 +143,19 @@ deploy:
   # travels with the trained policy; use this only for a per-run override.
   home_config: null
   control_hz: 10                                  # Nominal DiffuserActor waypoint rate used to interpret action horizon timing.
-  execution_hz: 100                              # Cartesian reference streaming rate; samples the retimed interpolation.
+  execution_hz: 100                              # Reference streaming rate; samples the retimed interpolation.
+  tracker: ik
+  # --- tracker: ik only -------------------------------------------------------
+  joint_stiffness: [320.0, 320.0, 320.0, 320.0, 120.0, 120.0, 30.0]
+  ik_joint_limit_margin: 0.02                   # rad — solutions kept this far inside the joint limits
+  ik_position_tolerance: 0.001                  # m
+  ik_rotation_tolerance: 0.01                   # rad (~0.6 deg)
+  # rad — cap on joint motion between IK waypoints. A plan that can only continue
+  # by jumping is truncated there and the executable prefix is played instead.
+  ik_max_distance: 0.2
+  # Plans in a row yielding NO executable prefix before deploy holds pose and
+  # hands off to the kill-key prompt (guards a wedged arm near a singularity).
+  ik_max_consecutive_failures: 3
   record_trajectory: true                       # If true, log the executed session to data_dir/*.mcap (same format as mode=replay), replayable via main.py mode=replay.
   # Stages where the gripper is MANUAL-ONLY: the policy plan's gripper channel is
   # ignored and only the SpaceMouse chord (both buttons) opens/closes it.
@@ -169,46 +171,11 @@ deploy:
   workspace_lo: [0.20, -0.45, 0.00]
   workspace_hi: [0.95,  0.40, 0.90]
   translational_stiffness: 1200.0
-  # Bumped 40 → 60. The wrist settles ~15° short of the steered target and giving
-  # it more time (catchup) doesn't help → it's a STEADY-STATE impedance offset
-  # (franky's Cartesian spring has no integrator: settles at target −
-  # residual_wrench/stiffness), not a transient. Higher rotational stiffness
-  # directly shrinks that offset (~33% less at 60). If it oscillates, back off;
-  # the fuller fix is the integral feedforward (integral_enabled, feat branch).
-  rotational_stiffness: 40.0
-  # Null-space biasing for the impedance controller. When stiffness > 0 the
-  # controller resolves the 7-DOF→6-DOF redundancy by biasing the joint config
-  # toward `nullspace_target` (7-vector). Useful for poses near the rack where
-  # the EE can only reach the basin Cartesian point if joint 0 is rotated
-  # backward — without a null-space bias the arm picks whatever resolution the
-  # dynamics push it to (often a configuration that can't reach the rack).
-  #
-  # `nullspace_target` defaults to teleop.reset_joint_config when unset.
-  # Override here with a 7-element list to bias toward a different posture
-  # (e.g. one captured by jogging the arm to the desired rack-reach pose).
-  # Set to the string "none" to disable the target entirely.
-  #
-  # Joint 0 carries the whole arm's inertia + gravity load when extended —
-  # 2.0 N·m/rad (the teleop value) wasn't enough to actually drive joint 0
-  # back to the target under deploy's faster commanded dynamics. 10-20 is
-  # the working range; bump further if joint 0 still doesn't pull back.
+  rotational_stiffness: 30.0
   nullspace_stiffness: 0
   # nullspace_target: [0.120437, -0.797005, -0.427542, -2.740433, 2.785569, 2.719076, 2.955555]
   # nullspace_target: [-0.06, 0.12, -0.60, -2.72, 1.98, 1.78, 0.45]   # example
-  #
-  # WARNING: nullspace_target[3] = -2.803 is only 0.27 rad (15°) from the
-  # j3 lower limit (-3.072). With high nullspace_stiffness this is the most
-  # likely joint to overshoot into the hardware reflex. The joint_limit_*
-  # below provide a soft-stop, but consider re-capturing the target with the
-  # elbow (j3) further from its lower limit, OR manually adjust j3 in the
-  # vector toward zero (e.g. -2.5 instead of -2.8).
-  #
-  # Joint-limit soft-stop. The franky impedance controller runs a built-in
-  # repulsive field within `activation_distance` rad of each limit. Defaults
-  # (stiffness=4, max_torque=5) are too weak vs nullspace pulls > ~4 N·m.
-  # Strong values here ensure the soft-stop wins before the hardware reflex.
-  # `joint_limit_buffer_rad` narrows the limits we hand to franky so the
-  # soft-stop kicks in inside the physical hardware limit.
+
   joint_limit_activation_distance: 0.20   # rad — 11° buffer zone before limit
   joint_limit_stiffness: 40.0             # N·m/rad — strong restoring spring
   joint_limit_damping: 5.0                # smooths velocity approach

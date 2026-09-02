@@ -4,30 +4,6 @@ Turns tool poses into joint configurations, needing nothing but the poses. Use
 `CartesianIK.solve` for one pose at a time — streaming a policy's waypoints to a
 joint impedance tracker, say — and `CartesianIK.solve_trajectory` to convert a
 whole recorded path up front.
-
-The solve is numerical: damped least squares with Levenberg-Marquardt damping,
-started from the previous configuration, which is what makes a sequence of them
-continuous. franky's analytic solver is exact and far faster, but resolves the
-arm's seventh degree of freedom by pinning one quantity and enumerating discrete
-branches, and neither available choice survives real demonstrations:
-
-  - Pinning q7 needs a recorded joint trajectory to read a value from, which a
-    policy rollout does not have. Holding it at one value instead leaves the
-    shoulder and elbow to produce any tool spin the path asks for, running them
-    out of range within a few tens of waypoints of a wrist-rotating demo.
-  - Pinning the swivel (arm-plane) angle needs no recording and handles wrist
-    spin properly, but tracking a path means chasing that angle from waypoint to
-    waypoint, and it is a badly behaved coordinate: as the arm approaches
-    straight, the planes that reach a pose shrink to a window thousandths of a
-    radian wide. Worse, the tracking slides onto branches that later dead-end at
-    a fold, where no configuration within reach continues the path. Measured
-    across 17 recorded demonstrations it lost the path on six.
-
-Numerical IK has neither problem: it follows the solution manifold itself, so
-branches and the folds between them do not arise, and the wrist takes up tool
-spin because rotating it is the smallest joint motion that will do the job. The
-cost is that the pose is reached by iteration rather than in closed form, so it
-can stop short — hence the tolerances, and `IKSolution.reached`.
 """
 
 import logging
@@ -281,6 +257,36 @@ class CartesianIK:
         thing in practice — from where the arm now is, this path cannot be
         followed any further, usually a singularity or a joint pinned against a
         limit with the path still demanding more.
+
+        Use `solve_trajectory_prefix` instead from a live control loop, where the
+        executable part of the path is more useful than an exception.
+        """
+        joint_pos, reason = self.solve_trajectory_prefix(
+            ee_pos, ee_rot, q_seed=q_seed, timestamps=timestamps,
+            max_distance=max_distance,
+        )
+        if reason is not None:
+            raise RuntimeError(reason)
+        return joint_pos
+
+    def solve_trajectory_prefix(
+        self,
+        ee_pos: np.ndarray,
+        ee_rot: np.ndarray,
+        *,
+        q_seed: np.ndarray | None = None,
+        timestamps: np.ndarray | None = None,
+        max_distance: float | None = 0.2,
+    ) -> tuple[np.ndarray, str | None]:
+        """As much of a Cartesian path as the arm can actually follow.
+
+        Returns `(joint_pos, reason)`: an (M, 7) joint trajectory for the leading
+        M poses that solved, and `None` when M == N. Otherwise `reason` says why
+        pose M could not be followed, and M may be 0.
+
+        This is the control-loop counterpart to `solve_trajectory`. A caller
+        mid-rollout cannot act on an exception — the arm is already moving — but
+        it can execute the prefix and replan from wherever that leaves it.
         """
         poses = pack_Rp(ee_rot, ee_pos).reshape(len(ee_pos), 4, 4)
 
@@ -291,7 +297,7 @@ class CartesianIK:
         if q_seed is None:
             q_prev = self.seed_configuration(poses[0])
             if q_prev is None:
-                raise RuntimeError(
+                return np.empty((0, 7), dtype=float), (
                     where(0) + "the pose is out of reach in every configuration "
                     "within the joint limits."
                 )
@@ -303,7 +309,7 @@ class CartesianIK:
         for i, target in enumerate(poses):
             solution = self.solve(target, q_prev)
             if not solution.reached:
-                raise RuntimeError(
+                return joint_pos[:i].copy(), (
                     where(i) + f"closest reachable configuration still misses the pose by "
                     f"{solution.position_error * 1000:.2f} mm / "
                     f"{np.degrees(solution.rotation_error):.2f}deg, outside the "
@@ -317,7 +323,7 @@ class CartesianIK:
             # chooses a starting posture, so it is free to sit far from the path.
             if i > 0 and max_distance is not None and solution.joint_motion > max_distance:
                 moved = np.abs(solution.joint_pos - q_prev)
-                raise RuntimeError(
+                return joint_pos[:i].copy(), (
                     where(i) + f"reaching it means moving j{int(np.argmax(moved)) + 1} by "
                     f"{solution.joint_motion:.3f} rad in one step, more than "
                     f"max_distance={max_distance} rad. The trajectory either crosses a "
@@ -330,4 +336,4 @@ class CartesianIK:
 
         if worst is not None and (worst.position_error > 1e-6 or worst.rotation_error > 1e-6):
             logger.info("ik: worst-case pose residual %s", worst)
-        return joint_pos
+        return joint_pos, None
