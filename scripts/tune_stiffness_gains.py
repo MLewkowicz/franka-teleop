@@ -35,11 +35,11 @@ import math
 import threading
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 
+import hydra
 import numpy as np
+from omegaconf import DictConfig
 
-from clear_franka.config import ConfigDict, load_app_config
 from clear_franka.franka import (
     DEFAULT_LOWER_JOINT_LIMITS,
     DEFAULT_UPPER_JOINT_LIMITS,
@@ -271,7 +271,7 @@ class TuningState:
 # ── control loop ────────────────────────────────────────────────────────────────
 
 class GainTuner:
-    def __init__(self, cfg: ConfigDict):
+    def __init__(self, cfg: DictConfig):
         self.cfg = cfg
         self.state = TuningState()
 
@@ -865,9 +865,7 @@ class GainTuner:
         from franky import JointMotion, JointState
 
         cfg = self.cfg
-        setup_zero_franky(
-            cfg.zero_franky.ip, cfg.zero_franky.port, pub_port=cfg.zero_franky.get("pub_port")
-        )
+        setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port)
 
         from clear_franka.visualization import CortadoViserVisualizer
 
@@ -969,10 +967,9 @@ class GainTuner:
             time.sleep(remaining)
 
 
-def main():
-    # This script lives in scripts/, but conf/config.yaml is at the repo root.
-    repo_root = Path(__file__).resolve().parent.parent
-    cfg = load_app_config(repo_root / "tune_stiffness_gains.py")
+# This script lives in scripts/, so conf/ is one level up.
+@hydra.main(version_base=None, config_path="../conf", config_name="config")
+def main(cfg: DictConfig):
     GainTuner(cfg).run()
 
 
