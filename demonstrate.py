@@ -396,7 +396,7 @@ def run_demonstrate(cfg: DictConfig):
 def main(cfg: DictConfig):
     from zero_franky import setup_zero_franky
 
-    setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port, pub_port=cfg.zero_franky.pub_port)
+    setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port)
     run_demonstrate(cfg)
 
 

@@ -26,7 +26,7 @@ def main(cfg: DictConfig):
         stop_tracker_motion,
     )
 
-    setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port, pub_port=cfg.zero_franky.pub_port)
+    setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port)
     dc = cfg.get("demonstrate", {})
     joint_stiffness = [float(v) for v in dc.get("joint_stiffness", [0.0] * 7)]
 
@@ -37,7 +37,7 @@ def main(cfg: DictConfig):
     except Exception:
         pass
 
-    session = robot.start_joint_impedance_session(
+    session = robot.start_joint_impedance_tracker(
         hold_current_joint,
         period=0.001,
         stiffness=joint_stiffness,
