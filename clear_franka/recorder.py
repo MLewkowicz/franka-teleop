@@ -1,5 +1,6 @@
 """Streaming MCAP trajectory recorder with native ZED SVO2 sidecars."""
 
+import atexit
 import json
 import queue
 import re
@@ -180,8 +181,11 @@ class TrajectoryRecorder:
         self.last_saved_path = None
         self._queue = queue.SimpleQueue()
         self._writer_error = None
-        self._thread = threading.Thread(target=self._write_loop, daemon=False)
+        self._thread = threading.Thread(
+            target=self._write_loop, name="mcap-writer", daemon=True
+        )
         self._thread.start()
+        atexit.register(self._atexit_shutdown)
 
         try:
             for name, camera in self._cameras.items():
@@ -192,28 +196,79 @@ class TrajectoryRecorder:
                     format=self._camera_format,
                 )
         except BaseException:
-            # The writer thread is non-daemon and blocks on the queue, so it has
-            # to be shut down on every failure path or process exit hangs.
-            self._queue.put(None)
-            self._thread.join()
-            self._thread = None
+            # The writer blocks on the queue, so it has to be shut down on every
+            # failure path — otherwise it lingers holding a half-written file.
+            self._shutdown_writer()
             raise
 
         self._recording = True
         print(f"  [recorder] RECORDING started -> {self._path.name}")
 
+    def _shutdown_writer(self) -> None:
+        """Send the sentinel and join the writer thread. Idempotent.
+
+        Safe to re-enter after an interrupted stop(): a Ctrl-C landing in the
+        middle of teardown must not leave the writer running on a half-written
+        file, so the join is retried rather than abandoned on interrupt.
+        """
+        thread = self._thread
+        if thread is None:
+            return
+        self._thread = None
+        if self._queue is not None:
+            self._queue.put(None)
+        deadline = time.monotonic() + 30.0
+        warned = False
+        while thread.is_alive() and time.monotonic() < deadline:
+            try:
+                thread.join(timeout=1.0)
+            except KeyboardInterrupt:
+                # An impatient second Ctrl-C: keep waiting rather than orphan a
+                # thread that is mid-write.
+                if not warned:
+                    print("  [recorder] finishing the episode file; please wait...")
+                    warned = True
+        if thread.is_alive():
+            print(f"  [recorder] WARNING: writer did not finish {self._path} within 30s")
+
+    def _atexit_shutdown(self) -> None:
+        """Last-chance flush for a recorder that was never stopped.
+
+        Runs before daemon threads are torn down, so the episode still gets a
+        valid footer instead of being truncated mid-write.
+        """
+        if self._recording:
+            try:
+                self.stop()
+            except BaseException as error:  # never raise out of atexit
+                print(f"  [recorder] error finishing episode at exit: {error}")
+        else:
+            self._shutdown_writer()
+
     def stop(self):
         if not self._recording:
+            # A previous stop() may have been interrupted before the writer was
+            # shut down. Finish that job instead of returning and leaving it.
+            self._shutdown_writer()
             return
         self._recording = False
-        camera_summaries = {}
-        for name, camera in self._cameras.items():
-            camera_summaries[name] = camera.stop_recording()
+        try:
+            camera_summaries = {}
+            for name, camera in self._cameras.items():
+                try:
+                    camera_summaries[name] = camera.stop_recording()
+                except Exception as error:
+                    # One camera failing to finalize must not cost us the
+                    # trajectory or strand the writer thread.
+                    print(f"  [recorder] camera {name} stop_recording failed: {error}")
+                    camera_summaries[name] = {"frame_count": 0, "error": str(error)}
 
-        duration_ns = max(0, time.monotonic_ns() - self._start_monotonic_ns)
-        self._queue.put(("finish", duration_ns, camera_summaries))
-        self._queue.put(None)
-        self._thread.join()
+            duration_ns = max(0, time.monotonic_ns() - self._start_monotonic_ns)
+            self._queue.put(("finish", duration_ns, camera_summaries))
+        finally:
+            # Always join, even if camera teardown raised or was interrupted.
+            self._shutdown_writer()
+            atexit.unregister(self._atexit_shutdown)
         if self._writer_error is not None:
             raise RuntimeError(f"MCAP writer failed: {self._writer_error}") from self._writer_error
         self.last_saved_path = self._path
@@ -432,3 +487,7 @@ class TrajectoryRecorder:
     def close(self):
         if self._recording:
             self.stop()
+        else:
+            # Settles a stop() that was interrupted before it finished.
+            self._shutdown_writer()
+            atexit.unregister(self._atexit_shutdown)
