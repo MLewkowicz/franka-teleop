@@ -17,7 +17,7 @@ teleop:
   rotational_stiffness: 5.0
   nullspace_stiffness: 2.0
   reset_joint_config: [-0.06217873,  0.11705305, -0.5995304 , -2.72505689,  1.98229098, 1.78315043,  0.44959301]
-  record: joints                # joints = joint data only; all = joint data + cameras
+  record: joints                # joints = joint data only; rgb = + mp4 video; rgbd = + SVO2 (stereo, depth reconstructable)
   spacemouse:
     control_rate: 120
     smoothing_factor: 0.3
@@ -47,21 +47,11 @@ demonstrate:
     coulomb: [0.5, 0.4, 0.5, 0.4, 0.4, 0.4, 0.2]
     viscous: [0.08, 0.05, 0.08, 0.05, 0.08, 0.08, 0.05]
   button_debounce_s: 0.35
-  # Demonstration controller. "joint" (default) = backdrivable joint-impedance float.
-  # "cartesian" = kinesthetic guiding with the Cartesian tracker live (reference tracks
-  # the measured pose, so the EE floats) — collect demos whose joint redundancy resolves
-  # the same way replay's higher-stiffness Cartesian tracker will resolve it.
-  controller: cartesian
-  # Light main-task stiffness so the arm is easy to hand-guide (damping ~ sqrt(stiffness)).
-  cartesian_translational_stiffness: 0.0
-  cartesian_rotational_stiffness: 0.0
-  # Nullspace stiffness kept at the replay value (replay.nullspace_stiffness=2.0) so the
-  # posture bias is faithful even though the main-task stiffness is low during teaching.
-  cartesian_nullspace_stiffness: 10.0
-  # nullspace_target defaults to teleop.reset_joint_config (the home config you reset to,
-  # which is also replay's default nullspace_target = episode's first joint state).
-  # Override with a 7-element list, or "none" to disable the posture bias.
-  # cartesian_nullspace_target: none
+  # Demonstrations run on the backdrivable joint-impedance tracker (joint_stiffness
+  # above). The Cartesian kinesthetic controller lives on the
+  # feat/demonstrate-cartesian-kinesthetic branch and is NOT wired up here — its
+  # config keys were removed rather than left advertising a controller that
+  # demonstrate.py never reads.
 
 cameras:
   third_person:
