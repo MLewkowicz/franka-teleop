@@ -89,17 +89,18 @@ class TrajectoryRecorder:
         """
         Args:
             save_dir: Directory to save episode files.
-            capacity: Pre-allocated buffer size in timesteps (120k = 2 min at 1kHz).
-            metadata: Optional dict of extra metadata stored in HDF5 attrs.
+            metadata: Optional dict of extra metadata stored in the MCAP
+                "episode" metadata record.
             cameras: Optional dict/list of named ZedCamera instances. If provided,
                 every camera is recorded with the same trajectory clock epoch.
-            record_svo: If True, cameras record native ZED SVO2 files instead of HDF5.
             svo_compression: SVO compression mode (H264, H265, LOSSLESS, etc.).
-                             Only used when record_svo=True.
-             episode_name: Optional base name for saved files. When set, episodes
-                are named ``{episode_name}_{N}.h5`` where N is the next free
+                Only used when camera_format="svo".
+            camera_format: "svo" for native stereo SVO2 sidecars, "rgb" for
+                H.265 mp4 sidecars of the left view only.
+            episode_name: Optional base name for saved files. When set, episodes
+                are named ``{episode_name}_{N}.mcap`` where N is the next free
                 index found by scanning ``save_dir`` (per start()). When None,
-                falls back to the timestamped ``episode_{YYYYmmdd_HHMMSS}.h5``
+                falls back to the timestamped ``episode_{YYYYmmdd_HHMMSS}.mcap``.
         """
         self._save_dir = Path(save_dir)
         self._metadata = metadata or {}
@@ -120,6 +121,9 @@ class TrajectoryRecorder:
         self._start_wall_ns = 0
         self._start_name = ""
         self._path = None
+        # Path of the most recently completed episode, set by stop(). None until
+        # an episode has been written.
+        self.last_saved_path = None
         self._queue = None
         self._thread = None
         self._writer_error = None
@@ -136,12 +140,12 @@ class TrajectoryRecorder:
 
     def _video_filename(self, camera_name: str) -> str:
         extension = "svo2" if self._camera_format == "svo" else "mp4"
-        return f"episode_{self._start_name}_{_safe_name(camera_name)}_video.{extension}"
+        return f"{self._episode_base}_{_safe_name(camera_name)}_video.{extension}"
 
     @staticmethod
     def _next_episode_index(save_dir: Path, safe_name: str) -> int:
-        """Lowest free N such that ``{safe_name}_{N}.h5`` does not exist in save_dir."""
-        pattern = re.compile(rf"^{re.escape(safe_name)}_(\d+)\.h5$")
+        """Lowest free N such that ``{safe_name}_{N}.mcap`` does not exist in save_dir."""
+        pattern = re.compile(rf"^{re.escape(safe_name)}_(\d+)\.mcap$")
         max_idx = -1
         if save_dir.is_dir():
             for entry in save_dir.iterdir():
@@ -158,7 +162,22 @@ class TrajectoryRecorder:
         self._start_monotonic_ns = time.monotonic_ns()
         self._start_wall_ns = time.time_ns()
         self._start_name = time.strftime("%Y%m%d_%H%M%S")
-        self._path = self._save_dir / f"episode_{self._start_name}.mcap"
+
+        # Resolve this episode's filename stem BEFORE anything derives a path
+        # from it (_path below, and _video_filename for the camera sidecars).
+        # With episode_name set, scan the save dir for the next free
+        # {episode_name}_{N} index so demos/replays get stable,
+        # human-referenceable names; otherwise use the timestamp.
+        if self._episode_name:
+            safe = _safe_name(self._episode_name)
+            self._episode_index = self._next_episode_index(self._save_dir, safe)
+            self._episode_base = f"{safe}_{self._episode_index}"
+        else:
+            self._episode_index = None
+            self._episode_base = f"episode_{self._start_name}"
+
+        self._path = self._save_dir / f"{self._episode_base}.mcap"
+        self.last_saved_path = None
         self._queue = queue.SimpleQueue()
         self._writer_error = None
         self._thread = threading.Thread(target=self._write_loop, daemon=False)
@@ -167,36 +186,21 @@ class TrajectoryRecorder:
         try:
             for name, camera in self._cameras.items():
                 path = self._save_dir / self._video_filename(name)
-                camera.start_recording(str(path), svo_compression=self._svo_compression, format=self._camera_format)
-        except Exception:
+                camera.start_recording(
+                    str(path),
+                    svo_compression=self._svo_compression,
+                    format=self._camera_format,
+                )
+        except BaseException:
+            # The writer thread is non-daemon and blocks on the queue, so it has
+            # to be shut down on every failure path or process exit hangs.
             self._queue.put(None)
             self._thread.join()
+            self._thread = None
             raise
 
         self._recording = True
-        self.last_saved_path = None
-
-        self._save_dir.mkdir(parents=True, exist_ok=True)
-        # Resolve this episode's filename stem. With episode_name set, scan the
-        # save dir for the next free {episode_name}_{N} index so demos/replays
-        # get stable, human-referenceable names; otherwise use the timestamp.
-        if self._episode_name:
-            safe = _safe_name(self._episode_name)
-            self._episode_index = self._next_episode_index(self._save_dir, safe)
-            self._episode_base = f"{safe}_{self._episode_index}"
-        else:
-            self._episode_index = None
-            self._episode_base = f"episode_{self._start_wall}"
-
-        video_ext = "svo2" if self._record_svo else "hdf5"
-        for name, camera in self._cameras.items():
-            video_path = str(
-                self._save_dir / f"{self._episode_base}_{_safe_name(name)}_video.{video_ext}"
-            )
-            camera.start_recording(video_path, self._start_time,
-                                   svo=self._record_svo, svo_compression=self._svo_compression)
-
-        print(f"  [recorder] RECORDING started -> {self._episode_base}.h5")
+        print(f"  [recorder] RECORDING started -> {self._path.name}")
 
     def stop(self):
         if not self._recording:
@@ -212,6 +216,7 @@ class TrajectoryRecorder:
         self._thread.join()
         if self._writer_error is not None:
             raise RuntimeError(f"MCAP writer failed: {self._writer_error}") from self._writer_error
+        self.last_saved_path = self._path
         print(f"  [recorder] SAVED {self._count} steps to {self._path}")
 
     def step(self, ee_pos, ee_rot, cmd_linear_vel, cmd_angular_vel,
@@ -311,10 +316,31 @@ class TrajectoryRecorder:
             ))
         self._queue.put(("rollout", elapsed_ns, rollout_step))
 
+    @property
+    def episode_base(self) -> str:
+        """Filename stem of the current/most recent episode (no extension)."""
+        return self._episode_base
+
+    @property
+    def episode_path(self):
+        """Path of the current/most recent episode MCAP, or None before start()."""
+        return self._path
+
+    def artifact_paths(self) -> list[Path]:
+        """Every file the current/most recent episode writes: the MCAP plus one
+        sidecar per camera. Lets callers keep or discard an episode as a unit
+        without re-deriving names and extensions."""
+        if self._path is None:
+            return []
+        return [self._path] + [
+            self._save_dir / self._video_filename(name) for name in self._cameras
+        ]
+
     def _episode_metadata(self):
         data = {
             "schema_version": EPISODE_SCHEMA_VERSION,
-            "episode_id": self._start_name,
+            "episode_id": self._episode_base,
+            "episode_base": self._episode_base,
             "start_wall_time_ns": str(self._start_wall_ns),
             "start_monotonic_time_ns": str(self._start_monotonic_ns),
             "trajectory_topic": TRAJECTORY_TOPIC,
@@ -322,6 +348,10 @@ class TrajectoryRecorder:
             "base_frame": "base",
             "end_effector_frame": "fr3_hand_tcp",
         }
+        if self._episode_name:
+            data["episode_name"] = _safe_name(self._episode_name)
+        if self._episode_index is not None:
+            data["episode_index"] = str(self._episode_index)
         for key, value in self._metadata.items():
             data[str(key)] = value if isinstance(value, str) else json.dumps(value)
         for name, camera in self._cameras.items():

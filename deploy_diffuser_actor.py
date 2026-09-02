@@ -1154,7 +1154,7 @@ def main(cfg: DictConfig) -> int:
     stage_state: dict = {"idx": stage_idx, "epoch": 0, "gripper_cmd": 1.0}
 
     # ----- optional trajectory recorder -----
-    # Logs the executed session to data_dir/episode_*.h5 in the exact format the
+    # Logs the executed session to data_dir/*.mcap in the exact format the
     # teleop/replay tools write, so a deploy run can be re-run with
     #   uv run python main.py mode=replay replay.episode=<file>
     # Cameras ARE recorded now: the worker reads frames from each camera's
@@ -1263,15 +1263,14 @@ def main(cfg: DictConfig) -> int:
         _recording_finalized = {"done": False}
         _trace_path = None
         if recorder is not None:
-            # __exit__ calls close()→stop()→_save_episode, so the h5 is written
+            # __exit__ calls close()→stop(), so the episode MCAP is written
             # on any exit path (Ctrl-C, completion, fault).
             stack.enter_context(recorder)
             recorder.start()
-            logger.info("Recording trajectory to %s/episode_%s.h5",
-                        cfg.data_dir, recorder._start_wall)
+            logger.info("Recording trajectory to %s", recorder.episode_path)
             if deploy_trace is not None:
                 deploy_trace.start()
-                _trace_path = Path(cfg.data_dir) / f"episode_{recorder._start_wall}_deploy.h5"
+                _trace_path = Path(cfg.data_dir) / f"{recorder.episode_base}_deploy.h5"
 
                 def _save_trace_on_exit():
                     if _recording_finalized["done"]:
@@ -1443,7 +1442,7 @@ def main(cfg: DictConfig) -> int:
 
         def _record_tick(enabled: bool, buttons: int = 0) -> None:
             """Log one measured timestep. Mirrors replay.py / teleop.py so the
-            resulting episode_*.h5 is byte-format compatible with mode=replay.
+            resulting *.mcap is byte-format compatible with mode=replay.
             `gripper_open` is the last commanded state (stage_state)."""
             if recorder is None:
                 return
@@ -1466,21 +1465,19 @@ def main(cfg: DictConfig) -> int:
 
         def finalize_recording(save: bool) -> None:
             """Stop + save the recording, then keep or delete it. Called from the
-            kill-key handler. Collects every artifact (robot h5, both camera
-            videos, deploy trace); on discard, unlinks them. Idempotent."""
+            kill-key handler. Collects every artifact (episode MCAP, each camera
+            video, deploy trace); on discard, unlinks them. Idempotent."""
             if _recording_finalized["done"]:
                 return
             _recording_finalized["done"] = True
             enabled_event.clear()
             paths: list[Path] = []
             if recorder is not None:
-                recorder.stop()  # writes robot h5 + closes both camera videos
+                recorder.stop()  # writes episode MCAP + closes camera videos
                 if recorder.last_saved_path is not None:
-                    paths.append(Path(recorder.last_saved_path))
-                    base = recorder._episode_base
-                    ext = "svo2" if recorder._record_svo else "hdf5"
-                    for cam in ("hand", "third_person"):
-                        paths.append(Path(cfg.data_dir) / f"{base}_{cam}_video.{ext}")
+                    # artifact_paths() covers the episode MCAP plus one sidecar
+                    # per camera actually attached, with the right extension.
+                    paths.extend(recorder.artifact_paths())
             if deploy_trace is not None and _trace_path is not None:
                 n = deploy_trace.save(_trace_path)
                 logger.info("Saved deploy trace (%d plans) to %s", n, _trace_path)

@@ -32,7 +32,7 @@ teleop:
     rot_offset_gain: 1.0         # scales clutch rotation offset (rad) into ~[-1, 1]
 
 demonstrate:
-  # Label for this batch of demos. Episodes save as {mode_title}_{N}.h5 where N
+  # Label for this batch of demos. Episodes save as {mode_title}_{N}.mcap where N
   # auto-increments from the highest existing index in data_dir. Override on the
   # CLI, e.g. `mode=demonstrate demonstrate.mode_title=pick_cup`. Null = timestamped names.
   mode_title: null
@@ -141,7 +141,7 @@ replay:
   # max_linear_vel_m_s: 0.015
   max_linear_vel_m_s: 0.03                      # Open-loop retime speed limit for Cartesian translation.
   max_angular_vel_rad_s: 0.25                   # Open-loop retime speed limit for Cartesian orientation.
-  episode: null  # path to .h5 episode or .npy q-trajectory file, or null for latest .h5 in data_dir
+  episode: null  # path to .mcap episode or .npy q-trajectory file, or null for latest .mcap in data_dir
   speed: 0.25
   period: 0.001
   # Joint impedance gains. Stiffer = better tracking, less compliance.
@@ -164,7 +164,7 @@ deploy:
   home_config: null
   control_hz: 10                                  # Nominal DiffuserActor waypoint rate used to interpret action horizon timing.
   execution_hz: 100                              # Cartesian reference streaming rate; samples the retimed interpolation.
-  record_trajectory: true                       # If true, log the executed session to data_dir/episode_*.h5 (same format as mode=replay), replayable via main.py mode=replay.
+  record_trajectory: true                       # If true, log the executed session to data_dir/*.mcap (same format as mode=replay), replayable via main.py mode=replay.
   # Stages where the gripper is MANUAL-ONLY: the policy plan's gripper channel is
   # ignored and only the SpaceMouse chord (both buttons) opens/closes it.
   # [] (current) = the policy predicts/drives the gripper in EVERY stage (default

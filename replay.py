@@ -565,7 +565,7 @@ def run_replay(cfg: DictConfig):
                 pass
 
         # Name replay episodes after the demo being replayed:
-        #   {mode_title}_{demo_number}_{replay_number}.h5
+        #   {mode_title}_{demo_number}_{replay_number}.mcap
         # Prefer the demo's embedded mode_title/episode_index attrs (survives a
         # file rename); fall back to the demo filename stem otherwise.
         attrs = episode.get("attrs", {})
@@ -573,11 +573,13 @@ def run_replay(cfg: DictConfig):
         demo_index = attrs.get("episode_index")
         if isinstance(demo_mode_title, bytes):
             demo_mode_title = demo_mode_title.decode()
-        if demo_mode_title is not None and demo_index is not None:
+        if isinstance(demo_index, bytes):
+            demo_index = demo_index.decode()
+        if demo_mode_title and demo_index is not None:
             replay_base_name = f"{demo_mode_title}_{int(demo_index)}"
         else:
             replay_base_name = episode_path.stem
-        print(f"  [recorder] Replay episodes -> {replay_base_name}_<N>.h5")
+        print(f"  [recorder] Replay episodes -> {replay_base_name}_<N>.mcap")
 
         from clear_franka.recorder import TrajectoryRecorder
         recorder = TrajectoryRecorder(

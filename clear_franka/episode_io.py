@@ -10,8 +10,14 @@ from clear_franka.recorder import TRAJECTORY_TOPIC
 
 
 def find_latest_episode(data_dir: str) -> Path:
+    """Most recently written episode in `data_dir`.
+
+    Matches every ``*.mcap``, not just the timestamped ``episode_*`` names:
+    demos recorded with a mode_title are named ``{mode_title}_{N}.mcap``.
+    Ordering is by mtime because those names don't sort chronologically.
+    """
     data_path = Path(data_dir)
-    episodes = sorted(data_path.glob("episode_*.mcap"))
+    episodes = sorted(data_path.glob("*.mcap"), key=lambda p: p.stat().st_mtime)
     if not episodes:
         raise FileNotFoundError(f"No episodes found in {data_dir}")
     return episodes[-1]

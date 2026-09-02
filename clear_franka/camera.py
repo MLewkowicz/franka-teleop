@@ -279,8 +279,11 @@ class ZedCamera:
 
     def get_latest_frame(self):
         """Return the newest (rgb, depth) published by the background loop, or
-        None if streaming isn't enabled yet / no frame captured. Copies out
-        under the lock so the caller owns the arrays.
+        None if streaming isn't enabled yet / no frame captured.
+
+        The arrays are handed out without copying: the loop allocates fresh ones
+        each iteration and never mutates a published frame, so the caller can
+        read them safely (but must not write to them).
         """
         with self._frame_lock:
             if self._latest_frame is None:
@@ -408,25 +411,40 @@ class ZedCamera:
             now = time.monotonic()
             should_capture_pointcloud = self._should_capture_pointcloud(now)
             should_capture_rgb = self._should_capture_rgb(now)
+            stream_frame = self._stream_latest
 
             with self._rec_lock:
                 recording = self._recording
-                if not recording and not should_capture_pointcloud and not should_capture_rgb:
+                if (
+                    not recording
+                    and not should_capture_pointcloud
+                    and not should_capture_rgb
+                    and not stream_frame
+                ):
                     continue
 
                 # Retrieve the left view at most once and fan it out to whoever
                 # wants it. get_data() is BGRA: ffmpeg is fed bgr24, while the
-                # stream stores RGB to match grab_frame's convention.
+                # streams store RGB to match grab_frame's convention.
                 rgb_recording = recording and self._record_format == "rgb"
-                if rgb_recording or should_capture_rgb:
+                if rgb_recording or should_capture_rgb or stream_frame:
                     self._zed.retrieve_image(self._rgb_mat, sl.VIEW.LEFT)
                     bgra = self._rgb_mat.get_data()
                     if rgb_recording:
                         self._video_writer.write(np.ascontiguousarray(bgra[:, :, :3]))
-                    if should_capture_rgb:
+                    if should_capture_rgb or stream_frame:
                         rgb = np.ascontiguousarray(bgra[:, :, :3][:, :, ::-1])
-                        with self._rgb_lock:
-                            self._latest_rgb = (rgb, now)
+                        if should_capture_rgb:
+                            with self._rgb_lock:
+                                self._latest_rgb = (rgb, now)
+                        if stream_frame:
+                            # Depth is retrieved only for the frame stream —
+                            # rgb recording and the rgb stream don't need it,
+                            # and retrieve_measure is not free.
+                            self._zed.retrieve_measure(self._depth_mat, sl.MEASURE.DEPTH)
+                            depth = self._depth_mat.get_data().copy()
+                            with self._frame_lock:
+                                self._latest_frame = (rgb, depth, now)
 
                 if recording:
                     # SVO frames are written automatically by the SDK on grab();
