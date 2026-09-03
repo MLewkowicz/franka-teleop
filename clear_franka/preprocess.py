@@ -30,10 +30,10 @@ import logging
 from pathlib import Path
 from typing import Any
 
-import h5py
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
 
+from clear_franka.episode_io import load_episode
 from clear_franka.joint_trajectory import Trajectory
 
 logger = logging.getLogger(__name__)
@@ -59,8 +59,8 @@ from clear_franka.franka import fk_ee_poses
 
 
 def preprocess_episode(
-    raw_h5_path: Path | str,
-    out_h5_path: Path | str,
+    raw_episode_path: Path | str,
+    out_path: Path | str,
     *,
     trim_enabled: bool = True,
     trim_time_window: float = 0.3,
@@ -84,14 +84,14 @@ def preprocess_episode(
     failures such as too-short episodes or velocity-bound violations. Dependency,
     load, processing, and write exceptions bubble up to the caller.
     """
-    raw_h5_path = Path(raw_h5_path)
-    out_h5_path = Path(out_h5_path)
+    raw_episode_path = Path(raw_episode_path)
+    out_path = Path(out_path)
 
-    if not raw_h5_path.exists():
-        logger.error("preprocess: raw episode does not exist: %s", raw_h5_path)
+    if not raw_episode_path.exists():
+        logger.error("preprocess: raw episode does not exist: %s", raw_episode_path)
         return False
 
-    raw = _load_episode(raw_h5_path)
+    raw = _load_episode(raw_episode_path)
 
     out_arrays = preprocess_episode_arrays(
         raw,
@@ -114,19 +114,18 @@ def preprocess_episode(
         return False
 
     # --- write out -------------------------------------------------------
-    out_h5_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     _write_episode(
-        out_h5_path,
+        out_path,
         arrays=out_arrays,
         raw_attrs=raw["_attrs"],
-        raw_camera_group=raw.get("_camera_timestamps"),
         preprocessing_params={} if params_metadata is None else dict(params_metadata),
-        raw_basename=raw_h5_path.name,
+        raw_basename=raw_episode_path.name,
     )
 
     logger.info(
         "preprocess: wrote %s (%d samples, %.2fs)",
-        out_h5_path,
+        out_path,
         out_arrays["joint_pos"].shape[0],
         float(out_arrays["timestamps"][-1]),
     )
@@ -447,24 +446,18 @@ def _insert_gripper_dwell(
 
 
 # ---------------------------------------------------------------------------
-# h5 I/O
+# Episode I/O
 # ---------------------------------------------------------------------------
 
 def _load_episode(path: Path) -> dict[str, Any]:
-    """Load every top-level dataset + attrs + the (optional) camera_timestamps group.
+    """Load a recorded (MCAP) episode into the array-dict shape the pipeline expects.
 
-    Returns a dict with numpy arrays for each dataset plus `_attrs` (dict) and
-    `_camera_timestamps` (dict[str, ndarray] | None). Datasets whose names start
-    with underscore are reserved for these meta entries.
+    Returns a dict with numpy arrays for each field plus `_attrs` (dict).
+    Datasets whose names start with underscore are reserved for meta entries.
     """
-    out: dict[str, Any] = {}
-    with h5py.File(path, "r") as f:
-        for name, item in f.items():
-            if isinstance(item, h5py.Dataset):
-                out[name] = item[()]
-            elif isinstance(item, h5py.Group) and name == "camera_timestamps":
-                out["_camera_timestamps"] = {k: v[()] for k, v in item.items()}
-        out["_attrs"] = {k: f.attrs[k] for k in f.attrs}
+    data = load_episode(path)
+    out: dict[str, Any] = {k: v for k, v in data.items() if k != "attrs"}
+    out["_attrs"] = data["attrs"]
     return out
 
 
@@ -473,28 +466,22 @@ def _write_episode(
     *,
     arrays: dict[str, np.ndarray],
     raw_attrs: dict[str, Any],
-    raw_camera_group: dict[str, np.ndarray] | None,
     preprocessing_params: dict[str, Any],
     raw_basename: str,
 ) -> None:
-    with h5py.File(path, "w") as f:
-        for key, arr in arrays.items():
-            f.create_dataset(key, data=arr, compression="gzip", compression_opts=1)
-        # Camera-timestamps group is preserved verbatim. Demos are joints-only by
-        # design, so this branch is usually inert; kept for robustness in case a
-        # future workflow attaches cameras to demonstrate.
-        if raw_camera_group:
-            group = f.create_group("camera_timestamps")
-            for name, ts in raw_camera_group.items():
-                group.create_dataset(name, data=ts, compression="gzip", compression_opts=1)
-        for k, v in raw_attrs.items():
-            f.attrs[k] = v
-        # Overwrite duration / num_steps with the post-pipeline values.
-        f.attrs["num_steps"] = int(arrays["joint_pos"].shape[0])
-        f.attrs["duration_s"] = float(arrays["timestamps"][-1])
-        f.attrs["preprocessing_version"] = int(PREPROCESSING_VERSION)
-        f.attrs["preprocessing_params"] = json.dumps(preprocessing_params)
-        f.attrs["raw_episode"] = raw_basename
+    """Write processed arrays to an .npz archive for inspection/caching.
+
+    Nothing currently reads this back programmatically (replay.py preprocesses
+    in memory via preprocess_episode_arrays) — this is only for the
+    preprocess_demonstrations.py batch CLI's on-disk output.
+    """
+    attrs = dict(raw_attrs)
+    attrs["num_steps"] = int(arrays["joint_pos"].shape[0])
+    attrs["duration_s"] = float(arrays["timestamps"][-1])
+    attrs["preprocessing_version"] = int(PREPROCESSING_VERSION)
+    attrs["preprocessing_params"] = json.dumps(preprocessing_params)
+    attrs["raw_episode"] = raw_basename
+    np.savez_compressed(path, attrs=json.dumps(attrs), **arrays)
 
 
 # ---------------------------------------------------------------------------

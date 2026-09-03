@@ -1,20 +1,52 @@
-"""ZED 2i camera capture and recording for teleoperation.
-
-Runs camera capture in a background daemon thread. Records RGB + depth
-frames to a separate HDF5 video file, synchronized with trajectory
-recording via a shared monotonic clock epoch.
-"""
+"""ZED 2i camera capture and native SVO2 recording for teleoperation."""
 
 import logging
 import threading
 import time
-from pathlib import Path
 from typing import Optional
 
-import h5py
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+class _FfmpegFrameWriter:
+    """Pipes raw BGR frames to a system `ffmpeg` subprocess for H.26x encoding.
+
+    cv2.VideoWriter can't do this: the FFmpeg bundled in the opencv-python wheel
+    omits libx264/libx265 (excluded from the prebuilt wheel), so h264/h265 fourccs
+    silently fail to open. The system ffmpeg (`apt install ffmpeg` on Ubuntu) has
+    both, so we drive it directly instead.
+    """
+
+    def __init__(self, path: str, width: int, height: int, fps: int,
+                 codec: str = "libx265", preset: str = "veryfast", crf: int = 28):
+        import shutil
+        import subprocess
+
+        ffmpeg_bin = shutil.which("ffmpeg")
+        if ffmpeg_bin is None:
+            raise RuntimeError(
+                "ffmpeg not found on PATH; install it for RGB video recording (e.g. `sudo apt install ffmpeg`)"
+            )
+        cmd = [
+            ffmpeg_bin, "-y", "-loglevel", "error",
+            "-f", "rawvideo", "-vcodec", "rawvideo",
+            "-pix_fmt", "bgr24", "-s", f"{width}x{height}", "-r", str(fps),
+            "-i", "-",
+            "-an", "-vcodec", codec, "-pix_fmt", "yuv420p",
+            "-preset", preset, "-crf", str(crf),
+            path,
+        ]
+        self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+
+    def write(self, frame_bgr) -> None:
+        self._proc.stdin.write(frame_bgr.tobytes())
+
+    def release(self) -> None:
+        if self._proc.stdin is not None:
+            self._proc.stdin.close()
+        self._proc.wait(timeout=30)
 
 
 def get_camera_config(cfg, name: str = "third_person") -> dict:
@@ -29,12 +61,17 @@ def get_camera_config(cfg, name: str = "third_person") -> dict:
     }
 
 
-def make_zed_camera(cfg, name: str = "third_person"):
+def make_zed_camera(cfg, name: str = "third_person", depth_mode: str | None = None):
+    """Build a camera from config. `depth_mode` overrides the configured mode.
+
+    Depth costs real time inside `grab()` — NEURAL runs a network per frame per
+    camera — so callers that only need color should pass "NONE".
+    """
     camera_cfg = get_camera_config(cfg, name)
     return ZedCamera(
         resolution=camera_cfg["resolution"],
         fps=camera_cfg["fps"],
-        depth_mode=camera_cfg["depth_mode"],
+        depth_mode=depth_mode or camera_cfg["depth_mode"],
         serial_number=camera_cfg["serial_number"],
         camera_id=camera_cfg["name"],
     )
@@ -53,7 +90,7 @@ def enabled_camera_names(cfg, include: tuple[str, ...] = ()) -> list[str]:
 
 
 class ZedCamera:
-    """Threaded ZED camera capture with HDF5 video recording."""
+    """Threaded ZED camera capture with native SVO2 recording."""
 
     def __init__(self, resolution="HD720", fps=30, depth_mode="PERFORMANCE",
                  serial_number=None, camera_id=None):
@@ -97,9 +134,11 @@ class ZedCamera:
         self._rec_lock = threading.Lock()
         self._recording = False
         self._svo_recording = False
-        self._video_file: Optional[h5py.File] = None
-        self._start_time = 0.0
+        self._record_format = "svo"
+        self._video_writer = None
         self._frame_count = 0
+        self._first_clock_anchor = None
+        self._last_clock_anchor = None
 
         # Pre-allocate retrieval buffers
         self._rgb_mat = sl.Mat()
@@ -125,6 +164,12 @@ class ZedCamera:
         self._last_pointcloud_time = 0.0
         self._latest_pointcloud = None
 
+        self._rgb_lock = threading.Lock()
+        self._rgb_stream_enabled = False
+        self._rgb_period = 0.0
+        self._last_rgb_time = 0.0
+        self._latest_rgb = None
+
         # Resolve image dimensions from camera config
         cam_info = self._zed.get_camera_information()
         self._img_h = cam_info.camera_configuration.resolution.height
@@ -139,23 +184,23 @@ class ZedCamera:
     # Recording control
     # ------------------------------------------------------------------
 
-    def start_recording(self, video_path: str, start_time: float,
-                        svo: bool = False, svo_compression: str = "H264"):
-        """Begin recording frames to disk.
+    def start_recording(self, video_path: str, svo_compression: str = "H264", format: str = "svo"):
+        """Begin recording camera video.
 
         Args:
-            video_path: Output path. HDF5 (.hdf5) or SVO2 (.svo2) depending on ``svo``.
-            start_time: The time.monotonic() epoch shared with the trajectory
-                        recorder, for synchronized timestamps.
-            svo: If True, record a native ZED SVO2 file instead of HDF5.
-            svo_compression: SVO compression mode name (H264, H265, LOSSLESS,
-                             H264_LOSSLESS, H265_LOSSLESS). Ignored when svo=False.
+            video_path: Output path (.svo2 for format="svo"; a video container, e.g. .mp4,
+                for format="rgb").
+            svo_compression: H264, H265, LOSSLESS, H264_LOSSLESS, or H265_LOSSLESS.
+                Only used for format="svo".
+            format: "svo" records the native stereo pair (depth reconstructable later,
+                larger files). "rgb" records only the left view as an H.265 color video
+                (via a piped system ffmpeg) — no depth, smaller files.
         """
         with self._rec_lock:
             if self._recording:
                 return
 
-            if svo:
+            if format == "svo":
                 sl = self._sl
                 recording_params = sl.RecordingParameters()
                 recording_params.video_filename = video_path
@@ -166,63 +211,44 @@ class ZedCamera:
                 if err != sl.ERROR_CODE.SUCCESS:
                     raise RuntimeError(f"Failed to start SVO recording: {err}")
                 self._svo_recording = True
-                self._video_file = None
+            elif format == "rgb":
+                self._video_writer = _FfmpegFrameWriter(video_path, self._img_w, self._img_h, self._fps)
             else:
-                h, w = self._img_h, self._img_w
-                f = h5py.File(video_path, "w")
-                f.create_dataset(
-                    "rgb", shape=(0, h, w, 3), maxshape=(None, h, w, 3),
-                    dtype=np.uint8, chunks=(1, h, w, 3), compression="lzf",
-                )
-                f.create_dataset(
-                    "depth", shape=(0, h, w), maxshape=(None, h, w),
-                    dtype=np.float32, chunks=(1, h, w), compression="lzf",
-                )
-                f.create_dataset(
-                    "timestamps", shape=(0,), maxshape=(None,),
-                    dtype=np.float64, chunks=(256,),
-                )
-                self._svo_recording = False
-                self._video_file = f
+                raise ValueError(f"Unknown camera recording format: {format!r}")
 
-            self._start_time = start_time
+            self._record_format = format
             self._frame_count = 0
+            self._first_clock_anchor = None
+            self._last_clock_anchor = None
             self._recording = True
-            logger.info("  [camera] Recording started: %s", video_path)
+            logger.info("  [camera] Recording started (%s): %s", format, video_path)
 
     def stop_recording(self):
         """Stop recording and close the video file.
 
         Returns:
-            (camera_timestamps, frame_count) or (None, 0) if not recording.
-            camera_timestamps is None for SVO recordings (timestamps are
-            embedded in the SVO file).
+            Frame count and first/last ZED-image-to-host-monotonic clock anchors.
         """
         with self._rec_lock:
             if not self._recording:
-                return None, 0
+                return {"frame_count": 0}
             self._recording = False
-            svo = self._svo_recording
+            record_format = self._record_format
             self._svo_recording = False
 
-            f = self._video_file
-            self._video_file = None
-
         n = self._frame_count
-        if svo:
+        if record_format == "svo":
             self._zed.disable_recording()
-            logger.info("  [camera] SVO recording stopped, %d frames", n)
-            return None, n
-
-        # Read back timestamps (file access outside lock is fine since
-        # the capture loop won't touch it after _recording is False).
-        if n > 0:
-            timestamps = f["timestamps"][:n]
-        else:
-            timestamps = None
-        f.close()
-        logger.info("  [camera] Recording stopped, %d frames", n)
-        return timestamps, n
+        elif self._video_writer is not None:
+            self._video_writer.release()
+            self._video_writer = None
+        logger.info("  [camera] Recording stopped (%s), %d frames", record_format, n)
+        result = {"frame_count": n}
+        for label, anchor in (("first", self._first_clock_anchor), ("last", self._last_clock_anchor)):
+            if anchor is not None:
+                result[f"{label}_zed_image_time_ns"] = anchor[0]
+                result[f"{label}_host_monotonic_time_ns"] = anchor[1]
+        return result
 
     # ------------------------------------------------------------------
     # Synchronous access (used by calibration; safe before run() is called)
@@ -253,8 +279,11 @@ class ZedCamera:
 
     def get_latest_frame(self):
         """Return the newest (rgb, depth) published by the background loop, or
-        None if streaming isn't enabled yet / no frame captured. Copies out
-        under the lock so the caller owns the arrays.
+        None if streaming isn't enabled yet / no frame captured.
+
+        The arrays are handed out without copying: the loop allocates fresh ones
+        each iteration and never mutates a published frame, so the caller can
+        read them safely (but must not write to them).
         """
         with self._frame_lock:
             if self._latest_frame is None:
@@ -307,6 +336,39 @@ class ZedCamera:
             points, colors, timestamp = self._latest_pointcloud
             return points.copy(), colors.copy(), timestamp
 
+    def start_rgb_stream(self, update_hz: float = 0.0) -> None:
+        """Enable background capture of the latest left-view RGB frame.
+
+        Unlike `grab_frame`, this is safe to use alongside `run()` and recording:
+        the capture thread retrieves the left view once per grab and shares it.
+
+        Args:
+            update_hz: 0 or less stores every grabbed frame, which is the default
+                and what live inference wants. Only set a rate when deliberately
+                sampling below the camera fps — rate-limiting at exactly the fps
+                lets grab jitter drop alternate frames, halving the effective rate.
+        """
+        with self._rgb_lock:
+            self._rgb_stream_enabled = True
+            self._rgb_period = 0.0 if update_hz <= 0 else 1.0 / update_hz
+
+    def stop_rgb_stream(self) -> None:
+        with self._rgb_lock:
+            self._rgb_stream_enabled = False
+            self._latest_rgb = None
+
+    def get_latest_rgb(self):
+        """Return the latest (rgb, timestamp) tuple, or None.
+
+        `rgb` is HxWx3 uint8 in RGB order; `timestamp` is `time.monotonic()` at
+        capture, so callers can check staleness.
+        """
+        with self._rgb_lock:
+            if self._latest_rgb is None:
+                return None
+            rgb, timestamp = self._latest_rgb
+            return rgb.copy(), timestamp
+
     # ------------------------------------------------------------------
     # Thread lifecycle
     # ------------------------------------------------------------------
@@ -348,45 +410,54 @@ class ZedCamera:
 
             now = time.monotonic()
             should_capture_pointcloud = self._should_capture_pointcloud(now)
+            should_capture_rgb = self._should_capture_rgb(now)
+            stream_frame = self._stream_latest
 
             with self._rec_lock:
                 recording = self._recording
-                svo = self._svo_recording
-            stream = self._stream_latest
-            if not recording and not should_capture_pointcloud and not stream:
-                continue
+                if (
+                    not recording
+                    and not should_capture_pointcloud
+                    and not should_capture_rgb
+                    and not stream_frame
+                ):
+                    continue
 
-            # Retrieve RGB+depth once if anyone needs it (HDF5 recording OR the
-            # latest-frame stream). SVO recording is written by the SDK on grab()
-            # and needs no retrieve unless we're also streaming.
-            rgb = depth = None
-            if (recording and not svo) or stream:
-                self._zed.retrieve_image(self._rgb_mat, sl.VIEW.LEFT)
-                self._zed.retrieve_measure(self._depth_mat, sl.MEASURE.DEPTH)
-                rgb = self._rgb_mat.get_data()[:, :, :3][:, :, ::-1].copy()  # BGRA→RGB
-                depth = self._depth_mat.get_data().copy()
-                if stream:
-                    with self._frame_lock:
-                        self._latest_frame = (rgb, depth, now)
+                # Retrieve the left view at most once and fan it out to whoever
+                # wants it. get_data() is BGRA: ffmpeg is fed bgr24, while the
+                # streams store RGB to match grab_frame's convention.
+                rgb_recording = recording and self._record_format == "rgb"
+                if rgb_recording or should_capture_rgb or stream_frame:
+                    self._zed.retrieve_image(self._rgb_mat, sl.VIEW.LEFT)
+                    bgra = self._rgb_mat.get_data()
+                    if rgb_recording:
+                        self._video_writer.write(np.ascontiguousarray(bgra[:, :, :3]))
+                    if should_capture_rgb or stream_frame:
+                        rgb = np.ascontiguousarray(bgra[:, :, :3][:, :, ::-1])
+                        if should_capture_rgb:
+                            with self._rgb_lock:
+                                self._latest_rgb = (rgb, now)
+                        if stream_frame:
+                            # Depth is retrieved only for the frame stream —
+                            # rgb recording and the rgb stream don't need it,
+                            # and retrieve_measure is not free.
+                            self._zed.retrieve_measure(self._depth_mat, sl.MEASURE.DEPTH)
+                            depth = self._depth_mat.get_data().copy()
+                            with self._frame_lock:
+                                self._latest_frame = (rgb, depth, now)
 
-            if recording:
-                with self._rec_lock:
-                    if self._recording:  # re-check; stop_recording may have raced
-                        if self._svo_recording:
-                            self._frame_count += 1
-                        elif rgb is not None:
-                            i = self._frame_count
-                            f = self._video_file
-                            f["rgb"].resize(i + 1, axis=0)
-                            f["rgb"][i] = rgb
-                            f["depth"].resize(i + 1, axis=0)
-                            f["depth"][i] = depth
-                            f["timestamps"].resize(i + 1, axis=0)
-                            f["timestamps"][i] = now - self._start_time
-                            self._frame_count = i + 1
+                if recording:
+                    # SVO frames are written automatically by the SDK on grab();
+                    # the rgb format was already handled above.
+                    self._frame_count += 1
+                    image_time_ns = self._zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_nanoseconds()
+                    anchor = (int(image_time_ns), time.monotonic_ns())
+                    if self._first_clock_anchor is None:
+                        self._first_clock_anchor = anchor
+                    self._last_clock_anchor = anchor
 
-            if should_capture_pointcloud:
-                self._retrieve_pointcloud(now)
+                if should_capture_pointcloud:
+                    self._retrieve_pointcloud(now)
 
     def _should_capture_pointcloud(self, now: float) -> bool:
         with self._pc_lock:
@@ -395,6 +466,15 @@ class ZedCamera:
             if now - self._last_pointcloud_time < self._pointcloud_period:
                 return False
             self._last_pointcloud_time = now
+            return True
+
+    def _should_capture_rgb(self, now: float) -> bool:
+        with self._rgb_lock:
+            if not self._rgb_stream_enabled:
+                return False
+            if now - self._last_rgb_time < self._rgb_period:
+                return False
+            self._last_rgb_time = now
             return True
 
     def _retrieve_pointcloud(self, timestamp: float) -> None:

@@ -6,13 +6,13 @@ Usage:
     uv run python preprocess_demonstrations.py
 
     # Re-process a single raw episode:
-    uv run python preprocess_demonstrations.py +episode=data/episode_20260528_120000.h5
+    uv run python preprocess_demonstrations.py +episode=data/episode_20260528_120000.mcap
 
     # Overwrite existing processed copies (re-tune with new params):
     uv run python preprocess_demonstrations.py preprocess.overwrite=true
 
 Replay can run the same preprocessing in memory before playback. This CLI is
-for writing processed HDF5 copies for inspection, caching, or batch re-runs.
+for writing processed .npz copies for inspection, caching, or batch re-runs.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 def _iter_raw_episodes(input_dir: Path) -> list[Path]:
     if not input_dir.exists():
         raise FileNotFoundError(f"input_dir does not exist: {input_dir}")
-    return sorted(input_dir.glob("episode_*.h5"))
+    return sorted(input_dir.glob("*.mcap"))
 
 
 def _preprocess_kwargs(pre_cfg: DictConfig) -> dict:
@@ -93,7 +93,7 @@ def main(cfg: DictConfig) -> None:
     skip_count = 0
     fail_count = 0
     for raw in paths:
-        out = output_dir / raw.name
+        out = output_dir / f"{raw.stem}.npz"
         if out.exists() and not overwrite:
             print(f"  [skip] {raw.name} (processed copy exists; pass preprocess.overwrite=true to redo)")
             skip_count += 1

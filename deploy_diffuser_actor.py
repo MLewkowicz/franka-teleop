@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import contextlib
 import datetime as _dt
+import select
+import signal
 from dataclasses import dataclass
 import logging
 import os
@@ -40,6 +42,37 @@ logger = logging.getLogger("deploy_diffuser_actor")
 # Hybrid control modes (see DIFFUSER_ACTOR_DEPLOY_DEBUG.md / plan).
 TELEOP = "teleop"
 INFERENCE = "inference"
+
+
+def _ignore_terminal_stop_signals() -> None:
+    """Keep SIGTTIN/SIGTTOU from freezing the whole rollout.
+
+    The kill-key listener reads the controlling terminal from a background
+    thread for the life of the run. If the process is not in the terminal's
+    foreground process group — it got backgrounded, or the shell reclaimed the
+    terminal — that read raises SIGTTIN, and its default action stops EVERY
+    thread in the process group. A stopped process cannot service SIGINT, so
+    Ctrl-C then appears to do nothing at all and the run looks hung (observed:
+    State: T (stopped), 120 threads parked in do_signal_stop).
+
+    Ignoring the two signals makes a background terminal read fail with EIO
+    instead, which the listener treats as "no keyboard right now".
+    """
+    for sig in (signal.SIGTTIN, signal.SIGTTOU):
+        try:
+            signal.signal(sig, signal.SIG_IGN)
+        except (ValueError, OSError, AttributeError):
+            # Not on the main thread, or the platform lacks it.
+            pass
+
+
+def _stdin_is_foreground() -> bool:
+    """True when reading stdin will not hit SIGTTIN/EIO."""
+    try:
+        return os.tcgetpgrp(sys.stdin.fileno()) == os.getpgrp()
+    except (OSError, ValueError, AttributeError):
+        # No controlling terminal (piped or redirected) — a read is fine.
+        return True
 
 
 def _teleop_target_from_sample(sample, robot_pos, robot_rot, input_filter,
@@ -468,6 +501,71 @@ def _make_cartesian_trajectory_for_plan(
         max_angular_vel=max_angular_vel,
         min_segment_dt=min_segment_dt,
     )
+
+
+def _make_joint_trajectory_for_plan(
+    cartesian_trajectory,
+    *,
+    ik,
+    q_seed: np.ndarray,
+    dt: float,
+    workspace_lo: np.ndarray,
+    workspace_hi: np.ndarray,
+    max_distance: float,
+    max_waypoints: int = 40,
+):
+    """Convert an adopted plan's Cartesian path into a joint trajectory via IK.
+
+    This is the `tracker: ik` counterpart to streaming Cartesian references, and
+    the per-plan equivalent of what `replay.tracker=ik` does per episode. It
+    works because the executor adopts one plan at a time and runs it to
+    completion, so the plan's Cartesian waypoints are known up front.
+
+    The workspace clip is applied to each sample BEFORE the solve: in Cartesian
+    mode the clip happens on the way to `set_target`, but here the solve has to
+    be for the pose that will actually be commanded, or the joint waypoints would
+    correspond to poses that were then discarded.
+
+    `q_seed` should be the measured joint configuration. The retimed trajectory
+    already starts at the live EE pose (the bridge segment), so the arm is
+    effectively pre-positioned at row 0 — the seeding contract
+    `solve_trajectory_prefix` expects.
+
+    Sampling is capped at `max_waypoints` because every sample costs an IK solve;
+    the joint spline interpolates between them at the streaming rate, exactly as
+    replay's joint playback interpolates the solved episode.
+
+    Returns `(trajectory, reason)`. `trajectory` is a
+    `clear_franka.joint_trajectory.Trajectory` over the solved prefix, or None
+    when fewer than two waypoints solved (nothing interpolable — the caller
+    should skip the plan). `reason` is None only on a complete solve.
+    """
+    from clear_franka.joint_trajectory import Trajectory
+
+    duration = float(cartesian_trajectory.duration)
+    if duration <= 0.0:
+        return None, "plan trajectory has zero duration"
+
+    num_samples = max(int(np.ceil(duration / float(dt))) + 1, 2)
+    num_samples = min(num_samples, int(max_waypoints))
+    times = np.linspace(0.0, duration, num_samples)
+
+    samples = [cartesian_trajectory.interpolate(t) for t in times]
+    positions = np.clip(
+        np.stack([sample[0] for sample in samples], axis=0), workspace_lo, workspace_hi
+    )
+    rotations = np.stack([sample[1] for sample in samples], axis=0)
+
+    joint_pos, reason = ik.solve_trajectory_prefix(
+        positions,
+        rotations,
+        q_seed=q_seed,
+        timestamps=times,
+        max_distance=max_distance,
+    )
+    if len(joint_pos) < 2:
+        return None, reason or "IK produced no executable prefix"
+    return Trajectory(joint_pos, times[:len(joint_pos)]), reason
 
 
 def _sample_cartesian_trajectory_positions(
@@ -994,8 +1092,8 @@ def main(cfg: DictConfig) -> int:
     from clear_franka.utils import LoopRatePrinter
     from clear_franka.diffuser_actor_io import euler_xyz_to_matrix
     from clear_franka.geometry import pack_Rp
+    from zero_franky.robotiq import RobotiqGripperProxy
     from scipy.spatial.transform import Rotation
-    from clear_franka.robotiq_net_proxy import RobotiqGripperProxy
     from clear_franka.recorder import TrajectoryRecorder
     from clear_franka.visualization import CortadoViserVisualizer
     from threed_mouse import ThreeDMouse
@@ -1064,11 +1162,6 @@ def main(cfg: DictConfig) -> int:
         gripper = RobotiqGripperProxy(
             server_host=gc.host,
             server_port=int(gc.port),
-            com_port=gc.com_port,
-            device_id=int(gc.device_id),
-            connection_type=gc.connection_type,
-            tcp_host=gc.tcp_host,
-            tcp_port=int(gc.tcp_port),
             auto_activate=True,
         )
         # Default open at start (matches training: episodes begin with gripper open).
@@ -1163,14 +1256,6 @@ def main(cfg: DictConfig) -> int:
     teleop_workspace_clip = bool(cfg.deploy.get("teleop_workspace_clip", True))
     mode = TELEOP   # start in teleop so the user positions the arm first
 
-    # ----- grasp->place gate (auto-advance on gripper closure confirmation) -----
-    gate_place_on_grasp = bool(cfg.deploy.get("gate_place_on_grasp", True))
-    grasp_gate_poll_dt = 1.0 / float(cfg.deploy.get("grasp_gate_poll_hz", 15.0))
-    grasp_gate_timeout_s = float(cfg.deploy.get("grasp_gate_timeout_s", 3.0))
-    grasp_close_pending = False
-    grasp_close_commanded_at = 0.0
-    last_grasp_gate_poll = 0.0
-
     plan_hz = float(cfg.deploy.get("control_hz", 10.0))
     execution_hz = float(cfg.deploy.get("execution_hz", 100.0))
     plan_dt = 1.0 / plan_hz
@@ -1183,7 +1268,7 @@ def main(cfg: DictConfig) -> int:
     stage_state: dict = {"idx": stage_idx, "epoch": 0, "gripper_cmd": 1.0}
 
     # ----- optional trajectory recorder -----
-    # Logs the executed session to data_dir/episode_*.h5 in the exact format the
+    # Logs the executed session to data_dir/*.mcap in the exact format the
     # teleop/replay tools write, so a deploy run can be re-run with
     #   uv run python main.py mode=replay replay.episode=<file>
     # Cameras ARE recorded now: the worker reads frames from each camera's
@@ -1196,8 +1281,8 @@ def main(cfg: DictConfig) -> int:
         recorder = TrajectoryRecorder(
             save_dir=cfg.data_dir,
             cameras={"hand": cam_hand, "third_person": cam_tp},
-            record_svo=bool(cfg.recorder.get("record_svo", False)),
             svo_compression=str(cfg.recorder.get("svo_compression", "H264")),
+            camera_format=str(cfg.recorder.get("camera_format", "svo")),
             metadata={
                 "control_mode": "diffuser_actor_deploy",
                 "policy_config": str(cfg.deploy.policy_config),
@@ -1207,6 +1292,24 @@ def main(cfg: DictConfig) -> int:
         # Companion trace: raw policy plans + per-tick Cartesian tracking error,
         # written to episode_<wall>_deploy.h5 next to the executed trajectory.
         deploy_trace = DeployTrace()
+
+    # Execution mode. "cartesian" streams Cartesian references straight to the
+    # Cartesian impedance tracker. "ik" solves each adopted plan's Cartesian
+    # waypoints into joint waypoints and streams those to the joint impedance
+    # tracker — the same conversion replay.tracker=ik does, applied per plan
+    # (the executor adopts one plan at a time and runs it to completion, so a
+    # plan's Cartesian path is fully known when it is adopted).
+    tracker_mode = str(cfg.deploy.get("tracker", "cartesian")).lower()
+    if tracker_mode not in {"cartesian", "ik"}:
+        raise ValueError(
+            f"deploy.tracker must be 'cartesian' or 'ik', got {tracker_mode!r}"
+        )
+    # plan_ik is built after the state stream comes up (below): the solver has to
+    # work in the SAME tool frame the plans and the tracker use, which is the
+    # controller's O_T_EE, and that frame is only knowable from a live state.
+    plan_ik = None
+    ik_max_distance = float(cfg.deploy.get("ik_max_distance", 0.2))
+    ik_max_consecutive_failures = int(cfg.deploy.get("ik_max_consecutive_failures", 3))
 
     with contextlib.ExitStack() as stack:
         stack.enter_context(cam_hand)
@@ -1267,21 +1370,91 @@ def main(cfg: DictConfig) -> int:
             "max_torque=%.1f buffer=%.2frad",
             jl_act, jl_stf, jl_dmp, jl_tmx, jl_buf,
         )
-        tracker = stack.enter_context(robot.start_cartesian_impedance_tracker(
-            period=0.001,
-            translational_stiffness=cfg.deploy.translational_stiffness,
-            rotational_stiffness=cfg.deploy.rotational_stiffness,
-            posture_task=PostureTask(_ns_target, stiffness=cfg.deploy.nullspace_stiffness),
-            manipulability_task=ManipulabilityTask(gain=5.0, max_torque=1.0),
-            lower_joint_limits=_lower_lim,
-            upper_joint_limits=_upper_lim,
-            joint_limit_activation_distance=jl_act,
-            joint_limit_stiffness=jl_stf,
-            joint_limit_damping=jl_dmp,
-            joint_limit_max_torque=jl_tmx,
-        ))
+        # tracker: ik streams JOINT references (plan Cartesian waypoints are solved
+        # into joint waypoints per adoption), so it needs the joint impedance
+        # tracker. The posture and manipulability tasks exist only to resolve the
+        # 7->6 DOF redundancy for a Cartesian reference; under IK the solver
+        # resolves it from the measured q, so they do not apply.
+        if tracker_mode == "ik":
+            ik_stiffness = [float(v) for v in cfg.deploy.get(
+                "joint_stiffness", [320.0, 320.0, 320.0, 320.0, 120.0, 120.0, 30.0]
+            )]
+            logger.info("Tracker: ik (joint impedance, stiffness=%s)", ik_stiffness)
+            tracker = stack.enter_context(robot.start_joint_impedance_tracker(
+                period=0.001,
+                stiffness=ik_stiffness,
+                lower_joint_limits=_lower_lim,
+                upper_joint_limits=_upper_lim,
+                joint_limit_activation_distance=jl_act,
+                joint_limit_stiffness=jl_stf,
+                joint_limit_damping=jl_dmp,
+                joint_limit_max_torque=jl_tmx,
+            ))
+        else:
+            logger.info("Tracker: cartesian (Cartesian impedance)")
+            tracker = stack.enter_context(robot.start_cartesian_impedance_tracker(
+                period=0.001,
+                translational_stiffness=cfg.deploy.translational_stiffness,
+                rotational_stiffness=cfg.deploy.rotational_stiffness,
+                posture_task=(
+                    PostureTask(_ns_target, stiffness=cfg.deploy.nullspace_stiffness)
+                    if _ns_target is not None else None
+                ),
+                manipulability_task=ManipulabilityTask(gain=5.0, max_torque=1.0),
+                lower_joint_limits=_lower_lim,
+                upper_joint_limits=_upper_lim,
+                joint_limit_activation_distance=jl_act,
+                joint_limit_stiffness=jl_stf,
+                joint_limit_damping=jl_dmp,
+                joint_limit_max_torque=jl_tmx,
+            ))
         robot.start_state_stream(timeout_ms=250)
         stack.callback(robot.stop_state_stream)
+
+        if tracker_mode == "ik":
+            # Every Cartesian pose in deploy — the policy's observation, the plan
+            # waypoints, and the Cartesian tracker's targets — is the robot's
+            # O_T_EE, i.e. the CONTROLLER's flange-to-TCP frame. CartesianIK
+            # defaults to the URDF's offset instead, which is a different frame
+            # unless the Desk EE config happens to match it, so solving with the
+            # default would put a fixed pose offset on every commanded waypoint.
+            # Recover the controller's offset from one live state the same way
+            # replay's ik_frame_from_episode recovers it from a recording:
+            # flange^-1 * tool.
+            from franky import Affine
+            from franky.kinematics import forward_kinematics
+
+            from clear_franka.ik import CartesianIK
+
+            _ik_state = robot.wait_for_state(timeout=5.0)
+            _ik_q = np.asarray(_ik_state["q"], dtype=np.float64)
+            _ik_O_T_EE = np.asarray(_ik_state["O_T_EE"], dtype=np.float64).reshape(4, 4)
+            _ik_f_t_ee = forward_kinematics(_ik_q).inverse * Affine(_ik_O_T_EE)
+            plan_ik = CartesianIK(
+                f_t_ee=_ik_f_t_ee,
+                joint_limit_margin=float(cfg.deploy.get("ik_joint_limit_margin", 0.02)),
+                position_tolerance=float(cfg.deploy.get("ik_position_tolerance", 1e-3)),
+                rotation_tolerance=float(cfg.deploy.get("ik_rotation_tolerance", 1e-2)),
+            )
+            logger.info(
+                "IK execution: f_t_ee from live state (translation=%s), "
+                "max_distance=%.3frad tolerances=%.1fmm/%.2fdeg "
+                "max_consecutive_failures=%d",
+                np.array2string(np.asarray(_ik_f_t_ee.matrix)[:3, 3], precision=4),
+                ik_max_distance,
+                float(cfg.deploy.get("ik_position_tolerance", 1e-3)) * 1000.0,
+                np.degrees(float(cfg.deploy.get("ik_rotation_tolerance", 1e-2))),
+                ik_max_consecutive_failures,
+            )
+            # Sanity: FK of the measured q in this frame must land on the measured
+            # pose. If it doesn't, the frame is wrong and every solve would be off.
+            _ik_check = np.linalg.norm(plan_ik.forward(_ik_q)[:3, 3] - _ik_O_T_EE[:3, 3])
+            if _ik_check > 1e-3:
+                raise RuntimeError(
+                    f"IK tool frame disagrees with the measured pose by "
+                    f"{_ik_check * 1000:.2f} mm — refusing to run deploy.tracker=ik "
+                    f"with a frame that would offset every commanded waypoint."
+                )
         # Set True once the kill-key save/discard prompt has finalized the
         # recording, so the ExitStack callbacks below don't re-save (or recreate
         # a just-discarded) trace. Normal exits (Ctrl-C / completion) leave this
@@ -1289,15 +1462,14 @@ def main(cfg: DictConfig) -> int:
         _recording_finalized = {"done": False}
         _trace_path = None
         if recorder is not None:
-            # __exit__ calls close()→stop()→_save_episode, so the h5 is written
+            # __exit__ calls close()→stop(), so the episode MCAP is written
             # on any exit path (Ctrl-C, completion, fault).
             stack.enter_context(recorder)
             recorder.start()
-            logger.info("Recording trajectory to %s/episode_%s.h5",
-                        cfg.data_dir, recorder._start_wall)
+            logger.info("Recording trajectory to %s", recorder.episode_path)
             if deploy_trace is not None:
                 deploy_trace.start()
-                _trace_path = Path(cfg.data_dir) / f"episode_{recorder._start_wall}_deploy.h5"
+                _trace_path = Path(cfg.data_dir) / f"{recorder.episode_base}_deploy.h5"
 
                 def _save_trace_on_exit():
                     if _recording_finalized["done"]:
@@ -1347,18 +1519,35 @@ def main(cfg: DictConfig) -> int:
         kill_event = threading.Event()
 
         def _keyboard_listener():
-            try:
-                for line in sys.stdin:
-                    if stop_event.is_set():
-                        break
+            # Polled rather than `for line in sys.stdin`, which blocks
+            # indefinitely: it only noticed stop_event after a line arrived, and
+            # it held a blocking read on the terminal the whole time — the read
+            # that gets the process stopped by SIGTTIN when backgrounded.
+            while not stop_event.is_set():
+                if not _stdin_is_foreground():
+                    time.sleep(0.25)
+                    continue
+                try:
+                    ready, _, _ = select.select([sys.stdin], [], [], 0.25)
+                    if not ready:
+                        continue
+                    line = sys.stdin.readline()
+                    if not line:
+                        return                      # EOF: stdin closed
                     if line.strip().lower() in ("k", "q", ""):
                         kill_event.set()
-                        break
-            except Exception:
-                pass
+                        return
+                except (OSError, ValueError):
+                    # EIO from a background read, or stdin closed under us.
+                    time.sleep(0.25)
+                except Exception:
+                    return
 
         if recorder is not None:
-            threading.Thread(target=_keyboard_listener, daemon=True).start()
+            _ignore_terminal_stop_signals()
+            threading.Thread(
+                target=_keyboard_listener, name="kill-key", daemon=True
+            ).start()
             logger.info("[KILL KEY] press 'k' (or Enter) then return to stop the "
                         "rollout and choose save/discard.")
 
@@ -1374,6 +1563,12 @@ def main(cfg: DictConfig) -> int:
         sample = None
         active_plan: InferencePlan | None = None
         active_cartesian_trajectory = None
+        # tracker: ik only — the joint trajectory solved from
+        # active_cartesian_trajectory at adoption, streamed instead of Cartesian
+        # references. Consecutive adoptions that yield no executable prefix are
+        # counted so a wedged arm cannot churn through plans without moving.
+        active_joint_trajectory = None
+        ik_consecutive_failures = 0
         active_plan_index_offset = 0
         active_index = 0
         active_plan_started_at = 0.0
@@ -1388,8 +1583,13 @@ def main(cfg: DictConfig) -> int:
         catchup_remaining = -1
         catchup_target_pos: np.ndarray | None = None
         catchup_target_rot: np.ndarray | None = None
+        # tracker: ik holds the last commanded joint configuration; the pos/rot
+        # pair above is still what convergence is judged on, since that is what
+        # the next observation depends on.
+        catchup_joint_target: np.ndarray | None = None
         next_tick = time.monotonic()
         last_viz_update = 0.0
+        last_teleop_ik_warn = 0.0
         viz_dt = 1.0 / 5.0
         plan_timeout_s = 3.0
         plan_completion_tolerance_m = 0.015
@@ -1409,31 +1609,16 @@ def main(cfg: DictConfig) -> int:
         )
         catchup_rot_tol_rad = float(cfg.deploy.get("catchup_rot_tol_rad", 0.05))
 
-        # ----- host-side terminal-convergence aids (feat/cartesian-integral-ff) -----
-        # franky's Cartesian impedance has no integrator, so the EE settles to
-        # target - residual/stiffness. We add a host-side integral on the tracking
-        # error (active only during the terminal hold, to avoid winding up against
-        # the velocity lag mid-trajectory) plus velocity feedforward via target_twist.
-        velocity_feedforward = bool(cfg.deploy.get("velocity_feedforward", True))
-        integral_enabled = bool(cfg.deploy.get("integral_enabled", True))
-        integral_gain_pos = float(cfg.deploy.get("integral_gain_pos", 1.5))
-        integral_gain_rot = float(cfg.deploy.get("integral_gain_rot", 1.5))
-        integral_max_pos_m = float(cfg.deploy.get("integral_max_pos_m", 0.04))
-        integral_max_rot_rad = float(cfg.deploy.get("integral_max_rot_rad", 0.12))
-        integral_deadband_pos_m = float(cfg.deploy.get("integral_deadband_pos_m", 0.002))
-        integral_deadband_rot_rad = float(cfg.deploy.get("integral_deadband_rot_rad", 0.01))
-        pos_err_int = np.zeros(3, dtype=np.float64)
-        rot_err_int = np.zeros(3, dtype=np.float64)
-
         # ----- mode transitions (swappable gesture->action mapping layer) -----
         def _enter_inference(prim: int, label: str) -> None:
             nonlocal mode, stage_idx, active_plan, active_cartesian_trajectory
             nonlocal active_plan_index_offset, active_plan_started_at, waiting_for_plan
-            nonlocal grasp_close_pending
-            grasp_close_pending = False   # any manual/auto transition supersedes a pending gate
+            nonlocal active_joint_trajectory, ik_consecutive_failures
             mode = INFERENCE
             active_plan = None
             active_cartesian_trajectory = None
+            active_joint_trajectory = None
+            ik_consecutive_failures = 0
             active_plan_index_offset = 0
             active_plan_started_at = 0.0
             waiting_for_plan = True
@@ -1442,13 +1627,6 @@ def main(cfg: DictConfig) -> int:
                 policy.set_primitive(prim)
                 policy.set_object(0)
                 policy.reset()
-                # policy.reset() only clears the gripper history, so the
-                # steering has to be rewound separately. Without this the basin
-                # latch survives a stage switch: once the EE has arrived, the
-                # position branch stays off forever and re-entering the stage
-                # gets no guidance at all.
-                if steering is not None:
-                    steering.reset()
                 stage_state["idx"] = prim
                 stage_state["epoch"] += 1
             stage_idx = prim          # keep executor adopt guard (plan.stage_idx==stage_idx)
@@ -1459,16 +1637,17 @@ def main(cfg: DictConfig) -> int:
         def _enter_teleop() -> None:
             nonlocal mode, active_plan, active_cartesian_trajectory
             nonlocal active_plan_index_offset, active_plan_started_at, waiting_for_plan
-            nonlocal grasp_close_pending
+            nonlocal active_joint_trajectory, ik_consecutive_failures
             if mode == TELEOP:
                 return
-            grasp_close_pending = False
             mode = TELEOP
             enabled_event.clear()
             request_event.clear()
             stage_state["epoch"] += 1          # orphan any in-flight plan (adopt guard)
             active_plan = None
             active_cartesian_trajectory = None
+            active_joint_trajectory = None
+            ik_consecutive_failures = 0
             active_plan_index_offset = 0
             active_plan_started_at = 0.0
             waiting_for_plan = False
@@ -1496,7 +1675,7 @@ def main(cfg: DictConfig) -> int:
 
         def _record_tick(enabled: bool, buttons: int = 0) -> None:
             """Log one measured timestep. Mirrors replay.py / teleop.py so the
-            resulting episode_*.h5 is byte-format compatible with mode=replay.
+            resulting *.mcap is byte-format compatible with mode=replay.
             `gripper_open` is the last commanded state (stage_state)."""
             if recorder is None:
                 return
@@ -1519,21 +1698,19 @@ def main(cfg: DictConfig) -> int:
 
         def finalize_recording(save: bool) -> None:
             """Stop + save the recording, then keep or delete it. Called from the
-            kill-key handler. Collects every artifact (robot h5, both camera
-            videos, deploy trace); on discard, unlinks them. Idempotent."""
+            kill-key handler. Collects every artifact (episode MCAP, each camera
+            video, deploy trace); on discard, unlinks them. Idempotent."""
             if _recording_finalized["done"]:
                 return
             _recording_finalized["done"] = True
             enabled_event.clear()
             paths: list[Path] = []
             if recorder is not None:
-                recorder.stop()  # writes robot h5 + closes both camera videos
+                recorder.stop()  # writes episode MCAP + closes camera videos
                 if recorder.last_saved_path is not None:
-                    paths.append(Path(recorder.last_saved_path))
-                    base = recorder._episode_base
-                    ext = "svo2" if recorder._record_svo else "hdf5"
-                    for cam in ("hand", "third_person"):
-                        paths.append(Path(cfg.data_dir) / f"{base}_{cam}_video.{ext}")
+                    # artifact_paths() covers the episode MCAP plus one sidecar
+                    # per camera actually attached, with the right extension.
+                    paths.extend(recorder.artifact_paths())
             if deploy_trace is not None and _trace_path is not None:
                 n = deploy_trace.save(_trace_path)
                 logger.info("Saved deploy trace (%d plans) to %s", n, _trace_path)
@@ -1551,13 +1728,6 @@ def main(cfg: DictConfig) -> int:
                     except OSError as e:
                         logger.warning("Could not delete %s: %s", p, e)
                 logger.info("[ROLLOUT] DISCARDED %d file(s)", deleted)
-
-        if bool(cfg.deploy.get("auto_start_inference", False)):
-            logger.info(
-                "auto_start_inference=True — skipping TELEOP wait, entering "
-                "INFERENCE (grasp) now"
-            )
-            _enter_inference(0, "grasp")
 
         while not stop_event.is_set():
             rate.start_tick()
@@ -1649,40 +1819,6 @@ def main(cfg: DictConfig) -> int:
                     prev_right = right
                     prev_chord = chord
 
-            # ---------- grasp->place gate ----------
-            # Poll for gripper-closure confirmation (Robotiq object_detection) and
-            # auto-advance once it arrives, or after a timeout so a hardware hiccup
-            # can't stall the rollout. Runs before the active-plan block below so a
-            # transition here can safely null out active_plan for this tick (same
-            # timing as the RIGHT-tap handler above). RIGHT tap still works as a
-            # manual override — it clears grasp_close_pending in _enter_inference
-            # so this can't double-fire afterward.
-            if grasp_close_pending and gripper is not None:
-                now_ = time.monotonic()
-                if now_ - last_grasp_gate_poll >= grasp_gate_poll_dt:
-                    last_grasp_gate_poll = now_
-                    try:
-                        obj = gripper.object_detection(refresh_status=True)
-                    except Exception as e:
-                        logger.warning(f"[grasp-gate] object_detection() failed: {e}")
-                        obj = None
-                    if obj in (2, 3):
-                        logger.info(
-                            f"[grasp-gate] gripper closed (object_detection={obj}"
-                            f"{' — object detected' if obj == 2 else ' — no contact, missed grasp'});"
-                            " auto-advancing to place"
-                        )
-                        grasp_close_pending = False
-                        _enter_inference(1, "place")
-                    elif now_ - grasp_close_commanded_at > grasp_gate_timeout_s:
-                        logger.warning(
-                            f"[grasp-gate] timed out after {grasp_gate_timeout_s}s waiting "
-                            f"for closure confirmation (last object_detection={obj}); "
-                            "advancing anyway"
-                        )
-                        grasp_close_pending = False
-                        _enter_inference(1, "place")
-
             now = time.monotonic()
             if now - last_viz_update >= viz_dt:
                 _update_visualizer_robot_state(visualizer, robot.latest_state)
@@ -1701,10 +1837,30 @@ def main(cfg: DictConfig) -> int:
                     if teleop_workspace_clip:
                         target_pos = np.clip(target_pos, workspace_lo_np, workspace_hi_np)
                     try:
-                        tracker.set_target(
-                            Affine(pack_Rp(target_rot, target_pos)),
-                            Twist(v_world, w_world),
-                        )
+                        if tracker_mode == "ik":
+                            # Single-pose solve seeded from the measured q (~0.02 ms).
+                            # An unreachable jog is simply not commanded, so the arm
+                            # holds its last target instead of lurching to a
+                            # nearest-branch configuration.
+                            solution = plan_ik.solve(
+                                pack_Rp(target_rot, target_pos),
+                                np.asarray(state["q"], dtype=np.float64),
+                            )
+                            if solution.reached:
+                                tracker.set_target(solution.joint_pos)
+                            elif now - last_teleop_ik_warn >= 1.0:
+                                logger.warning(
+                                    "[teleop] IK cannot reach the jogged pose "
+                                    "(%.1fmm/%.1fdeg off); holding",
+                                    solution.position_error * 1000.0,
+                                    np.degrees(solution.rotation_error),
+                                )
+                                last_teleop_ik_warn = now
+                        else:
+                            tracker.set_target(
+                                Affine(pack_Rp(target_rot, target_pos)),
+                                Twist(v_world, w_world),
+                            )
                     except Exception as exc:
                         logger.warning(f"[teleop] set_target failed: {exc}")
                 _record_tick(enabled=False)
@@ -1749,11 +1905,6 @@ def main(cfg: DictConfig) -> int:
                     else:
                         active_plan = plan
                         waiting_for_plan = False
-                        # Fresh integral state per plan — the steady-state offset
-                        # is configuration-dependent, so carrying it across plans
-                        # would inject a stale correction at the next endpoint.
-                        pos_err_int = np.zeros(3, dtype=np.float64)
-                        rot_err_int = np.zeros(3, dtype=np.float64)
                         adopted_at = time.monotonic()
                         active_index = _plan_start_index(
                             plan,
@@ -1780,6 +1931,61 @@ def main(cfg: DictConfig) -> int:
                             current_ee_pos=ee_pos,
                             current_ee_euler=ee_euler,
                         )
+                        # tracker: ik — solve the plan's Cartesian path into joint
+                        # waypoints now, while it is fully known. A partial solve
+                        # is executed as far as it goes and replanned from there;
+                        # only a solve with nothing executable drops the plan.
+                        if tracker_mode == "ik":
+                            active_joint_trajectory, ik_reason = _make_joint_trajectory_for_plan(
+                                active_cartesian_trajectory,
+                                ik=plan_ik,
+                                q_seed=np.asarray(state["q"], dtype=np.float64),
+                                dt=execution_dt,
+                                workspace_lo=workspace_lo_np,
+                                workspace_hi=workspace_hi_np,
+                                max_distance=ik_max_distance,
+                            )
+                            if active_joint_trajectory is None:
+                                ik_consecutive_failures += 1
+                                logger.warning(
+                                    "  plan %d: IK produced no executable prefix "
+                                    "(%d/%d in a row) — %s",
+                                    plan.sequence,
+                                    ik_consecutive_failures,
+                                    ik_max_consecutive_failures,
+                                    ik_reason,
+                                )
+                                # Same response as a hard skip: hold nothing, keep
+                                # the arm where it is, ask for another plan. Leaving
+                                # active_plan None makes the catchup and execute
+                                # branches below no-ops for this tick.
+                                active_plan = None
+                                active_cartesian_trajectory = None
+                                active_plan_index_offset = 0
+                                waiting_for_plan = True
+                                visualizer.clear_plan_waypoints()
+                                if ik_consecutive_failures >= ik_max_consecutive_failures:
+                                    logger.error(
+                                        "  IK failed on %d consecutive plans — the arm "
+                                        "cannot follow from this configuration. Holding "
+                                        "pose and handing off to the operator.",
+                                        ik_consecutive_failures,
+                                    )
+                                    kill_event.set()
+                                else:
+                                    request_event.set()
+                            else:
+                                ik_consecutive_failures = 0
+                                if ik_reason is not None:
+                                    logger.info(
+                                        "  plan %d: executing IK prefix (%.2fs of %.2fs) — %s",
+                                        plan.sequence,
+                                        float(active_joint_trajectory.waypts_time[-1]),
+                                        float(active_cartesian_trajectory.duration),
+                                        ik_reason,
+                                    )
+
+                    if active_plan is not None:
                         active_plan_started_at = adopted_at
                         visualizer.update_plan_waypoints(plan.trajectory, active_index)
                         visualizer.update_interpolated_plan_path(
@@ -1813,9 +2019,16 @@ def main(cfg: DictConfig) -> int:
                 if state is None:
                     state = rate.time_call("state_wait", robot.wait_for_state, 1.0)
                 ee_pos, _ee_rot, _O_T_EE = _read_ee_pose_from_state(state)
-                tracker.set_target(
-                    Affine(pack_Rp(catchup_target_rot, catchup_target_pos))
-                )
+                if tracker_mode == "ik":
+                    # Freeze the joint configuration; convergence is still judged
+                    # on the EE pose below, since that is what the next
+                    # observation depends on.
+                    if catchup_joint_target is not None:
+                        tracker.set_target(catchup_joint_target)
+                else:
+                    tracker.set_cartesian_reference(
+                        Affine(pack_Rp(catchup_target_rot, catchup_target_pos))
+                    )
                 if deploy_trace is not None:
                     deploy_trace.record_error(
                         t=time.monotonic(),
@@ -1845,6 +2058,7 @@ def main(cfg: DictConfig) -> int:
                     visualizer.clear_plan_waypoints()
                     active_plan = None
                     active_cartesian_trajectory = None
+                    active_joint_trajectory = None
                     active_plan_index_offset = 0
                     active_plan_started_at = 0.0
                     request_event.set()
@@ -1859,22 +2073,23 @@ def main(cfg: DictConfig) -> int:
                 assert active_cartesian_trajectory is not None
 
                 elapsed = time.monotonic() - active_plan_started_at
+                # tracker: ik may hold only a PREFIX of the plan (a partial solve),
+                # so the plan is done when the joint trajectory runs out, not when
+                # the Cartesian one would. Clamping elapsed keeps the commanded
+                # target, the trace and the catchup hold all consistent with the
+                # last pose actually reachable.
+                ik_prefix_done = False
+                if tracker_mode == "ik":
+                    assert active_joint_trajectory is not None
+                    ik_joint_end = float(active_joint_trajectory.waypts_time[-1])
+                    ik_prefix_done = elapsed >= ik_joint_end
+                    elapsed = min(elapsed, ik_joint_end)
                 local_index = active_cartesian_trajectory.waypoint_index_at(elapsed)
                 active_index = min(
                     active_plan_index_offset + local_index,
                     len(active_plan.trajectory) - 1,
                 )
                 target_xyz, target_rot = active_cartesian_trajectory.interpolate(elapsed)
-                # Past the trajectory duration the reference pose is clamped at the
-                # final waypoint, so the feedforward velocity must be zero. (velocity()
-                # returns the last segment's nonzero slope for a degree-1 spline, which
-                # would otherwise drive the EE past the endpoint during the hold.)
-                at_terminal_hold = elapsed >= active_cartesian_trajectory.duration
-                if at_terminal_hold:
-                    ref_lin_vel = np.zeros(3, dtype=np.float64)
-                    ref_ang_vel = np.zeros(3, dtype=np.float64)
-                else:
-                    ref_lin_vel, ref_ang_vel = active_cartesian_trajectory.velocity(elapsed)
                 visualizer.update_plan_waypoints(active_plan.trajectory, active_index)
 
                 # Optional safety clip — keep targets inside the recorded workspace.
@@ -1882,50 +2097,14 @@ def main(cfg: DictConfig) -> int:
                 hi = np.array(cfg.deploy.workspace_hi, dtype=np.float64)
                 target_xyz = np.clip(target_xyz, lo, hi)
 
-                # ----- host-side integral term on the Cartesian tracking error -----
-                # The impedance controller is a pure proportional spring, so the EE
-                # settles to target - residual/stiffness and never reaches the final
-                # waypoint. Accumulate the (planned target - measured) error during
-                # the *terminal hold* (elapsed >= duration; the reference is clamped
-                # at the final waypoint) and ramp the commanded setpoint along it
-                # until the residual is cancelled. Gating on the terminal hold avoids
-                # winding up against the deliberate velocity lag during transit.
-                # target_xyz / target_rot are left untouched so the tracking-error
-                # readout below still reports the true plan-tracking error.
-                pos_err = target_xyz - ee_pos
-                rot_err_vec = Rotation.from_matrix(target_rot @ _ee_rot.T).as_rotvec()
-                if integral_enabled and at_terminal_hold:
-                    if np.linalg.norm(pos_err) > integral_deadband_pos_m:
-                        pos_err_int = pos_err_int + pos_err * execution_dt
-                        if integral_gain_pos > 0.0:
-                            lim = integral_max_pos_m / integral_gain_pos
-                            pos_err_int = np.clip(pos_err_int, -lim, lim)
-                    if np.linalg.norm(rot_err_vec) > integral_deadband_rot_rad:
-                        rot_err_int = rot_err_int + rot_err_vec * execution_dt
-                        if integral_gain_rot > 0.0:
-                            lim = integral_max_rot_rad / integral_gain_rot
-                            rot_err_int = np.clip(rot_err_int, -lim, lim)
-                pos_corr = integral_gain_pos * pos_err_int
-                rot_corr = integral_gain_rot * rot_err_int
-                cmd_xyz = np.clip(target_xyz + pos_corr, lo, hi)
-                cmd_rot = Rotation.from_rotvec(rot_corr).as_matrix() @ target_rot
-
-                if velocity_feedforward:
+                if tracker_mode == "ik":
+                    # The joint waypoints were solved from the clipped Cartesian
+                    # samples, so this commands the same pose target_xyz reports.
                     tracker.set_target(
-                        Affine(pack_Rp(cmd_rot, cmd_xyz)),
-                        Twist(ref_lin_vel, ref_ang_vel),
+                        active_joint_trajectory.interpolate(elapsed).reshape(7)
                     )
                 else:
-                    tracker.set_target(Affine(pack_Rp(cmd_rot, cmd_xyz)))
-
-                # Live Cartesian tracking error: commanded reference (the
-                # clipped target actually sent to the impedance controller)
-                # vs. measured EE pose. Same quantities the deploy trace logs.
-                pos_err_vec = target_xyz - ee_pos
-                R_err = target_rot @ _ee_rot.T
-                cos_angle = (np.trace(R_err) - 1.0) / 2.0
-                rot_err_rad = float(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
-                visualizer.update_tracking_error(pos_err_vec, rot_err_rad)
+                    tracker.set_target(Affine(pack_Rp(target_rot, target_xyz)))
 
                 if deploy_trace is not None:
                     deploy_trace.record_error(
@@ -1950,11 +2129,6 @@ def main(cfg: DictConfig) -> int:
                         gripper.move_width(width, wait=False)
                         visualizer.update_gripper_width(width, max_width_m=cfg.gripper.max_width_m)
                         stage_state["gripper_cmd"] = cmd_state
-                        if (gate_place_on_grasp and cmd_state == 0.0
-                                and active_plan.stage_idx == 0):
-                            grasp_close_pending = True
-                            grasp_close_commanded_at = time.monotonic()
-                            last_grasp_gate_poll = 0.0
 
                 final_dist = float(np.linalg.norm(
                     active_plan.trajectory[-1, :3] - ee_pos
@@ -1974,10 +2148,21 @@ def main(cfg: DictConfig) -> int:
                 # trajectory's scheduled duration (well before active_plan_timeout_s),
                 # so in normal operation we always finish via the streamed-to-end
                 # path; the timeout is the safety net for a stalled loop.
-                if streamed_to_end or timed_out:
+                if streamed_to_end or timed_out or ik_prefix_done:
                     catchup_target_pos = np.asarray(target_xyz, dtype=np.float64).copy()
                     catchup_target_rot = np.asarray(target_rot, dtype=np.float64).copy()
+                    if tracker_mode == "ik":
+                        catchup_joint_target = np.asarray(
+                            active_joint_trajectory.interpolate(elapsed), dtype=np.float64
+                        ).reshape(7)
                     catchup_remaining = plan_catchup_ticks
+                    if ik_prefix_done and not streamed_to_end:
+                        logger.info(
+                            "  plan %d: IK prefix exhausted at idx=%d/%d; "
+                            "catchup hold %d ticks then replan",
+                            active_plan.sequence, active_index,
+                            len(active_plan.trajectory), plan_catchup_ticks,
+                        )
                     if streamed_to_end:
                         logger.info(
                             "  plan %d streamed to end at idx=%d/%d (err=%.1fmm); "

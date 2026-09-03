@@ -3,12 +3,28 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager
+from pathlib import Path
 
 import numpy as np
 
 
 LOOP_RATE_WINDOW_S = 5.0
 LOOP_RATE_PRINT_PERIOD_S = 0.25
+
+# clear_franka/ sits directly under the project root.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def resolve_project_path(path: str | Path) -> Path:
+    """Resolve a config-supplied path against the project root if relative.
+
+    Hydra chdirs into a per-run output directory before scripts run, so a
+    bare relative path (e.g. ``data/extrinsics_hand.json``) would otherwise
+    resolve against that run directory instead of the repo root the config
+    author intended.
+    """
+    path = Path(path).expanduser()
+    return path if path.is_absolute() else PROJECT_ROOT / path
 
 
 def prompt_yes_no(prompt: str, default: bool = False) -> bool:

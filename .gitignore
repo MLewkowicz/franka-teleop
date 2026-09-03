@@ -5,6 +5,8 @@ __pycache__/
 *.swp
 *.pyc
 *.h5
+*.log
+clear_franka/proto/*_pb2.py
 scripts/print_joints.py
 scripts/test_gripper.py
 tracker_error_debug.py

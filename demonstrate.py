@@ -190,10 +190,10 @@ def run_demonstrate(cfg: DictConfig):
     extrinsics_metadata = _metadata_for_cameras(cameras, cfg, vc)
 
     recorder_cfg = cfg.get("recorder", {})
-    # mode_title (resolved above) drives the episode filename: {mode_title}_{N}.h5
+    # mode_title (resolved above) drives the episode filename: {mode_title}_{N}.mcap
     # where N is the next free index in data_dir. Timestamped names when unset.
     if mode_title:
-        print(f"  [recorder] Demo mode title: '{mode_title}' -> {mode_title}_<N>.h5")
+        print(f"  [recorder] Demo mode title: '{mode_title}' -> {mode_title}_<N>.mcap")
     else:
         print("  [recorder] No demonstrate.mode_title set; using timestamped episode names.")
     recorder = TrajectoryRecorder(
@@ -214,7 +214,7 @@ def run_demonstrate(cfg: DictConfig):
             **extrinsics_metadata,
         },
         cameras=cameras if record_cameras else {},
-        record_svo=bool(recorder_cfg.get("record_svo", False)),
+        camera_format=str(recorder_cfg.get("camera_format", "svo")),
         svo_compression=str(recorder_cfg.get("svo_compression", "H264")),
     )
 
