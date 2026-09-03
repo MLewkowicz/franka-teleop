@@ -234,6 +234,7 @@ def capture_boxes(args, cfg):
             checkpoint, classes, confidence=confidence, bpe_path=bpe_path
         )
         per_frame = [(segmenter.detect(f.rgb), f.xyz) for f in frames]
+        K = source.intrinsics
     finally:
         source.close()
         if camera is not None:
@@ -255,19 +256,25 @@ def capture_boxes(args, cfg):
     save_scene_cloud(args.cloud_out, *cloud)
 
     if args.viser:
-        _serve_viser(cloud, boxes)
+        _serve_viser(cloud, boxes, rgb=frames[-1].rgb, K=K, T_cam2base=T_cam2base)
     return boxes, cloud
 
 
-def _serve_viser(cloud, boxes) -> None:
-    """Show the scene cloud and the fitted boxes, both in the base frame."""
+def _serve_viser(cloud, boxes, rgb=None, K=None, T_cam2base=None) -> None:
+    """Show the scene cloud and the fitted boxes, both in the base frame.
+
+    When `rgb`/`K`/`T_cam2base` are given, also drop a textured camera
+    frustum at the shot's pose so the RGB frame the boxes were fit from can
+    be checked against the cloud/boxes directly, in place.
+    """
     import viser
+    import viser.transforms as vtf
 
     from clear_franka.perception import aabb_edges
 
-    world, rgb = cloud
+    world, colors = cloud
     server = viser.ViserServer()
-    server.scene.add_point_cloud("/cloud", world, rgb, point_size=0.005)
+    server.scene.add_point_cloud("/cloud", world, colors, point_size=0.005)
     for i, b in enumerate(boxes):
         lo, hi = b.aabb
         server.scene.add_line_segments(
@@ -275,6 +282,20 @@ def _serve_viser(cloud, boxes) -> None:
         )
         server.scene.add_label(f"/box_{i}_label", b.name,
                                position=(lo[0], lo[1], hi[2]))
+
+    if rgb is not None and K is not None and T_cam2base is not None:
+        h, w = rgb.shape[:2]
+        fov_y = 2.0 * np.arctan2(h / 2.0, K[1, 1])
+        server.scene.add_camera_frustum(
+            "/camera",
+            fov=fov_y,
+            aspect=w / h,
+            image=rgb,
+            wxyz=vtf.SO3.from_matrix(T_cam2base[:3, :3]).wxyz,
+            position=T_cam2base[:3, 3],
+            scale=0.15,
+        )
+
     input("viser serving the scene in the base frame — press Enter to continue... ")
 
 

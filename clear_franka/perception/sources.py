@@ -95,6 +95,18 @@ class SvoSource:
         self._cloud = sl.Mat()
         self._loop = loop
 
+    @property
+    def intrinsics(self) -> np.ndarray:
+        """LEFT camera K, same convention as `ZedCamera.get_intrinsics`."""
+        cal = self.cam.get_camera_information().camera_configuration \
+            .calibration_parameters.left_cam
+        return np.array(
+            [[cal.fx, 0.0, cal.cx],
+             [0.0, cal.fy, cal.cy],
+             [0.0, 0.0, 1.0]],
+            dtype=np.float64,
+        )
+
     def frames(self) -> Iterator[Frame]:
         sl = self._sl
         while True:
