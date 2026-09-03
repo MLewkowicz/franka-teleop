@@ -210,8 +210,13 @@ def preprocess_episode_arrays(
     # (tens to hundreds of waypoints). Running it on Ruckig's dense 1 kHz
     # output (~17k samples) makes its reachability solver fail.
     current = trimmed_traj
+    # (path parameter s of each sparse waypoint, its source time in the trimmed
+    #  timeline) and (retimed sample times, their path parameter). Together they
+    #  invert "retimed time -> where on the path -> when that was demonstrated".
+    sparse_path_param: np.ndarray | None = None
     sparse_source_times: np.ndarray | None = None
-    sparse_toppra_times: np.ndarray | None = None
+    retimed_times: np.ndarray | None = None
+    retimed_path_param: np.ndarray | None = None
     if retime_enabled:
         if retime_max_joint_vel is None and smooth_max_joint_vel is None:
             raise ValueError("retime_enabled=True requires retime_max_joint_vel or smooth_max_joint_vel")
@@ -234,18 +239,20 @@ def preprocess_episode_arrays(
         else:
             sparse = trimmed_traj
 
-        # Capture source times before TOPPRA retimes.
-        # sparse_source_times[i] ↔ sparse_toppra_times[i]: same path index.
+        # Source times (in the trimmed timeline) of the waypoints TOPPRA is about
+        # to retime, keyed by the same normalised path parameter TOPPRA uses.
         sparse_source_times = np.asarray(sparse.waypts_time, dtype=np.float64)
+        sparse_path_param = np.linspace(0.0, 1.0, sparse.num_waypts)
 
-        current = sparse.retime(
+        current, retimed_path_param = sparse.retime(
             max_vel=max_vel,
             max_accel=max_accel,
             sample_uniform=bool(retime_sample_uniform),
+            return_path_param=True,
         )
 
         # Capture retimed timestamps before Ruckig overwrites current.waypts_time.
-        sparse_toppra_times = np.asarray(current.waypts_time, dtype=np.float64)
+        retimed_times = np.asarray(current.waypts_time, dtype=np.float64)
 
     # Capture the retimed (pre-smooth) joints for the EE-stage overlay.
     retimed_joint_for_viz = (
@@ -278,8 +285,22 @@ def preprocess_episode_arrays(
         return None
 
     target_times = times_out
-    if sparse_source_times is not None and sparse_toppra_times is not None:
-        target_times = np.interp(times_out, sparse_toppra_times, sparse_source_times)
+    if retimed_times is not None:
+        # Map each dense output time to its source time in the trimmed trajectory,
+        # via the path parameter: output time → s (TOPPRA's own parameterization)
+        # → demonstrated time (the sparse waypoints, whose source times are exact
+        # members of times_trim). Both legs are monotone, so np.interp composes
+        # them exactly, with no nearest-neighbour joint matching.
+        #
+        # Going via s is what makes this correct. Pairing the two time arrays by
+        # array index instead assumes the traversal covers one waypoint per equal
+        # slice of time; TOPPRA does the opposite, racing through the long sparse
+        # transit segments and crawling through the densely sampled detail around
+        # grasp and release. That skew put gripper events ~1.5-3.5s of demo time
+        # late, so the arm had already lifted away before the gripper was told to
+        # open.
+        s_of_t = np.interp(times_out, retimed_times, retimed_path_param)
+        target_times = np.interp(s_of_t, sparse_path_param, sparse_source_times)
         target_times = np.clip(target_times, times_trim[0], times_trim[-1])
 
     # Velocity-bound assertion (post-smooth). Allow 5% slack for numerical diff.
@@ -317,31 +338,44 @@ def preprocess_episode_arrays(
     # The time-based source-time map places each gripper event at the output
     # time corresponding to the source time — but Ruckig lags the TOPPRA
     # reference, so the arm may not yet have arrived at the target position
-    # when that time index is reached. Scan forward from each event to the
-    # frame where the arm is closest to the source joint position, and push
-    # the gripper transition there.
+    # when that time index is reached. Scan (both directions, bounded by the
+    # neighbouring transitions) from each event to the frame where the arm is
+    # closest to the source joint position, and push the gripper transition
+    # there.
     if "gripper_open" in resampled:
         gripper_arr = resampled["gripper_open"].copy()
         changes = np.where(gripper_arr[1:] != gripper_arr[:-1])[0] + 1
         if len(changes) > 0:
             max_scan = int(1.5 / float(smooth_dt))
+            n_out = len(joint_pos_out)
+            changes_list = sorted(changes.tolist())
             modified = False
-            for idx in sorted(changes.tolist()):
+            for k, idx in enumerate(changes_list):
                 t_src = float(np.clip(target_times[idx], times_trim[0], times_trim[-1]))
                 q_tgt = np.array([
                     float(np.interp(t_src, times_trim, joint_pos_trim[:, j]))
                     for j in range(joint_pos_trim.shape[1])
                 ])
-                end = min(idx + max_scan, len(joint_pos_out))
-                dists = np.linalg.norm(joint_pos_out[idx:end] - q_tgt, axis=1)
-                settle = idx + int(np.argmin(dists))
-                if settle > idx:
-                    pre_val = gripper_arr[idx - 1] if idx > 0 else gripper_arr[0]
-                    gripper_arr[idx:settle] = pre_val
+                # Never scan across a neighbouring transition: the window each
+                # event may move within stays disjoint from its neighbours', so
+                # relocating one can't overwrite another.
+                prev_idx = changes_list[k - 1] if k > 0 else 0
+                next_idx = changes_list[k + 1] if k + 1 < len(changes_list) else n_out
+                start = max(idx - max_scan, prev_idx)
+                end = min(idx + max_scan, next_idx)
+                dists = np.linalg.norm(joint_pos_out[start:end] - q_tgt, axis=1)
+                settle = start + int(np.argmin(dists))
+                if settle != idx:
+                    if settle > idx:
+                        # Late arrival: hold the pre-change state until settle.
+                        gripper_arr[idx:settle] = gripper_arr[idx - 1] if idx > 0 else gripper_arr[0]
+                    else:
+                        # Early: bring the post-change state forward to settle.
+                        gripper_arr[settle:idx] = gripper_arr[idx]
                     logger.info(
                         "preprocess: gripper event snapped idx %d → %d (%.3fs → %.3fs, dist=%.4f rad)",
-                        idx, settle, times_out[idx], times_out[min(settle, len(times_out)-1)],
-                        float(dists[settle - idx]),
+                        idx, settle, times_out[idx], times_out[min(settle, len(times_out) - 1)],
+                        float(dists[settle - start]),
                     )
                     modified = True
             if modified:

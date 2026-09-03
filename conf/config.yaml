@@ -139,7 +139,7 @@ recorder:
   svo_compression: H265_LOSSLESS       # H264 | H265 | LOSSLESS | H264_LOSSLESS | H265_LOSSLESS
 
 replay:
-  tracker: cartesian                                # joint, cartesian, or ik
+  tracker: ik                                # joint, cartesian, or ik
   ik_joint_limit_margin: 0.02      # tracker: ik — inset from each joint limit (rad) before it's considered reachable
   ik_max_distance: 0.2             # tracker: ik — max per-step joint motion (rad) before the solve is rejected
   ik_position_tolerance: 0.001     # tracker: ik — max position residual (m) accepted as "reached"
@@ -156,7 +156,7 @@ replay:
   speed: 0.25
   period: 0.001
   # Joint impedance gains. Stiffer = better tracking, less compliance.
-  joint_stiffness: [320.0, 320.0, 320.0, 320.0, 320.0, 320.0, 30.0] # [320.0, 320.0, 320.0, 320.0, 120.0, 120.0, 30.0]
+  joint_stiffness: [320.0, 320.0, 320.0, 320.0, 120.0, 120.0, 30.0]
   translational_stiffness: 1000.0                # Cartesian tracker translation stiffness.
   rotational_stiffness: 20.0                    # Cartesian tracker rotation stiffness.
   nullspace_stiffness: 5.0                      # Cartesian tracker posture-task stiffness.
@@ -244,7 +244,7 @@ deploy:
   joint_limit_buffer_rad: 0.05            # pad lower/upper limits inward by this
 
   steering:
-    enabled: true                  # flip to true (or override on CLI) to steer
+    enabled: false                  # flip to true (or override on CLI) to steer
     # When True, reaching the basin / final position stage turns off ALL steering
     # (rotation too), not just position — so the policy fully takes over there.
     latch_disables_rotation: true
