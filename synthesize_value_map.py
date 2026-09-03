@@ -54,10 +54,14 @@ from clear_franka.perception import (  # noqa: E402
     collect_frames,
     detections_to_scene_boxes,
     frame_to_world_cloud,
+    label_scene_image,
     load_scene_boxes,
     load_scene_cloud,
+    load_scene_image,
+    match_boxes_to_frame_detections,
     save_scene_boxes,
     save_scene_cloud,
+    save_scene_image,
 )
 from clear_franka.value_map_llm import (  # noqa: E402
     save_stages,
@@ -118,6 +122,9 @@ def _parse_args() -> argparse.Namespace:
     src.add_argument("--cloud-out", default="data/scene_cloud.npz",
                      help="decimated scene cloud, overlaid on the value-map "
                           "plots and reused by --source boxes")
+    src.add_argument("--image-out", default="data/scene_image.png",
+                     help="workspace snapshot handed to the planner LLM, "
+                          "cached for --source boxes reruns")
     src.add_argument("--cloud-points", type=int, default=40000,
                      help="max cloud points kept (Plotly renders one colour "
                           "string per point)")
@@ -185,9 +192,9 @@ def _xyz(text: str | None) -> np.ndarray | None:
 def capture_boxes(args, cfg):
     """Segment the requested objects, fit world-frame boxes, keep the cloud.
 
-    Returns (boxes, (points, colors)) — the cloud comes from the same frame the
-    boxes were fitted from, so a box that looks wrong in the plot is wrong
-    against the very data that produced it.
+    Returns (boxes, (points, colors), rgb) — the cloud and the snapshot both
+    come from the same frame the boxes were fitted from, so a box that looks
+    wrong in the plot is wrong against the very data that produced it.
     """
     classes = [c.strip() for c in args.objects.split(",") if c.strip()]
     if not classes:
@@ -255,9 +262,19 @@ def capture_boxes(args, cfg):
     )
     save_scene_cloud(args.cloud_out, *cloud)
 
+    # Label the last frame with each box's own SAM footprint (not a reprojected
+    # 3D box) so the planner can tell which physical object in the photo is
+    # 'bowl' vs 'bowl_2' -- the box table's world-frame numbers alone give it
+    # no way to make that correspondence.
+    matches = match_boxes_to_frame_detections(
+        boxes, per_frame[-1][0], args.max_per_label
+    )
+    labeled_image = label_scene_image(frames[-1].rgb, matches)
+    save_scene_image(args.image_out, labeled_image)
+
     if args.viser:
         _serve_viser(cloud, boxes, rgb=frames[-1].rgb, K=K, T_cam2base=T_cam2base)
-    return boxes, cloud
+    return boxes, cloud, labeled_image
 
 
 def _serve_viser(cloud, boxes, rgb=None, K=None, T_cam2base=None) -> None:
@@ -339,8 +356,12 @@ def main() -> int:
         if cloud is None:
             logger.info("no cached cloud at %s — plots will show boxes only",
                         args.cloud_out)
+        workspace_image = load_scene_image(args.image_out)
+        if workspace_image is None:
+            logger.info("no cached snapshot at %s — planner runs text-only",
+                        args.image_out)
     else:
-        boxes, cloud = capture_boxes(args, cfg)
+        boxes, cloud, workspace_image = capture_boxes(args, cfg)
         boxes_path = args.boxes_out
 
     if args.skip_llm:
@@ -362,6 +383,7 @@ def main() -> int:
         map_size=args.map_size,
         avoidance_weight=args.avoidance_weight,
         obstacle_sigma=args.obstacle_sigma,
+        workspace_image=workspace_image,
         llm=llm,
     )
 

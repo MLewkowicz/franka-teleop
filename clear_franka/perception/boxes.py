@@ -207,6 +207,85 @@ def load_scene_cloud(path: str | Path):
     return data["points"], data["colors"]
 
 
+def match_boxes_to_frame_detections(
+    boxes: list[SceneBox],
+    detections: list[Detection],
+    max_per_label: int,
+) -> dict[str, Detection]:
+    """Pair each fused SceneBox with the 2D detection (mask) it came from in
+    one particular frame, so that frame's photo can be labeled with the exact
+    SAM footprint instead of a reprojected 3D box.
+
+    Boxes and this frame's detections are both grouped by label and matched in
+    score-rank order -- the same order `detections_to_scene_boxes` used to
+    name them ('label', 'label_2', ...). This only misidentifies a box when
+    two same-label instances swap score rank in this one frame relative to
+    the fused ranking, which is rare and low-stakes: the label lands on the
+    wrong twin of an otherwise near-identical pair.
+    """
+    by_label_boxes: dict[str, list[SceneBox]] = defaultdict(list)
+    for b in boxes:
+        by_label_boxes[b.label].append(b)
+
+    by_label_dets: dict[str, list[Detection]] = defaultdict(list)
+    for d in detections:
+        by_label_dets[d.label].append(d)
+
+    matches: dict[str, Detection] = {}
+    for label, blist in by_label_boxes.items():
+        dlist = sorted(
+            by_label_dets.get(label, []), key=lambda d: d.score, reverse=True
+        )[:max_per_label]
+        for b, d in zip(blist, dlist):
+            matches[b.name] = d
+    return matches
+
+
+def label_scene_image(rgb: np.ndarray, matches: dict[str, Detection]) -> np.ndarray:
+    """Overlay each box's SAM mask footprint + NAME on the frame it came from.
+
+    The planner sees a box table of world-frame numbers and a photo, with no
+    way to tell which physical object in the photo is 'bowl' vs 'bowl_2' --
+    that correspondence has to be handed to it visually.
+    """
+    from PIL import ImageDraw
+    from PIL import Image as PILImage
+
+    img = PILImage.fromarray(np.ascontiguousarray(rgb))
+    draw = ImageDraw.Draw(img)
+    color = (57, 255, 20)
+    for name, det in matches.items():
+        ys, xs = np.nonzero(det.mask)
+        if len(xs) == 0:
+            continue
+        x0, x1 = int(xs.min()), int(xs.max())
+        y0, y1 = int(ys.min()), int(ys.max())
+        draw.rectangle([x0, y0, x1, y1], outline=color, width=2)
+        draw.text((x0 + 2, max(0, y0 - 14)), name, fill=color)
+    return np.asarray(img)
+
+
+def save_scene_image(path: str | Path, rgb: np.ndarray) -> Path:
+    """Cache the workspace snapshot so `--source boxes` reruns keep vision."""
+    from PIL import Image
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(rgb).save(path)
+    logger.info("wrote workspace snapshot -> %s", path)
+    return path
+
+
+def load_scene_image(path: str | Path) -> np.ndarray | None:
+    """(H, W, 3) uint8 RGB, or None when no snapshot has been captured yet."""
+    from PIL import Image
+
+    path = Path(path)
+    if not path.is_file():
+        return None
+    return np.asarray(Image.open(path).convert("RGB"))
+
+
 def aabb_edges(lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
     """The 12 edges of a box, as (12, 2, 3) line segments (for viser)."""
     corners = np.array(np.meshgrid(*zip(lo, hi), indexing="ij")).reshape(3, -1).T

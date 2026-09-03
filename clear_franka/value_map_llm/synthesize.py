@@ -140,6 +140,7 @@ def synthesize_value_maps(
     avoidance_weight: float = 1.0,
     obstacle_sigma: float = 3.0,
     ee_pos_world: Optional[np.ndarray] = None,
+    workspace_image: Optional[np.ndarray] = None,
     llm: Optional[dict] = None,
 ) -> list[SynthesizedStage]:
     """Run planner -> per-stage affordance/avoidance LMPs -> ValueMaps.
@@ -168,7 +169,7 @@ def synthesize_value_maps(
     logger.info("scene handed to the planner:\n%s", scene_block)
 
     backend = LLMBackend(**(llm or {}))
-    plan = PlannerLMP(backend, scene_block)(task)
+    plan = PlannerLMP(backend, scene_block, image=workspace_image)(task)
     logger.info("planner returned %d stage(s) for '%s'", len(plan), task)
 
     affordance_lmp = MapLMP("get_affordance_map", backend, interface, scene_block)

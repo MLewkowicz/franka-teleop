@@ -83,7 +83,7 @@ perception:
   # only exists in a source checkout — so point at our own copy of the standard
   # CLIP BPE vocab. Without this, model construction dies before loading weights.
   bpe_path: "/home/clear/franka-teleop/checkpoints/bpe_simple_vocab_16e6.txt.gz"
-  confidence: 0.1             # minimum detection score
+  confidence: 0.5             # minimum detection score
   depth_mode: NEURAL          # SVO playback depth; NEURAL_LIGHT if VRAM is tight
 
 # LLM that turns the task + detected boxes into value maps. The API key is NOT
@@ -91,7 +91,7 @@ perception:
 # which is what the SDKs read and what keeps it out of git.
 value_map_llm:
   provider: openai            # openai | anthropic
-  model: gpt-5.4-mini
+  model: gpt-5.2
   cache_dir: cache/value_map_llm   # responses are cached by (model, prompt)
 
 gripper:

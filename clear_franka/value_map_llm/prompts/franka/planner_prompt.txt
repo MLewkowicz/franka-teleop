@@ -33,7 +33,44 @@
 #     above its rim -- the rim is the box's max z, not its centre. For a flat
 #     surface ("on the shelf", "on the table"), aim just above the top face.
 #   * Only name objects that appear in the scene table.
-#   * Emit ONLY the assignment. No commentary, no markdown.
+#   * Emit ONLY the assignment -- no markdown. EXCEPTION: when the
+#     destination type matches more than one box, first write one short
+#     comment line per candidate saying exactly what you see inside its
+#     green box (e.g. "# bowl: empty", "# bowl_2: has a yellow object in
+#     it"), THEN the assignment. Look, don't assume -- describe the actual
+#     pixels before picking.
+#
+# You are also given a photo of the workspace, from the same camera the scene
+# table was fit from, with each detected box drawn on it in green and labeled
+# with its EXACT name from the table (e.g. 'bowl_2') -- that label is how you
+# tell which physical object in the photo a table row refers to. Use the
+# photo for what the box table can't tell you: whether a candidate
+# destination is actually clear, or already holds something -- an object
+# resting in it, a lid, packaging, anything not captured as its own box.
+# Small, thin, or occluded items (a single grape, a slice, cutlery lying
+# flat) routinely fail segmentation and will have NO green box at all, even
+# though they are sitting right there in the photo -- the absence of a
+# labeled box is not evidence a spot is empty. When you check a candidate,
+# look at the pixels inside ITS OWN green box, not just at whether some other
+# box overlaps it.
+#
+# When the instruction's destination type matches more than one box (e.g.
+# 'bowl' and 'bowl_2'), check each candidate against BOTH signals: (1) the
+# table -- another listed object whose x/y falls inside the candidate's x/y
+# footprint, with z at or above its floor (a container's rim, or a flat
+# surface's top face); and (2) the photo -- find the candidate's own labeled
+# green box and look inside it, since an occupant with no box of its own is
+# common. Either signal alone is enough to call a candidate occupied. Pick
+# the clear one and name its EXACT box name in 'affordance' (e.g. 'bowl_2',
+# not 'the bowl'), so the next stage resolves it unambiguously. Never aim at
+# a destination that already holds something, unless the instruction
+# explicitly says to add to a pile or stack.
+#
+# If the instruction instead picks the destination by how it looks in the
+# shot -- nearer/farther, left/right, closer to you -- read that straight off
+# the photo (which labeled box actually sits where), not off x/y/z: the
+# robot-frame axes describe the robot's geometry, not the camera's viewpoint,
+# and the two do not line up in general.
 
 # Scene (frame = fr3_link0, metres; +x away from the robot base, +y left, +z up)
 #   shelf: center=[0.720, 0.100, 0.500] size=[0.300, 0.400, 0.060] x=[0.570, 0.870] y=[-0.100, 0.300] z=[0.470, 0.530]
@@ -66,6 +103,31 @@ ret_val = {
     'avoidance': 'everything inside the cabinet',
     'arrival_radius_cm': 8,
     'label': 'place on rack',
+}
+
+# Scene (frame = fr3_link0, metres; +x away from the robot base, +y left, +z up)
+#   bowl: center=[0.640, 0.180, 0.430] size=[0.180, 0.180, 0.070] x=[0.550, 0.730] y=[0.090, 0.270] z=[0.395, 0.465]
+#   bowl_2: center=[0.560, -0.220, 0.430] size=[0.180, 0.180, 0.070] x=[0.470, 0.650] y=[-0.310, -0.130] z=[0.395, 0.465]
+#   fork: center=[0.560, -0.220, 0.440] size=[0.140, 0.025, 0.015] x=[0.490, 0.630] y=[-0.233, -0.208] z=[0.433, 0.448]
+# Query: put the mug in the bowl.
+ret_val = {
+    'affordance': 'a point 4cm above the rim of bowl, centered on it',
+    'avoidance': None,
+    'arrival_radius_cm': 5,
+    'label': 'place in bowl',
+}
+
+# Scene (frame = fr3_link0, metres; +x away from the robot base, +y left, +z up)
+#   bowl: center=[0.640, 0.180, 0.430] size=[0.180, 0.180, 0.070] x=[0.550, 0.730] y=[0.090, 0.270] z=[0.395, 0.465]
+#   bowl_2: center=[0.560, -0.220, 0.430] size=[0.180, 0.180, 0.070] x=[0.470, 0.650] y=[-0.310, -0.130] z=[0.395, 0.465]
+# Query: put the grape in the empty bowl.
+# bowl: a few grapes are resting inside it -- no box of their own, but visible
+# bowl_2: empty
+ret_val = {
+    'affordance': 'a point 4cm above the rim of bowl_2, centered on it',
+    'avoidance': None,
+    'arrival_radius_cm': 5,
+    'label': 'place in empty bowl',
 }
 
 # Query:

@@ -17,10 +17,14 @@ from clear_franka.perception.boxes import (
     detections_to_scene_boxes,
     frame_to_world_cloud,
     load_scene_boxes,
+    label_scene_image,
     load_scene_cloud,
+    load_scene_image,
     mask_to_world_aabb,
+    match_boxes_to_frame_detections,
     save_scene_boxes,
     save_scene_cloud,
+    save_scene_image,
 )
 from clear_franka.perception.sam3 import Sam3Segmenter
 from clear_franka.perception.sources import (
@@ -43,8 +47,12 @@ __all__ = [
     "detections_to_scene_boxes",
     "frame_to_world_cloud",
     "load_scene_boxes",
+    "label_scene_image",
     "load_scene_cloud",
+    "load_scene_image",
     "mask_to_world_aabb",
+    "match_boxes_to_frame_detections",
     "save_scene_boxes",
     "save_scene_cloud",
+    "save_scene_image",
 ]

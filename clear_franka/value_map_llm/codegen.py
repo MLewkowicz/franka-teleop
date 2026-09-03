@@ -15,6 +15,7 @@ from __future__ import annotations
 import ast
 import logging
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
@@ -79,16 +80,19 @@ class MapLMP:
 
 
 class PlannerLMP:
-    """Turns the task + scene into a short list of steering stages."""
+    """Turns the task + scene (+ optional workspace photo) into steering stages."""
 
-    def __init__(self, backend, scene_block: str) -> None:
+    def __init__(
+        self, backend, scene_block: str, image: Optional[np.ndarray] = None
+    ) -> None:
         self._backend = backend
         self._scene_block = scene_block
+        self._image = image
         self._base_prompt = load_prompt("planner_prompt")
 
     def __call__(self, task: str) -> list[dict]:
         prompt = f"{self._base_prompt}\n\n{self._scene_block}\n# Query: {task}."
-        code = self._backend.generate(prompt, stop=STOP)
+        code = self._backend.generate(prompt, stop=STOP, image=self._image)
         logger.info('[planner] "%s" ->\n%s', task, code)
         return parse_stages(code)
 

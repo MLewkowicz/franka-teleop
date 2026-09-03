@@ -10,9 +10,14 @@ and task costs nothing.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import io
 import logging
 import time
 from typing import Optional
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -71,8 +76,14 @@ class LLMBackend:
             raise ValueError(f"Unknown LLM provider: {self._provider}")
         return self._client
 
-    def generate(self, prompt: str, stop: Optional[list[str]] = None) -> str:
+    def generate(
+        self,
+        prompt: str,
+        stop: Optional[list[str]] = None,
+        image: Optional[np.ndarray] = None,
+    ) -> str:
         stop = list(stop or [])
+        image_b64 = _encode_image_b64(image) if image is not None else None
         cache_key = {
             "provider": self._provider,
             "model": self._model,
@@ -80,6 +91,11 @@ class LLMBackend:
             "system": self._system,
             "max_tokens": self._max_tokens,
             "effort": self._effort,
+            "image_sha256": (
+                hashlib.sha256(image_b64.encode("ascii")).hexdigest()
+                if image_b64 is not None
+                else None
+            ),
         }
         if cache_key in self._cache:
             logger.debug("LLM cache hit (%s)", self._model)
@@ -91,9 +107,9 @@ class LLMBackend:
         for attempt in range(self._max_retries):
             try:
                 if self._provider == "anthropic":
-                    text = self._call_anthropic(client, prompt, stop)
+                    text = self._call_anthropic(client, prompt, stop, image_b64)
                 else:
-                    text = self._call_openai(client, prompt, stop)
+                    text = self._call_openai(client, prompt, stop, image_b64)
                 break
             except Exception as e:  # noqa: BLE001 — retried, then re-raised
                 # Both SDKs put the HTTP status on the exception. A bad key,
@@ -129,10 +145,25 @@ class LLMBackend:
 
     # ------------------------------------------------------------------
 
-    def _call_anthropic(self, client, prompt: str, stop: list[str]) -> str:
+    def _call_anthropic(
+        self, client, prompt: str, stop: list[str], image_b64: Optional[str] = None
+    ) -> str:
         # No `temperature`: sampling parameters are rejected on Opus 5 / Sonnet 5.
         # Adaptive thinking at low effort — these are short, highly patterned
         # emissions, and the in-context examples do most of the work.
+        content: object = prompt
+        if image_b64 is not None:
+            content = [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": image_b64,
+                    },
+                },
+                {"type": "text", "text": prompt},
+            ]
         response = client.messages.create(
             model=self._model,
             max_tokens=self._max_tokens,
@@ -140,19 +171,30 @@ class LLMBackend:
             thinking={"type": "adaptive"},
             output_config={"effort": self._effort},
             stop_sequences=stop or None,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content": content}],
         )
         if response.stop_reason == "refusal":
             raise RuntimeError(f"model refused: {response.stop_details}")
         text = "".join(b.text for b in response.content if b.type == "text")
         return _strip_fences(text)
 
-    def _call_openai(self, client, prompt: str, stop: list[str]) -> str:
+    def _call_openai(
+        self, client, prompt: str, stop: list[str], image_b64: Optional[str] = None
+    ) -> str:
+        user_content: object = prompt
+        if image_b64 is not None:
+            user_content = [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                },
+                {"type": "text", "text": prompt},
+            ]
         kwargs: dict = {
             "model": self._model,
             "messages": [
                 {"role": "system", "content": self._system},
-                {"role": "user", "content": prompt},
+                {"role": "user", "content": user_content},
             ],
         }
         # The gpt-5 family rejects `max_tokens` and `stop`; LangSteer's
@@ -175,3 +217,12 @@ class LLMBackend:
 
 def _strip_fences(text: str) -> str:
     return text.replace("```python", "").replace("```", "").strip()
+
+
+def _encode_image_b64(image: np.ndarray) -> str:
+    """(H, W, 3) uint8 RGB -> base64-encoded PNG bytes."""
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.fromarray(image).save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
