@@ -110,7 +110,7 @@ def _parse_args() -> argparse.Namespace:
     src.add_argument("--bpe-path", default=None,
                      help="overrides perception.bpe_path from the config")
     src.add_argument("--confidence", type=float, default=None)
-    src.add_argument("--max-per-label", type=int, default=1,
+    src.add_argument("--max-per-label", type=int, default=2,
                      help="instances kept per text prompt, highest score first")
     src.add_argument("--boxes-in", default=None,
                      help="boxes JSON to read (--source boxes)")

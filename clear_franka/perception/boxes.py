@@ -71,7 +71,7 @@ def detections_to_scene_boxes(
     per_frame: list[tuple[list[Detection], np.ndarray]],
     T_cam2base: np.ndarray,
     *,
-    max_per_label: int = 1,
+    max_per_label: int = 2,
     min_size_m: float = 0.01,
     trim_pct: float = TRIM_PCT,
 ) -> list[SceneBox]:
