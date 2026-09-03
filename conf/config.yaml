@@ -64,7 +64,7 @@ cameras:
     serial_number: 37820861
     resolution: HD720
     fps: 30
-    depth_mode: PERFORMANCE
+    depth_mode: NEURAL
     extrinsics_path: "/home/clear/franka-teleop/data/extrinsics_third_person.json"
   hand:
     name: hand
@@ -72,7 +72,7 @@ cameras:
     serial_number: 10986074
     resolution: HD720
     fps: 30
-    depth_mode: PERFORMANCE
+    depth_mode: NEURAL
     extrinsics_path: "/home/clear/franka-teleop/data/extrinsics_hand.json"
 
 # Text-prompted 3D perception for value-map synthesis (synthesize_value_map.py).
@@ -176,7 +176,7 @@ deploy:
   control_hz: 10                                  # Nominal DiffuserActor waypoint rate used to interpret action horizon timing.
   execution_hz: 100                              # Reference streaming rate; samples the retimed interpolation.
   record_trajectory: true                       # If true, log the executed session to data_dir/episode_*.mcap (same format as mode=replay), replayable via main.py mode=replay.
-  tracker: cartesian                             # cartesian or ik
+  tracker: ik                                    # cartesian or ik
   # ---- tracker: ik only ----
   joint_stiffness: [320.0, 320.0, 320.0, 320.0, 120.0, 120.0, 30.0]
   ik_joint_limit_margin: 0.02
@@ -203,7 +203,7 @@ deploy:
   # target - residual_wrench/stiffness, a steady-state offset, not a transient.
   # Higher rotational stiffness directly shrinks that offset. If it oscillates,
   # back off.
-  rotational_stiffness: 40.0
+  rotational_stiffness: 30.0
   # Null-space biasing for the impedance controller. When stiffness > 0 the
   # controller resolves the 7-DOF→6-DOF redundancy by biasing the joint config
   # toward `nullspace_target` (7-vector). Useful for poses near the rack where

@@ -9,7 +9,7 @@ data_dir = Path("./data")
 data_dir.mkdir(exist_ok=True)
 
 print("Opening ZED 2i...")
-cam = ZedCamera(resolution="HD720", fps=30, depth_mode="PERFORMANCE")
+cam = ZedCamera(resolution="HD720", fps=30, depth_mode="NEURAL")
 cam.run()
 
 video_path = str(data_dir / "test_video.hdf5")

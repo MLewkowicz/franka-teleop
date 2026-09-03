@@ -56,7 +56,7 @@ def get_camera_config(cfg, name: str = "third_person") -> dict:
         "enabled": bool(named.get("enabled", False)),
         "resolution": named.get("resolution", "HD720"),
         "fps": int(named.get("fps", 30)),
-        "depth_mode": named.get("depth_mode", "PERFORMANCE"),
+        "depth_mode": named.get("depth_mode", "NEURAL"),
         "serial_number": named.get("serial_number"),
     }
 
@@ -92,7 +92,7 @@ def enabled_camera_names(cfg, include: tuple[str, ...] = ()) -> list[str]:
 class ZedCamera:
     """Threaded ZED camera capture with native SVO2 recording."""
 
-    def __init__(self, resolution="HD720", fps=30, depth_mode="PERFORMANCE",
+    def __init__(self, resolution="HD720", fps=30, depth_mode="NEURAL",
                  serial_number=None, camera_id=None):
         """
         Args:
@@ -139,6 +139,18 @@ class ZedCamera:
         self._frame_count = 0
         self._first_clock_anchor = None
         self._last_clock_anchor = None
+        # enable_recording()/disable_recording() are native SDK calls and, like
+        # grab(), are not safe to make from a different thread than whichever
+        # one is currently mid-grab() — the ZED SDK's Camera object is not
+        # thread-safe. start/stop_recording() (called from the recorder thread)
+        # hand the actual toggle to _capture_loop via these fields and block on
+        # the event instead of calling self._zed directly. Concretely calling
+        # disable_recording() from another thread while grab() is in flight can
+        # wedge the SDK forever (observed: Ctrl-C didn't even work).
+        self._pending_recording_params = None  # sl.RecordingParameters or None
+        self._pending_disable_recording = False
+        self._recording_toggle_error = None  # sl.ERROR_CODE or None
+        self._recording_toggle_done = threading.Event()
 
         # Pre-allocate retrieval buffers
         self._rgb_mat = sl.Mat()
@@ -207,9 +219,9 @@ class ZedCamera:
                 recording_params.compression_mode = getattr(
                     sl.SVO_COMPRESSION_MODE, svo_compression
                 )
-                err = self._zed.enable_recording(recording_params)
-                if err != sl.ERROR_CODE.SUCCESS:
-                    raise RuntimeError(f"Failed to start SVO recording: {err}")
+                self._recording_toggle_done.clear()
+                self._recording_toggle_error = None
+                self._pending_recording_params = recording_params
                 self._svo_recording = True
             elif format == "rgb":
                 self._video_writer = _FfmpegFrameWriter(video_path, self._img_w, self._img_h, self._fps)
@@ -221,7 +233,26 @@ class ZedCamera:
             self._first_clock_anchor = None
             self._last_clock_anchor = None
             self._recording = True
-            logger.info("  [camera] Recording started (%s): %s", format, video_path)
+
+        if format == "svo":
+            # enable_recording() is actually issued by _capture_loop, on the
+            # same thread as grab() — see the comment by _pending_recording_params.
+            if not self._recording_toggle_done.wait(timeout=5.0):
+                with self._rec_lock:
+                    self._recording = False
+                    self._svo_recording = False
+                raise RuntimeError(
+                    "Timed out starting SVO recording (capture loop not running?)"
+                )
+            if self._recording_toggle_error is not None:
+                error = self._recording_toggle_error
+                self._recording_toggle_error = None
+                with self._rec_lock:
+                    self._recording = False
+                    self._svo_recording = False
+                raise RuntimeError(f"Failed to start SVO recording: {error}")
+
+        logger.info("  [camera] Recording started (%s): %s", format, video_path)
 
     def stop_recording(self):
         """Stop recording and close the video file.
@@ -235,10 +266,20 @@ class ZedCamera:
             self._recording = False
             record_format = self._record_format
             self._svo_recording = False
+            if record_format == "svo":
+                self._recording_toggle_done.clear()
+                self._pending_disable_recording = True
 
         n = self._frame_count
         if record_format == "svo":
-            self._zed.disable_recording()
+            # disable_recording() is actually issued by _capture_loop — see the
+            # comment by _pending_recording_params for why this can't just call
+            # self._zed.disable_recording() directly from here. A stalled
+            # capture loop leaves the SVO file open rather than hanging forever.
+            if not self._recording_toggle_done.wait(timeout=5.0):
+                logger.warning(
+                    "  [camera] Timed out stopping SVO recording (capture loop stalled?)"
+                )
         elif self._video_writer is not None:
             self._video_writer.release()
             self._video_writer = None
@@ -389,6 +430,22 @@ class ZedCamera:
         consecutive_failures = 0
         last_fail_log = 0.0
         while not self._stop_event.is_set():
+            # Service a pending enable_recording()/disable_recording() request
+            # before grab() — never concurrently with it. See the comment by
+            # _pending_recording_params in __init__.
+            with self._rec_lock:
+                if self._pending_recording_params is not None:
+                    params = self._pending_recording_params
+                    self._pending_recording_params = None
+                    err_toggle = self._zed.enable_recording(params)
+                    if err_toggle != sl.ERROR_CODE.SUCCESS:
+                        self._recording_toggle_error = err_toggle
+                    self._recording_toggle_done.set()
+                elif self._pending_disable_recording:
+                    self._pending_disable_recording = False
+                    self._zed.disable_recording()
+                    self._recording_toggle_done.set()
+
             err = self._zed.grab(runtime)
             if err != sl.ERROR_CODE.SUCCESS:
                 consecutive_failures += 1
