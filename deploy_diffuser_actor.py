@@ -9,9 +9,17 @@ abandons the old plan and pauses while the worker generates a replacement. The
 gripper command is issued when the executed trajectory step flips relative to
 what we last commanded.
 
-Stage transitions (grasp → place → done) are driven by SpaceMouse buttons:
-    LEFT  short tap   → toggle ENABLED (closed-loop control on/off)
-    RIGHT short tap   → advance stage (grasp → place → exit)
+With deploy.auto_start_inference=True, inference starts in the grasp stage as
+soon as the script comes up (no manual tap needed). The grasp->place transition
+is then automatic too: once the policy commands the gripper closed, we poll
+Robotiq object_detection() for closure confirmation (or time out) and advance
+to place on our own (deploy.gate_place_on_grasp, default True).
+
+SpaceMouse buttons remain available as manual overrides:
+    LEFT  short tap   → (re)enter INFERENCE at the grasp stage
+    RIGHT short tap   → (re)enter INFERENCE at the place stage
+    long-press either → take over in TELEOP
+    chord (L+R)       → toggle gripper (TELEOP, or place stage if manual-gripper)
 
 Launch:
     uv run python deploy_diffuser_actor.py \\
@@ -1221,8 +1229,8 @@ def main(cfg: DictConfig) -> int:
         ], dtype=float)
         mouse.run()
         logger.info(
-            "Hybrid control — start in TELEOP. Tap LEFT=grasp / RIGHT=place to run "
-            "inference; long-press=take over (teleop); chord(L+R)=toggle gripper."
+            "Hybrid control — Tap LEFT=grasp / RIGHT=place to run inference; "
+            "long-press=take over (teleop); chord(L+R)=toggle gripper."
         )
     except Exception as e:
         logger.warning(f"No SpaceMouse ({e}); buttons disabled — Ctrl-C to stop.")
@@ -1609,11 +1617,26 @@ def main(cfg: DictConfig) -> int:
         )
         catchup_rot_tol_rad = float(cfg.deploy.get("catchup_rot_tol_rad", 0.05))
 
+        # ----- grasp->place gate (auto-advance on gripper closure confirmation) -----
+        # Once the policy commands the gripper CLOSE during the grasp stage, poll
+        # Robotiq object_detection() for closure confirmation and auto-advance to
+        # place — or advance anyway after a timeout so a hardware hiccup can't
+        # stall the rollout. A manual RIGHT tap still works and supersedes this
+        # (cleared in _enter_inference/_enter_teleop) so it can't double-fire.
+        gate_place_on_grasp = bool(cfg.deploy.get("gate_place_on_grasp", True))
+        grasp_gate_poll_dt = 1.0 / float(cfg.deploy.get("grasp_gate_poll_hz", 15.0))
+        grasp_gate_timeout_s = float(cfg.deploy.get("grasp_gate_timeout_s", 3.0))
+        grasp_close_pending = False
+        grasp_close_commanded_at = 0.0
+        last_grasp_gate_poll = 0.0
+
         # ----- mode transitions (swappable gesture->action mapping layer) -----
         def _enter_inference(prim: int, label: str) -> None:
             nonlocal mode, stage_idx, active_plan, active_cartesian_trajectory
             nonlocal active_plan_index_offset, active_plan_started_at, waiting_for_plan
             nonlocal active_joint_trajectory, ik_consecutive_failures
+            nonlocal grasp_close_pending
+            grasp_close_pending = False   # any manual/auto transition supersedes a pending gate
             mode = INFERENCE
             active_plan = None
             active_cartesian_trajectory = None
@@ -1638,8 +1661,10 @@ def main(cfg: DictConfig) -> int:
             nonlocal mode, active_plan, active_cartesian_trajectory
             nonlocal active_plan_index_offset, active_plan_started_at, waiting_for_plan
             nonlocal active_joint_trajectory, ik_consecutive_failures
+            nonlocal grasp_close_pending
             if mode == TELEOP:
                 return
+            grasp_close_pending = False
             mode = TELEOP
             enabled_event.clear()
             request_event.clear()
@@ -1728,6 +1753,13 @@ def main(cfg: DictConfig) -> int:
                     except OSError as e:
                         logger.warning("Could not delete %s: %s", p, e)
                 logger.info("[ROLLOUT] DISCARDED %d file(s)", deleted)
+
+        if bool(cfg.deploy.get("auto_start_inference", False)):
+            logger.info(
+                "auto_start_inference=True — skipping TELEOP wait, entering "
+                "INFERENCE (grasp) now"
+            )
+            _enter_inference(0, "grasp")
 
         while not stop_event.is_set():
             rate.start_tick()
@@ -1818,6 +1850,40 @@ def main(cfg: DictConfig) -> int:
                     prev_left = left
                     prev_right = right
                     prev_chord = chord
+
+            # ---------- grasp->place gate ----------
+            # Poll for gripper-closure confirmation (Robotiq object_detection) and
+            # auto-advance once it arrives, or after a timeout so a hardware hiccup
+            # can't stall the rollout. Runs before the active-plan block below so a
+            # transition here can safely null out active_plan for this tick (same
+            # timing as the RIGHT-tap handler above). RIGHT tap still works as a
+            # manual override — it clears grasp_close_pending in _enter_inference
+            # so this can't double-fire afterward.
+            if grasp_close_pending and gripper is not None:
+                now_ = time.monotonic()
+                if now_ - last_grasp_gate_poll >= grasp_gate_poll_dt:
+                    last_grasp_gate_poll = now_
+                    try:
+                        obj = gripper.object_detection(refresh_status=True)
+                    except Exception as e:
+                        logger.warning(f"[grasp-gate] object_detection() failed: {e}")
+                        obj = None
+                    if obj in (2, 3):
+                        logger.info(
+                            f"[grasp-gate] gripper closed (object_detection={obj}"
+                            f"{' — object detected' if obj == 2 else ' — no contact, missed grasp'});"
+                            " auto-advancing to place"
+                        )
+                        grasp_close_pending = False
+                        _enter_inference(1, "place")
+                    elif now_ - grasp_close_commanded_at > grasp_gate_timeout_s:
+                        logger.warning(
+                            f"[grasp-gate] timed out after {grasp_gate_timeout_s}s waiting "
+                            f"for closure confirmation (last object_detection={obj}); "
+                            "advancing anyway"
+                        )
+                        grasp_close_pending = False
+                        _enter_inference(1, "place")
 
             now = time.monotonic()
             if now - last_viz_update >= viz_dt:
@@ -2129,6 +2195,11 @@ def main(cfg: DictConfig) -> int:
                         gripper.move_width(width, wait=False)
                         visualizer.update_gripper_width(width, max_width_m=cfg.gripper.max_width_m)
                         stage_state["gripper_cmd"] = cmd_state
+                        if (gate_place_on_grasp and cmd_state == 0.0
+                                and active_plan.stage_idx == 0):
+                            grasp_close_pending = True
+                            grasp_close_commanded_at = time.monotonic()
+                            last_grasp_gate_poll = 0.0
 
                 final_dist = float(np.linalg.norm(
                     active_plan.trajectory[-1, :3] - ee_pos

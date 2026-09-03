@@ -176,6 +176,10 @@ deploy:
   control_hz: 10                                  # Nominal DiffuserActor waypoint rate used to interpret action horizon timing.
   execution_hz: 100                              # Reference streaming rate; samples the retimed interpolation.
   record_trajectory: true                       # If true, log the executed session to data_dir/episode_*.mcap (same format as mode=replay), replayable via main.py mode=replay.
+  auto_start_inference: true                    # If true, skip the TELEOP wait and enter INFERENCE (grasp stage) as soon as the script comes up.
+  gate_place_on_grasp: true                     # If true, auto-advance grasp -> place once Robotiq confirms gripper closure (or after grasp_gate_timeout_s).
+  grasp_gate_poll_hz: 15                        # Poll rate for Robotiq object_detection() while a grasp-closure confirmation is pending.
+  grasp_gate_timeout_s: 3.0                     # Advance to place anyway if closure isn't confirmed within this long (hardware hiccup safety net).
   tracker: ik                                    # cartesian or ik
   # ---- tracker: ik only ----
   joint_stiffness: [320.0, 320.0, 320.0, 320.0, 120.0, 120.0, 30.0]
