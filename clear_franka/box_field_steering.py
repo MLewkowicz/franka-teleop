@@ -2,11 +2,17 @@
 
 Keeps the proven `TargetRotationSteering` (LangSteer) that tips the wrist into
 the inverted-place basin (writes the rotation slice [3:9]) and adds a positional
-branch driven by a *hardcoded* VoxPoser-style value map built from the workspace
-bounding boxes (writes the position slice [0:3]). The position branch reuses
-LangSteer's `PositionFieldGuidance` / `PositionTransform` math exactly — only the
-value map is supplied locally (clear_franka.value_maps) instead of by the LLM
-composer, so no `StageManager`/LLM is involved.
+branch driven by a VoxPoser-style value map over the workspace bounding boxes
+(writes the position slice [0:3]). The position branch reuses LangSteer's
+`PositionFieldGuidance` / `PositionTransform` math exactly — only the value map
+is supplied locally, so no `StageManager` is involved.
+
+Where that map comes from is `place_mode`:
+  rack / cabinet — hand-built from `data/workspace_boxes.json`
+                   (clear_franka.value_maps), tuned by config.
+  llm            — synthesized offline from a task string + SAM 3 scene boxes
+                   and loaded from a .npz (clear_franka.value_map_llm). No
+                   model loading or API call happens in the control path.
 
 Both branches must share one `guidance_mode` because the policy routes a single
 guidance fn (see policies/diffuser_actor_base._build_guidance_fns); we take it
@@ -70,8 +76,14 @@ class CombinedBoxSteering(BaseSteering):
         #     (no walls). The `cabinet` block overrides target_euler /
         #     rot_reverse_direction and supplies `cabinet.position`; everything
         #     else (scene bounds, gripper bounds, scalers, SLERP machinery) is
-        #     shared. Switch modes with one line: `place_mode: rack|cabinet`.
+        #     shared.
+        #   llm — value maps synthesized offline from a task string + the SAM 3
+        #     scene boxes and loaded from `llm.artifact_path` (see
+        #     synthesize_value_map.py). Same multi-stage advance as cabinet
+        #     mode; rotation is still config-driven.
+        # Switch modes with one line: `place_mode: rack|cabinet|llm`.
         self._place_mode = str(cfg.get("place_mode", "rack")).lower()
+        self._llm_task = ""  # set in llm mode from the artifact's metadata
         ccfg = dict(cfg.get("cabinet", {}))
         if self._place_mode == "cabinet":
             cfg = dict(cfg)  # shallow copy; override the rotation knobs the branches read
@@ -141,7 +153,44 @@ class CombinedBoxSteering(BaseSteering):
         ws_max = np.asarray(pcfg["workspace_bounds_max"], dtype=np.float32)
         map_size = int(pcfg.get("map_size", 100))
 
-        if self._place_mode == "cabinet":
+        if self._place_mode == "llm":
+            # Value maps synthesized offline from the task + SAM 3 scene boxes
+            # (synthesize_value_map.py -> .npz). The artifact carries its own
+            # grid — bounds derived from the detected scene, not the hand-tuned
+            # rack bounds — so adopt them here: PositionTransform and
+            # PositionFieldGuidance below must index the SAME grid the maps
+            # were built on, or every gradient lookup is silently offset.
+            from clear_franka.value_map_llm.artifact import load_stages
+
+            lcfg = dict(cfg.get("llm", {}))
+            pos_params = lcfg
+            synth_stages, meta = load_stages(lcfg["artifact_path"])
+            ws_min = np.asarray(meta["workspace_bounds_min"], dtype=np.float32)
+            ws_max = np.asarray(meta["workspace_bounds_max"], dtype=np.float32)
+            map_size = int(meta["map_size"])
+            self._llm_task = str(meta.get("task", ""))
+
+            self._pos_stages = [
+                {
+                    "vm": st.value_map,
+                    "grad": gradient_field_tensor(st.value_map, self.device),
+                    "target": st.target_world,
+                    "radius": st.arrival_radius_m,
+                    "label": st.label,
+                }
+                for st in synth_stages
+            ]
+            self._pos_stage_idx = 0
+            vm = self._pos_stages[0]["vm"]
+            self._stage_target_world = self._pos_stages[0]["target"]
+            logger.info(
+                "CombinedBoxSteering: LLM value maps from %s — task=%r, "
+                "%d stage(s): %s",
+                lcfg["artifact_path"], self._llm_task, len(self._pos_stages),
+                [(st["label"], np.round(st["target"], 3).tolist())
+                 for st in self._pos_stages],
+            )
+        elif self._place_mode == "cabinet":
             # Point-attractor(s) toward the cabinet, plus an optional avoidance
             # blob (the closed cabinet to the right). Supports a SEQUENCE of
             # position stages (`cpos.stages`): the EE advances to the next target
@@ -180,23 +229,23 @@ class CombinedBoxSteering(BaseSteering):
             else:
                 stage_specs = [(np.asarray(cpos["target"], dtype=np.float32),
                                 float(cpos.get("basin_latch_radius_m", 0.10)))]
-            self._cab_stages = []
+            self._pos_stages = []
             for tgt, radius in stage_specs:
                 vm_i = build_center_attractor_value_map(
                     tgt, ws_min=ws_min, ws_max=ws_max, map_size=map_size,
                     seed_extent_m=seed_extent, avoidance_boxes=avoidance_boxes,
                     avoidance_weight=av_weight, obstacle_sigma=av_sigma)
-                self._cab_stages.append({
+                self._pos_stages.append({
                     "vm": vm_i,
                     "grad": gradient_field_tensor(vm_i, self.device),
                     "target": tgt,
                     "radius": radius,
                 })
-            self._cab_stage_idx = 0
-            vm = self._cab_stages[0]["vm"]
-            self._stage_target_world = self._cab_stages[0]["target"]
+            self._pos_stage_idx = 0
+            vm = self._pos_stages[0]["vm"]
+            self._stage_target_world = self._pos_stages[0]["target"]
         else:
-            self._cab_stages = None
+            self._pos_stages = None
             pos_params = pcfg
             boxes = load_boxes(pcfg["boxes_path"])
             face_thickness_m = float(pcfg.get("face_thickness_m", 0.04))
@@ -380,12 +429,12 @@ class CombinedBoxSteering(BaseSteering):
         self._all_off = False
         self._rot_commit_axis = None
         self._rot_negate = False
-        # Rewind the cabinet position-stage sequence to the first target.
-        if self._cab_stages is not None:
-            self._cab_stage_idx = 0
-            self._stage.value_map = self._cab_stages[0]["vm"]
-            self._stage.gradient_field = self._cab_stages[0]["grad"]
-            self._stage_target_world = self._cab_stages[0]["target"]
+        # Rewind the position-stage sequence (cabinet / llm) to the first target.
+        if self._pos_stages is not None:
+            self._pos_stage_idx = 0
+            self._stage.value_map = self._pos_stages[0]["vm"]
+            self._stage.gradient_field = self._pos_stages[0]["grad"]
+            self._stage_target_world = self._pos_stages[0]["target"]
 
     # Lifecycle no-ops for run_experiment / policy compatibility.
     def setup_episode(self, task_name: str):
@@ -540,26 +589,27 @@ class CombinedBoxSteering(BaseSteering):
         # Position-stage progression / basin latch. The measured EE is fixed
         # across this plan's denoising loop (it's the observation pose), so these
         # checks are effectively per-plan.
-        if self._cab_stages is not None:
-            # Cabinet: advance through the position-stage sequence as the EE
-            # arrives at each target; latch off after the last. One-way (monotonic).
+        if self._pos_stages is not None:
+            # Multi-stage modes (cabinet, llm): advance through the position-stage
+            # sequence as the EE arrives at each target; latch off after the
+            # last. One-way (monotonic).
             ee = self._coords.current_gripper_pos
             if not self._pos_latched and ee is not None:
-                cur = self._cab_stages[self._cab_stage_idx]
+                cur = self._pos_stages[self._pos_stage_idx]
                 d = float(torch.norm(
                     ee - torch.as_tensor(cur["target"], dtype=ee.dtype, device=ee.device)
                 ).item())
                 if cur["radius"] > 0.0 and d <= cur["radius"]:
-                    if self._cab_stage_idx + 1 < len(self._cab_stages):
-                        self._cab_stage_idx += 1
-                        nxt = self._cab_stages[self._cab_stage_idx]
+                    if self._pos_stage_idx + 1 < len(self._pos_stages):
+                        self._pos_stage_idx += 1
+                        nxt = self._pos_stages[self._pos_stage_idx]
                         self._stage.value_map = nxt["vm"]
                         self._stage.gradient_field = nxt["grad"]
                         self._stage_target_world = nxt["target"]
                         logger.info(
                             "CombinedBoxSteering: position stage %d reached "
                             "(d=%.3fm) → advancing to stage %d target=%s",
-                            self._cab_stage_idx, d, self._cab_stage_idx + 1,
+                            self._pos_stage_idx, d, self._pos_stage_idx + 1,
                             np.array2string(nxt["target"], precision=3))
                     else:
                         self._pos_latched = True

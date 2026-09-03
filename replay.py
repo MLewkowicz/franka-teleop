@@ -86,7 +86,7 @@ def play_joint_trajectory(
     n_steps = len(timestamps)
     trajectory = Trajectory(joint_pos, timestamps)
 
-    with robot.start_joint_impedance_session(
+    with robot.start_joint_impedance_tracker(
         period=rc.period,
         stiffness=stiffness.tolist(),
         lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
@@ -107,16 +107,16 @@ def play_joint_trajectory(
 
             if elapsed >= timestamps[-1]:
                 print("  Replay complete.")
-                session.set_joint_reference(joint_pos[-1].tolist())
+                session.set_target(joint_pos[-1].tolist())
                 break
 
             q = trajectory.interpolate(elapsed).reshape(7)
             if has_joint_vel:
                 dq = np.asarray(trajectory._spline.derivative()(elapsed), dtype=float).reshape(7)
                 dq = dq * rc.speed
-                session.set_joint_reference(q.tolist(), velocity=dq.tolist())
+                session.set_target(q.tolist(), dq.tolist())
             else:
-                session.set_joint_reference(q.tolist())
+                session.set_target(q.tolist())
 
             if gripper is not None and np.isfinite(gripper_open_data[step]):
                 current_gripper_open = bool(round(float(gripper_open_data[step])))
@@ -189,7 +189,7 @@ def play_cartesian_trajectory(
     else:
         nullspace_target = np.asarray(nullspace_target_cfg, dtype=float)
 
-    with robot.start_cartesian_impedance_session(
+    with robot.start_cartesian_impedance_tracker(
         period=rc.period,
         translational_stiffness=float(
             rc.get("translational_stiffness", cfg.replay.translational_stiffness)
@@ -197,15 +197,13 @@ def play_cartesian_trajectory(
         rotational_stiffness=float(
             rc.get("rotational_stiffness", cfg.replay.rotational_stiffness)
         ),
-        nullspace_tasks=[
-            PostureTask(
-                nullspace_target,
-                stiffness=float(
-                    rc.get("nullspace_stiffness", cfg.replay.nullspace_stiffness)
-                ),
+        posture_task=PostureTask(
+            nullspace_target,
+            stiffness=float(
+                rc.get("nullspace_stiffness", cfg.replay.nullspace_stiffness)
             ),
-            ManipulabilityTask(gain=5.0, max_torque=1.0),
-        ],
+        ),
+        manipulability_task=ManipulabilityTask(gain=5.0, max_torque=1.0),
         lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
         upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
     ) as session:
@@ -224,12 +222,12 @@ def play_cartesian_trajectory(
 
             if elapsed >= timestamps[-1]:
                 print("  Replay complete.")
-                session.set_cartesian_reference(Affine(pack_Rp(ee_rot[-1], ee_pos[-1])))
+                session.set_target(Affine(pack_Rp(ee_rot[-1], ee_pos[-1])))
                 break
 
             target_pos, target_rot = trajectory.interpolate(elapsed)
             linear_vel, angular_vel = trajectory.velocity(elapsed)
-            session.set_cartesian_reference(
+            session.set_target(
                 Affine(pack_Rp(target_rot, target_pos)),
                 Twist(linear_vel * rc.speed, angular_vel * rc.speed),
             )

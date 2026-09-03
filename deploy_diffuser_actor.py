@@ -1086,8 +1086,7 @@ def main(cfg: DictConfig) -> int:
     )
 
     # ----- robot -----
-    setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port,
-                      pub_port=cfg.zero_franky.pub_port)
+    setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port)
     robot = Robot(cfg.robot.ip)
     robot.recover_from_errors()
     # Home config the arm moves to before inference (and the default nullspace
@@ -1163,6 +1162,14 @@ def main(cfg: DictConfig) -> int:
     long_press_s = float(cfg.teleop.get("long_press_s", 0.8))
     teleop_workspace_clip = bool(cfg.deploy.get("teleop_workspace_clip", True))
     mode = TELEOP   # start in teleop so the user positions the arm first
+
+    # ----- grasp->place gate (auto-advance on gripper closure confirmation) -----
+    gate_place_on_grasp = bool(cfg.deploy.get("gate_place_on_grasp", True))
+    grasp_gate_poll_dt = 1.0 / float(cfg.deploy.get("grasp_gate_poll_hz", 15.0))
+    grasp_gate_timeout_s = float(cfg.deploy.get("grasp_gate_timeout_s", 3.0))
+    grasp_close_pending = False
+    grasp_close_commanded_at = 0.0
+    last_grasp_gate_poll = 0.0
 
     plan_hz = float(cfg.deploy.get("control_hz", 10.0))
     execution_hz = float(cfg.deploy.get("execution_hz", 100.0))
@@ -1260,14 +1267,12 @@ def main(cfg: DictConfig) -> int:
             "max_torque=%.1f buffer=%.2frad",
             jl_act, jl_stf, jl_dmp, jl_tmx, jl_buf,
         )
-        tracker = stack.enter_context(robot.start_cartesian_impedance_session(
+        tracker = stack.enter_context(robot.start_cartesian_impedance_tracker(
             period=0.001,
             translational_stiffness=cfg.deploy.translational_stiffness,
             rotational_stiffness=cfg.deploy.rotational_stiffness,
-            nullspace_tasks=[
-                PostureTask(_ns_target, stiffness=cfg.deploy.nullspace_stiffness),
-                ManipulabilityTask(gain=5.0, max_torque=1.0),
-            ],
+            posture_task=PostureTask(_ns_target, stiffness=cfg.deploy.nullspace_stiffness),
+            manipulability_task=ManipulabilityTask(gain=5.0, max_torque=1.0),
             lower_joint_limits=_lower_lim,
             upper_joint_limits=_upper_lim,
             joint_limit_activation_distance=jl_act,
@@ -1424,6 +1429,8 @@ def main(cfg: DictConfig) -> int:
         def _enter_inference(prim: int, label: str) -> None:
             nonlocal mode, stage_idx, active_plan, active_cartesian_trajectory
             nonlocal active_plan_index_offset, active_plan_started_at, waiting_for_plan
+            nonlocal grasp_close_pending
+            grasp_close_pending = False   # any manual/auto transition supersedes a pending gate
             mode = INFERENCE
             active_plan = None
             active_cartesian_trajectory = None
@@ -1435,6 +1442,13 @@ def main(cfg: DictConfig) -> int:
                 policy.set_primitive(prim)
                 policy.set_object(0)
                 policy.reset()
+                # policy.reset() only clears the gripper history, so the
+                # steering has to be rewound separately. Without this the basin
+                # latch survives a stage switch: once the EE has arrived, the
+                # position branch stays off forever and re-entering the stage
+                # gets no guidance at all.
+                if steering is not None:
+                    steering.reset()
                 stage_state["idx"] = prim
                 stage_state["epoch"] += 1
             stage_idx = prim          # keep executor adopt guard (plan.stage_idx==stage_idx)
@@ -1445,8 +1459,10 @@ def main(cfg: DictConfig) -> int:
         def _enter_teleop() -> None:
             nonlocal mode, active_plan, active_cartesian_trajectory
             nonlocal active_plan_index_offset, active_plan_started_at, waiting_for_plan
+            nonlocal grasp_close_pending
             if mode == TELEOP:
                 return
+            grasp_close_pending = False
             mode = TELEOP
             enabled_event.clear()
             request_event.clear()
@@ -1535,6 +1551,13 @@ def main(cfg: DictConfig) -> int:
                     except OSError as e:
                         logger.warning("Could not delete %s: %s", p, e)
                 logger.info("[ROLLOUT] DISCARDED %d file(s)", deleted)
+
+        if bool(cfg.deploy.get("auto_start_inference", False)):
+            logger.info(
+                "auto_start_inference=True — skipping TELEOP wait, entering "
+                "INFERENCE (grasp) now"
+            )
+            _enter_inference(0, "grasp")
 
         while not stop_event.is_set():
             rate.start_tick()
@@ -1626,6 +1649,40 @@ def main(cfg: DictConfig) -> int:
                     prev_right = right
                     prev_chord = chord
 
+            # ---------- grasp->place gate ----------
+            # Poll for gripper-closure confirmation (Robotiq object_detection) and
+            # auto-advance once it arrives, or after a timeout so a hardware hiccup
+            # can't stall the rollout. Runs before the active-plan block below so a
+            # transition here can safely null out active_plan for this tick (same
+            # timing as the RIGHT-tap handler above). RIGHT tap still works as a
+            # manual override — it clears grasp_close_pending in _enter_inference
+            # so this can't double-fire afterward.
+            if grasp_close_pending and gripper is not None:
+                now_ = time.monotonic()
+                if now_ - last_grasp_gate_poll >= grasp_gate_poll_dt:
+                    last_grasp_gate_poll = now_
+                    try:
+                        obj = gripper.object_detection(refresh_status=True)
+                    except Exception as e:
+                        logger.warning(f"[grasp-gate] object_detection() failed: {e}")
+                        obj = None
+                    if obj in (2, 3):
+                        logger.info(
+                            f"[grasp-gate] gripper closed (object_detection={obj}"
+                            f"{' — object detected' if obj == 2 else ' — no contact, missed grasp'});"
+                            " auto-advancing to place"
+                        )
+                        grasp_close_pending = False
+                        _enter_inference(1, "place")
+                    elif now_ - grasp_close_commanded_at > grasp_gate_timeout_s:
+                        logger.warning(
+                            f"[grasp-gate] timed out after {grasp_gate_timeout_s}s waiting "
+                            f"for closure confirmation (last object_detection={obj}); "
+                            "advancing anyway"
+                        )
+                        grasp_close_pending = False
+                        _enter_inference(1, "place")
+
             now = time.monotonic()
             if now - last_viz_update >= viz_dt:
                 _update_visualizer_robot_state(visualizer, robot.latest_state)
@@ -1644,12 +1701,12 @@ def main(cfg: DictConfig) -> int:
                     if teleop_workspace_clip:
                         target_pos = np.clip(target_pos, workspace_lo_np, workspace_hi_np)
                     try:
-                        tracker.set_cartesian_reference(
+                        tracker.set_target(
                             Affine(pack_Rp(target_rot, target_pos)),
                             Twist(v_world, w_world),
                         )
                     except Exception as exc:
-                        logger.warning(f"[teleop] set_cartesian_reference failed: {exc}")
+                        logger.warning(f"[teleop] set_target failed: {exc}")
                 _record_tick(enabled=False)
                 rate.finish_tick()
                 next_tick += execution_dt
@@ -1756,7 +1813,7 @@ def main(cfg: DictConfig) -> int:
                 if state is None:
                     state = rate.time_call("state_wait", robot.wait_for_state, 1.0)
                 ee_pos, _ee_rot, _O_T_EE = _read_ee_pose_from_state(state)
-                tracker.set_cartesian_reference(
+                tracker.set_target(
                     Affine(pack_Rp(catchup_target_rot, catchup_target_pos))
                 )
                 if deploy_trace is not None:
@@ -1854,12 +1911,12 @@ def main(cfg: DictConfig) -> int:
                 cmd_rot = Rotation.from_rotvec(rot_corr).as_matrix() @ target_rot
 
                 if velocity_feedforward:
-                    tracker.set_cartesian_reference(
+                    tracker.set_target(
                         Affine(pack_Rp(cmd_rot, cmd_xyz)),
                         Twist(ref_lin_vel, ref_ang_vel),
                     )
                 else:
-                    tracker.set_cartesian_reference(Affine(pack_Rp(cmd_rot, cmd_xyz)))
+                    tracker.set_target(Affine(pack_Rp(cmd_rot, cmd_xyz)))
 
                 # Live Cartesian tracking error: commanded reference (the
                 # clipped target actually sent to the impedance controller)
@@ -1893,6 +1950,11 @@ def main(cfg: DictConfig) -> int:
                         gripper.move_width(width, wait=False)
                         visualizer.update_gripper_width(width, max_width_m=cfg.gripper.max_width_m)
                         stage_state["gripper_cmd"] = cmd_state
+                        if (gate_place_on_grasp and cmd_state == 0.0
+                                and active_plan.stage_idx == 0):
+                            grasp_close_pending = True
+                            grasp_close_commanded_at = time.monotonic()
+                            last_grasp_gate_poll = 0.0
 
                 final_dist = float(np.linalg.norm(
                     active_plan.trajectory[-1, :3] - ee_pos

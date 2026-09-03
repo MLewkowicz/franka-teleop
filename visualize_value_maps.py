@@ -10,13 +10,13 @@ the exact value map the deploy would use for the active `place_mode`:
 
 Renders an interactive Plotly HTML via LangSteer's ValueMapVisualizer:
 affordance in Greens, avoidance in Reds, scene/target/avoidance boxes overlaid,
-and a cone quiver of the descent field (-∇cost) so you can see where the policy
-would be pushed.
+plus a printed descent probe so you can see which way the policy would be
+pushed.
 
 Usage:
     uv run python visualize_value_maps.py                 # active map from config
     uv run python visualize_value_maps.py --place-mode rack
-    uv run python visualize_value_maps.py --no-quiver --map-size 80
+    uv run python visualize_value_maps.py --map-size 80
 
 Output: outputs/value_maps/place.html (and latest.html). Open in a browser.
 """
@@ -35,6 +35,10 @@ sys.path.insert(0, LANGSTEER_PATH)
 
 from omegaconf import OmegaConf  # noqa: E402
 
+from clear_franka.value_map_viz import (  # noqa: E402
+    box_overlay as _box_obj,
+    print_gradient_probes as _print_gradient_probes,
+)
 from clear_franka.value_maps import (  # noqa: E402
     CABINET,
     RACK,
@@ -46,37 +50,32 @@ from clear_franka.value_maps import (  # noqa: E402
 )
 
 
+def _utf8_stdout() -> None:
+    """Don't let an ASCII locale turn a nabla in a log line into a crash."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):  # already wrapped / not a TTY
+            pass
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--config", default="conf/config.yaml",
                    help="Hydra config to read deploy.steering from")
-    p.add_argument("--place-mode", default=None, choices=["rack", "cabinet"],
+    p.add_argument("--place-mode", default=None,
+                   choices=["rack", "cabinet", "llm"],
                    help="override place_mode (default: read from config)")
     p.add_argument("--stage", type=int, default=0,
-                   help="which cabinet position stage's value map to render (0-based)")
+                   help="which position stage to render (0-based; cabinet / llm modes)")
     p.add_argument("--boxes", default=None,
                    help="workspace boxes json (default: from steering.position.boxes_path)")
     p.add_argument("--out-dir", default="outputs/value_maps")
     p.add_argument("--map-size", type=int, default=None, help="override map_size")
     p.add_argument("--quality", default="medium",
                    choices=["low", "medium", "high", "best"])
-    p.add_argument("--quiver", dest="quiver", action="store_true", default=True)
-    p.add_argument("--no-quiver", dest="quiver", action="store_false")
     p.add_argument("--show", action="store_true", help="open in browser")
     return p.parse_args()
-
-
-def _box_obj(name: str, center, size) -> dict:
-    center = np.asarray(center, dtype=np.float32)
-    size = np.asarray(size, dtype=np.float32)
-    return {
-        "name": name,
-        "_position_world": center,
-        "obb_center_world": center,
-        "obb_size": size,
-        "obb_rotation": np.eye(3, dtype=np.float32),
-        "aabb": np.stack([center - size / 2.0, center + size / 2.0]),
-    }
 
 
 def build_active_value_map(steer: dict, stage: int = 0):
@@ -94,12 +93,39 @@ def build_active_value_map(steer: dict, stage: int = 0):
     ws_max = np.asarray(pos["workspace_bounds_max"], dtype=np.float32)
     map_size = int(pos.get("map_size", 100))
 
-    # Scene wireframes for context (the real boxes), always shown.
+    # Scene wireframes for context (the real boxes), always shown. Missing
+    # boxes are skipped — a scene JSON written by the perception pipeline has
+    # semantic names, not the hand-edited box_00N ones.
     ctx = [
-        _box_obj("wine_rack", boxes[RACK]["center"], boxes[RACK]["size"]),
-        _box_obj("cabinet", boxes[CABINET]["center"], boxes[CABINET]["size"]),
-        _box_obj("underneath", boxes[UNDERNEATH]["center"], boxes[UNDERNEATH]["size"]),
+        _box_obj(label, boxes[key]["center"], boxes[key]["size"])
+        for label, key in (("wine_rack", RACK), ("cabinet", CABINET),
+                           ("underneath", UNDERNEATH))
+        if key in boxes
     ]
+
+    if place_mode == "llm":
+        # Whatever synthesize_value_map.py last wrote for this scene + task.
+        # The artifact owns its grid, so ws_min/ws_max/map_size above are
+        # replaced by the ones the maps were actually built on.
+        from clear_franka.perception import load_scene_boxes
+        from clear_franka.value_map_llm import load_stages
+
+        stages, meta = load_stages(dict(steer.get("llm", {}))["artifact_path"])
+        stage = max(0, min(stage, len(stages) - 1))
+        st = stages[stage]
+        ws_min = np.asarray(meta["workspace_bounds_min"], dtype=np.float32)
+        ws_max = np.asarray(meta["workspace_bounds_max"], dtype=np.float32)
+        ctx = []
+        if meta.get("boxes_path") and Path(meta["boxes_path"]).exists():
+            ctx = [_box_obj(b.name, b.center, b.size)
+                   for b in load_scene_boxes(meta["boxes_path"])]
+        for i, other in enumerate(stages):
+            ctx.append(_box_obj(f"stage{i}_{other.label}", other.target_world,
+                                np.array([0.03, 0.03, 0.03])))
+        print(f"task: {meta['task']!r}")
+        print(f"stage {stage} '{st.label}': affordance={st.affordance_query!r} "
+              f"avoidance={st.avoidance_query!r}")
+        return st.value_map, st.target_world, place_mode, ws_min, ws_max, ctx
 
     if place_mode == "cabinet":
         cpos = dict(steer.get("cabinet", {}).get("position", {}))
@@ -107,7 +133,15 @@ def build_active_value_map(steer: dict, stage: int = 0):
         # attractor map; mark all stage targets so the sequence is visible.
         stages_cfg = cpos.get("stages", None)
         if stages_cfg:
-            targets = [np.asarray(s["target"], dtype=np.float32) for s in stages_cfg]
+            # A stage target is either explicit coords (`target: [x,y,z]`) or a
+            # workspace box referenced by name (`target_box: box_004`) -> its
+            # center. Same resolution CombinedBoxSteering does, so the render
+            # matches what actually steers.
+            targets = [
+                np.asarray(boxes[s["target_box"]]["center"], dtype=np.float32)
+                if s.get("target_box") else np.asarray(s["target"], dtype=np.float32)
+                for s in stages_cfg
+            ]
         else:
             targets = [np.asarray(cpos["target"], dtype=np.float32)]
         stage = max(0, min(stage, len(targets) - 1))
@@ -164,52 +198,8 @@ def build_active_value_map(steer: dict, stage: int = 0):
     return vm, target_world, place_mode, ws_min, ws_max, ctx
 
 
-def _print_gradient_probes(vm, target_world) -> None:
-    """Sample the descent (= -∇cost) at points around the target; it should
-    point toward the target (and away from any avoidance region)."""
-    t = np.asarray(target_world, dtype=np.float32)
-    probes = {
-        "0.15m -x of target": t + np.array([-0.15, 0.0, 0.0], np.float32),
-        "0.15m -y of target": t + np.array([0.0, -0.15, 0.0], np.float32),
-        "0.15m below target": t + np.array([0.0, 0.0, -0.15], np.float32),
-        "0.20m -x,-z (approach)": t + np.array([-0.20, 0.0, -0.20], np.float32),
-    }
-    print(f"\nDescent sanity check (descent = -∇cost; should point toward target {np.round(t,3)}):")
-    print(f"  {'probe':<26} {'world xyz':<24} {'descent dir':<22} cos_to_target")
-    for label, pt in probes.items():
-        grad = vm.gradient_at_world_points(pt)[0]
-        descent = -grad
-        n = np.linalg.norm(descent)
-        unit = descent / n if n > 1e-9 else descent
-        to_t = t - pt
-        tn = np.linalg.norm(to_t)
-        cos = float(np.dot(unit, to_t / tn)) if (n > 1e-9 and tn > 1e-9) else 0.0
-        print(f"  {label:<26} {np.array2string(pt, precision=2):<24} "
-              f"{np.array2string(unit, precision=2):<22} {cos:+.2f}")
-
-
-def _add_descent_quiver(fig, vm, stride: int = 12) -> None:
-    import plotly.graph_objects as go
-
-    M = vm.map_size
-    ws_min, ws_max = vm.workspace_bounds_min, vm.workspace_bounds_max
-    idx = np.arange(0, M, stride)
-    ii, jj, kk = np.meshgrid(idx, idx, idx, indexing="ij")
-    vox = np.stack([ii.ravel(), jj.ravel(), kk.ravel()], axis=-1).astype(np.float32)
-    world = vox / (M - 1) * (ws_max - ws_min) + ws_min
-    descent = -vm.gradient_at_world_points(world)
-    mag = np.linalg.norm(descent, axis=1)
-    keep = mag > (mag.max() * 0.05 if mag.max() > 0 else np.inf)
-    world, descent = world[keep], descent[keep]
-    fig.add_trace(go.Cone(
-        x=world[:, 0], y=world[:, 1], z=world[:, 2],
-        u=descent[:, 0], v=descent[:, 1], w=descent[:, 2],
-        sizemode="scaled", sizeref=2.0, anchor="tail",
-        colorscale="Blues", showscale=False, opacity=0.6, name="descent",
-    ))
-
-
 def main() -> int:
+    _utf8_stdout()
     args = _parse_args()
     from voxposer.visualizer import ValueMapVisualizer
 
@@ -234,10 +224,7 @@ def main() -> int:
     })
     fig = viz.visualize(vm, objects=ctx, save=True, show=False, filename="place")
 
-    if args.quiver:
-        _add_descent_quiver(fig, vm)
-        fig.write_html(str(out_dir / "place.html"))
-        fig.write_html(str(out_dir / "latest.html"))
+    fig.write_html(str(out_dir / "latest.html"))
 
     if args.show:
         fig.show()

@@ -1,0 +1,82 @@
+# You build a 3D voxel grid marking WHERE the gripper SHOULD go. High values
+# attract; the grid becomes a gradient field pulling the diffusion policy's
+# predicted trajectory toward that region while it denoises.
+#
+# World frame is the robot base frame (fr3_link0), metres:
+#     +x  away from the robot base, out across the table
+#     +y  to the robot's left
+#     +z  up
+# An object's -x face is the one the robot reaches toward first ("in front of"
+# it); "above" is +z; "to the left of" is +y. All centimetre offsets go through
+# cm2index(cm, axis) to become voxel index offsets.
+#
+# Available helpers:
+#     parse_query_obj(name) -> object with .position (voxel [x,y,z]),
+#                              .aabb ([[min_x,min_y,min_z],[max_x,max_y,max_z]],
+#                              voxel indices), .obb_size / .obb_center_world
+#     get_empty_affordance_map(), set_voxel_by_radius(map, pos, radius_cm, value),
+#     set_voxel_by_box(map, obj, value, pad_cm), cm2index(cm, axis)
+#
+# Prefer a SINGLE voxel (or a small radius) for a point target. The map is
+# expanded by a distance transform later, and the gradient points at the
+# NEAREST marked voxel — so a wide seed pulls only weakly along its own long
+# axis, while a compact seed pulls toward its centre from everywhere. Fill a
+# whole box only when the target really is a volume.
+#
+# Assign the grid to `ret_val`. Emit only code.
+
+# Query: a point at the center of the block.
+affordance_map = get_empty_affordance_map()
+block = parse_query_obj('block')
+x, y, z = block.position
+affordance_map[x, y, z] = 1
+ret_val = affordance_map
+
+# Query: a point 8cm in front of the center of the wine rack.
+# "In front of" = toward the robot = the -x side, so subtract from min_x.
+affordance_map = get_empty_affordance_map()
+wine_rack = parse_query_obj('wine rack')
+(min_x, min_y, min_z), (max_x, max_y, max_z) = wine_rack.aabb
+center_x, center_y, center_z = wine_rack.position
+x = min_x - cm2index(8, 'x')
+y = center_y
+z = center_z
+affordance_map[x, y, z] = 1
+ret_val = affordance_map
+
+# Query: a point 3cm above the center of the shelf top surface.
+affordance_map = get_empty_affordance_map()
+shelf = parse_query_obj('shelf')
+(min_x, min_y, min_z), (max_x, max_y, max_z) = shelf.aabb
+center_x, center_y, center_z = shelf.position
+x = center_x
+y = center_y
+z = max_z + cm2index(3, 'z')
+affordance_map[x, y, z] = 1
+ret_val = affordance_map
+
+# Query: a point 10cm to the left of the mug.
+# Left = +y, so add to max_y. Mirror to subtract from min_y for "to the right".
+affordance_map = get_empty_affordance_map()
+mug = parse_query_obj('mug')
+(min_x, min_y, min_z), (max_x, max_y, max_z) = mug.aabb
+center_x, center_y, center_z = mug.position
+x = center_x
+y = max_y + cm2index(10, 'y')
+z = center_z
+affordance_map[x, y, z] = 1
+ret_val = affordance_map
+
+# Query: anywhere within 4cm of the drawer handle.
+affordance_map = get_empty_affordance_map()
+drawer_handle = parse_query_obj('drawer handle')
+set_voxel_by_radius(affordance_map, drawer_handle.position, radius_cm=4, value=1)
+ret_val = affordance_map
+
+# Query: all voxels inside the shelf.
+affordance_map = get_empty_affordance_map()
+shelf = parse_query_obj('shelf')
+set_voxel_by_box(affordance_map, shelf, value=1)
+ret_val = affordance_map
+
+# Query:

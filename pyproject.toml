@@ -29,7 +29,10 @@ camera = [
 [tool.uv.sources]
 zero-franky = { path = "../zero_franky", editable = true }
 pyzed = { url = "https://download.stereolabs.com/zedsdk/5.2/whl/linux_x86_64/pyzed-5.2-cp312-cp312-linux_x86_64.whl" }
-franky-control = { url = "https://github.com/nickswalker/franky/releases/download/wheels-libfranka-0.21.1/franky_control-1.1.3+impedance.libfranka.0.21.1-cp312-cp312-manylinux_2_28_x86_64.whl" }
+# Upstream deleted the `wheels-libfranka-0.21.1` release; the 1.1.x `+impedance` fork
+# wheels are gone and upstream now ships 2.x (fork-dev) built against libfranka 0.21.2.
+# Vendored because the upstream release tags are rolling and get their assets replaced.
+franky-control = { path = "wheels/franky_control-2.0.1.dev8+gdd693b0f.libfranka.0.21.2-cp312-cp312-manylinux_2_28_x86_64.whl" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]

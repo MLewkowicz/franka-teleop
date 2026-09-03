@@ -26,7 +26,7 @@ def main(cfg: DictConfig):
     from zero_franky import Robot, setup_zero_franky
     from franky import JointMotion, JointState
 
-    setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port, pub_port=cfg.zero_franky.pub_port)
+    setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port)
 
     robot = Robot(cfg.robot.ip)
 

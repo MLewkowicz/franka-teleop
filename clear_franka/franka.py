@@ -143,15 +143,19 @@ def joint_friction_kwargs(cfg) -> dict:
     if not friction_cfg or not friction_cfg.get("enabled", False):
         return {}
 
-    kwargs = {
-        "friction_coulomb": [float(v) for v in friction_cfg.coulomb],
-        "friction_viscous": [float(v) for v in friction_cfg.viscous],
+    # franky takes friction as one FrictionCompensationParams; unset fields keep
+    # its defaults (max_torque 1.0 Nm/joint, velocity_epsilon 0.03).
+    from franky import FrictionCompensationParams
+
+    params = {
+        "coulomb": [float(v) for v in friction_cfg.coulomb],
+        "viscous": [float(v) for v in friction_cfg.viscous],
     }
     if friction_cfg.get("max_torque") is not None:
-        kwargs["friction_max_torque"] = [float(v) for v in friction_cfg.max_torque]
+        params["max_torque"] = [float(v) for v in friction_cfg.max_torque]
     if friction_cfg.get("velocity_epsilon") is not None:
-        kwargs["friction_velocity_epsilon"] = float(friction_cfg.velocity_epsilon)
-    return kwargs
+        params["velocity_epsilon"] = float(friction_cfg.velocity_epsilon)
+    return {"friction": FrictionCompensationParams(**params)}
 
 
 def desk_credentials(

@@ -2,8 +2,7 @@ mode: teleop  # teleop or replay
 
 zero_franky:
   ip: "172.16.0.1"
-  port: 18812
-  pub_port: 18813
+  port: 18812  # RPC; state PUB is port+1, tracker port+2 (derived by zero_franky)
 
 robot:
   ip: "172.16.0.2"
@@ -34,7 +33,7 @@ demonstrate:
   # Reset/home pose CROSS returns to (and the default Cartesian nullspace posture).
   # Resolution order: home_configs[<mode_title>] > reset_joint_config > teleop.reset_joint_config.
   # Capture joint angles for a desired pose with `python capture_home_config.py`.
-  reset_joint_config: null   # demonstrate-wide override: [j0,...,j6], or null
+  reset_joint_config: [0.249339, -0.199937, -0.391007, -2.437545, -0.078345, 2.240440, 0.001707]   # demonstrate-wide override: [j0,...,j6], or null
   home_configs: null         # per-mode_title map, e.g. {right: [j0,...,j6], top_down: [...]}, or null
   joint_stiffness: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
   joint_friction:
@@ -75,6 +74,25 @@ cameras:
     fps: 30
     depth_mode: PERFORMANCE
     extrinsics_path: "/home/clear/franka-teleop/data/extrinsics_hand.json"
+
+# Text-prompted 3D perception for value-map synthesis (synthesize_value_map.py).
+# Offline only — nothing here is loaded by the deploy control path.
+perception:
+  sam3_checkpoint: "/home/clear/franka-teleop/checkpoints/sam3.pt"
+  # The sam3 wheel does not ship its text-encoder vocabulary — its default path
+  # only exists in a source checkout — so point at our own copy of the standard
+  # CLIP BPE vocab. Without this, model construction dies before loading weights.
+  bpe_path: "/home/clear/franka-teleop/checkpoints/bpe_simple_vocab_16e6.txt.gz"
+  confidence: 0.1             # minimum detection score
+  depth_mode: NEURAL          # SVO playback depth; NEURAL_LIGHT if VRAM is tight
+
+# LLM that turns the task + detected boxes into value maps. The API key is NOT
+# here — it comes from the environment (OPENAI_API_KEY / ANTHROPIC_API_KEY),
+# which is what the SDKs read and what keeps it out of git.
+value_map_llm:
+  provider: openai            # openai | anthropic
+  model: gpt-5.4-mini
+  cache_dir: cache/value_map_llm   # responses are cached by (model, prompt)
 
 gripper:
   enabled: true
@@ -159,6 +177,17 @@ deploy:
   # [] = the policy drives the gripper everywhere (follow policy outputs).
   # [0, 1] = both grasp and place manual; [1] = only place manual.
   manual_gripper_stages: []
+  # Auto-advance grasp(0)->place(1) once the gripper confirms closure
+  # (Robotiq object_detection) instead of waiting for a RIGHT tap. RIGHT tap
+  # still works as a manual override at any time.
+  gate_place_on_grasp: true
+  grasp_gate_poll_hz: 15          # object_detection() poll rate while waiting for grasp-close confirmation.
+  grasp_gate_timeout_s: 3.0       # advance anyway (with a warning) if no terminal state arrives in time.
+  # Skip the TELEOP wait-for-button-tap at startup and enter INFERENCE (grasp,
+  # stage 0) immediately once setup completes. For headless runs with no
+  # SpaceMouse. grasp->place still auto-advances via gate_place_on_grasp;
+  # Ctrl-C (or the kill key, if record_trajectory=true) is still how you stop.
+  auto_start_inference: false
   max_linear_vel_m_s: 0.03                      # Open-loop retime speed limit for Cartesian translation.
   max_angular_vel_rad_s: 0.25                   # Open-loop retime speed limit for Cartesian orientation.
   # ---- Host-side terminal-convergence aids (feat/cartesian-integral-ff) ----
@@ -237,8 +266,26 @@ deploy:
     #             below: target_euler, rot_reverse_direction, position).
     #   cabinet — mode A: place the glass UPRIGHT into the cabinet (the `cabinet:`
     #             block further down overrides the rotation target + position).
+    #   llm     — value maps synthesized offline from a task string + the SAM 3
+    #             scene boxes, loaded from `llm.artifact_path` (see the `llm:`
+    #             block below and synthesize_value_map.py). Rotation still comes
+    #             from target_euler here.
     # Switch with this one line; the inactive mode's params are preserved.
     place_mode: cabinet
+    # --- place_mode: llm ----------------------------------------------------
+    # Built by:
+    #   uv run python synthesize_value_map.py --task "..." \
+    #       --objects "wine rack,cabinet" --source live
+    # The artifact carries its own grid bounds and map_size (derived from the
+    # detected scene), so `position.workspace_bounds_*` / `position.map_size`
+    # are IGNORED in this mode — the maps and the coordinate transform have to
+    # index the same grid. Everything else (guidance_strength, delta_norm_cap,
+    # distance ramp, diag logging) falls back to the `position:` block below
+    # unless overridden here.
+    llm:
+      artifact_path: "data/value_maps/place.npz"
+      # guidance_strength: 0.35
+      # delta_norm_cap: 0.04
     # Absolute target orientation, Euler XYZ radians, SAME convention as
     # obs.ee_pose[3:6] (ee_rot_to_euler_xyz). Inverted-place value from the
     # mode-B demos; refine by jogging to the inverted pose and reading ee euler.

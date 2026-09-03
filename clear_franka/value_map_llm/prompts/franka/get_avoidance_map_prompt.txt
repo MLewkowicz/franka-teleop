@@ -1,0 +1,42 @@
+# You build a 3D voxel grid marking WHERE the gripper SHOULD NOT go. High
+# values repel: the grid pushes the diffusion policy's predicted trajectory
+# away from those regions while it denoises. Counterpart of the affordance map.
+#
+# Same world frame and helpers as the affordance map: fr3_link0 metres, +x away
+# from the robot base, +y left, +z up; get_empty_avoidance_map(),
+# set_voxel_by_radius, set_voxel_by_box, cm2index, parse_query_obj.
+#
+# Fill the obstacle's actual volume — set_voxel_by_box for a box-shaped fixture,
+# set_voxel_by_radius for a keep-out sphere around a small object. The field is
+# blurred afterwards, so the repulsion already fades with distance; use pad_cm
+# rather than an inflated radius when you just want clearance.
+#
+# Assign the grid to `ret_val`. Emit only code.
+
+# Query: everything inside the cabinet.
+avoidance_map = get_empty_avoidance_map()
+cabinet = parse_query_obj('cabinet')
+set_voxel_by_box(avoidance_map, cabinet, value=1)
+ret_val = avoidance_map
+
+# Query: the cabinet, with 3cm of clearance.
+avoidance_map = get_empty_avoidance_map()
+cabinet = parse_query_obj('cabinet')
+set_voxel_by_box(avoidance_map, cabinet, value=1, pad_cm=3)
+ret_val = avoidance_map
+
+# Query: within 10cm of the mug.
+avoidance_map = get_empty_avoidance_map()
+mug = parse_query_obj('mug')
+set_voxel_by_radius(avoidance_map, mug.position, radius_cm=10, value=1)
+ret_val = avoidance_map
+
+# Query: the shelf and everything under it.
+avoidance_map = get_empty_avoidance_map()
+shelf = parse_query_obj('shelf')
+set_voxel_by_box(avoidance_map, shelf, value=1)
+(min_x, min_y, min_z), (max_x, max_y, max_z) = shelf.aabb
+avoidance_map[min_x:max_x + 1, min_y:max_y + 1, 0:min_z + 1] = 1
+ret_val = avoidance_map
+
+# Query:

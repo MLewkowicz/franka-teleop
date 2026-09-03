@@ -273,14 +273,12 @@ def run_teleop(cfg: DictConfig):
             left_press_time = None
             left_used_in_record = False
 
-            session = robot.start_cartesian_impedance_session(
+            session = robot.start_cartesian_impedance_tracker(
                 period=0.001,
                 translational_stiffness=tc.translational_stiffness,
                 rotational_stiffness=tc.rotational_stiffness,
-                nullspace_tasks=[
-                    PostureTask(nullspace_target, stiffness=tc.nullspace_stiffness),
-                    ManipulabilityTask(gain=5.0, max_torque=1.0),
-                ],
+                posture_task=PostureTask(nullspace_target, stiffness=tc.nullspace_stiffness),
+                manipulability_task=ManipulabilityTask(gain=5.0, max_torque=1.0),
                 lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
                 upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
             )
@@ -411,12 +409,12 @@ def run_teleop(cfg: DictConfig):
                                 w_world = base_rot @ w
 
                             try:
-                                session.set_cartesian_reference(
+                                session.set_target(
                                     Affine(pack_Rp(target_rot, target_pos)),
                                     Twist(v_world, w_world),
                                 )
                             except Exception as exc:
-                                print(f"\n  [tracker] set_cartesian_reference failed: {exc}")
+                                print(f"\n  [tracker] set_target failed: {exc}")
 
                         recorder.step(
                             ee_pos=robot_pos,

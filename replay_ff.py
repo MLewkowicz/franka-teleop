@@ -126,7 +126,7 @@ def play_joint_trajectory(
         **motion_kwargs,
     }
 
-    with robot.start_joint_impedance_session(policy, **session_kwargs) as session:
+    with robot.start_joint_impedance_tracker(policy, **session_kwargs) as session:
         step = 0
         replay_start = None
         last_status_check = time.monotonic()
@@ -152,7 +152,7 @@ def play_joint_trajectory(
 
             if elapsed >= timestamps[-1]:
                 print("  Replay complete.")
-                session.set_joint_reference(joint_pos[-1].tolist())
+                session.set_target(joint_pos[-1].tolist())
                 break
 
             if gripper is not None and np.isfinite(gripper_open_data[step]):

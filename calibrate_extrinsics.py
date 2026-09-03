@@ -348,7 +348,7 @@ def _capture_kinesthetic(robot, camera, joint_stiffnesses, cal, detector, board,
         Q     — abort
     """
 
-    with robot.start_joint_impedance_session(
+    with robot.start_joint_impedance_tracker(
         hold_current_joint,
         period=0.001,
         stiffness=joint_stiffnesses,
@@ -438,8 +438,8 @@ def _demonstration_joint_friction_kwargs(cfg: DictConfig) -> dict:
     if kwargs:
         logger.info(
             "Using demonstrate.joint_friction for calibration: coulomb=%s viscous=%s",
-            kwargs["friction_coulomb"],
-            kwargs["friction_viscous"],
+            kwargs["friction"].coulomb,
+            kwargs["friction"].viscous,
         )
     else:
         logger.info("Joint friction compensation disabled for calibration.")

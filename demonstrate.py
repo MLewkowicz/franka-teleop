@@ -20,7 +20,7 @@ from franky import (
     ManipulabilityTask,
     PilotButton,
     PostureTask,
-    RobotWebSession,
+    DeskWebSession,
 )
 from omegaconf import DictConfig
 
@@ -301,7 +301,7 @@ def run_demonstrate(cfg: DictConfig):
         if gripper is not None:
             stack.enter_context(gripper)
         stack.enter_context(recorder)
-        web = stack.enter_context(RobotWebSession(hostname, username, password, token_storage=True))
+        web = stack.enter_context(DeskWebSession(hostname, username, password, token_storage=True))
         stack.callback(loop_rate.newline)
 
         while True:
@@ -344,21 +344,22 @@ def run_demonstrate(cfg: DictConfig):
                 # the nullspace PostureTask + ManipulabilityTask + joint limits stay
                 # at replay-faithful values so the redundancy resolves the same way it
                 # will when the recorded demo is replayed at higher main-task stiffness.
-                nullspace_tasks = [ManipulabilityTask(gain=5.0, max_torque=1.0)]
-                if cart_nullspace_target is not None:
-                    nullspace_tasks.insert(
-                        0, PostureTask(cart_nullspace_target, stiffness=cart_nullspace_stiffness)
-                    )
-                session = robot.start_cartesian_impedance_session(
+                cart_posture_task = (
+                    None
+                    if cart_nullspace_target is None
+                    else PostureTask(cart_nullspace_target, stiffness=cart_nullspace_stiffness)
+                )
+                session = robot.start_cartesian_impedance_tracker(
                     period=period,
                     translational_stiffness=cart_trans_stiffness,
                     rotational_stiffness=cart_rot_stiffness,
-                    nullspace_tasks=nullspace_tasks,
+                    posture_task=cart_posture_task,
+                    manipulability_task=ManipulabilityTask(gain=5.0, max_torque=1.0),
                     lower_joint_limits=DEFAULT_LOWER_JOINT_LIMITS,
                     upper_joint_limits=DEFAULT_UPPER_JOINT_LIMITS,
                 )
             else:
-                session = robot.start_joint_impedance_session(
+                session = robot.start_joint_impedance_tracker(
                     hold_current_joint,
                     period=period,
                     stiffness=[float(v) for v in joint_stiffness],
@@ -451,10 +452,10 @@ def run_demonstrate(cfg: DictConfig):
                         # Reference = measured pose → zero stiffness error → EE floats
                         # for hand-guiding; nullspace tasks keep shaping the joints.
                         try:
-                            session.set_cartesian_reference(Affine(measured_pose))
+                            session.set_target(Affine(measured_pose))
                         except Exception as exc:
                             loop_rate.newline()
-                            print(f"  [tracker] set_cartesian_reference failed: {exc}")
+                            print(f"  [tracker] set_target failed: {exc}")
 
                     if visualizer is not None:
                         visualizer.update(joint_pos)
@@ -499,7 +500,7 @@ def run_demonstrate(cfg: DictConfig):
 def main(cfg: DictConfig):
     from zero_franky import setup_zero_franky
 
-    setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port, pub_port=cfg.zero_franky.pub_port)
+    setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port)
     run_demonstrate(cfg)
 
 

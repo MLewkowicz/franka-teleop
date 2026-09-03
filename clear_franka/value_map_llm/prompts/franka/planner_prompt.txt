@@ -1,0 +1,71 @@
+# You decide where a robot arm should end up to carry out one instruction.
+#
+# You are given the task and a table of the objects a segmentation model found,
+# as axis-aligned boxes in the robot base frame (fr3_link0, metres):
+#     +x  away from the robot base, out across the table
+#     +y  to the robot's left
+#     +z  up
+# So the face of an object the robot reaches toward first is its -x face, and
+# "above" is +z.
+#
+# The policy already knows how to reach for, grasp and release the object. Your
+# stage covers only the DESTINATION half of the instruction: where the object
+# ends up. For "put the mug on the shelf" that is the shelf, not the mug.
+#
+# Emit ONE stage, as `ret_val = {...}`:
+#     'affordance'        where the gripper should end up, in plain language.
+#                         This becomes the region the policy is pulled toward.
+#     'avoidance'         a THIRD object physically in the way, or None.
+#     'arrival_radius_cm' how close the gripper gets before steering hands back
+#                         to the policy. 5-10 is typical; use the smaller end
+#                         when the target must be hit precisely.
+#     'label'             a couple of words, for logs.
+#
+# Rules:
+#   * Exactly ONE stage. No approach-then-place pairs -- the pull is a smooth
+#     field, so a single target already draws the arm in from wherever it is.
+#   * 'avoidance' is almost always None. NEVER avoid the object you are moving
+#     toward, and NEVER avoid the object the gripper is carrying -- both would
+#     push the arm away from its own goal. Use it only when some other object
+#     sits between the arm and the destination.
+#   * Aim where the OBJECT must go, offset so the gripper clears the
+#     destination. For a container ("in the bowl", "in the plate"), aim a few cm
+#     above its rim -- the rim is the box's max z, not its centre. For a flat
+#     surface ("on the shelf", "on the table"), aim just above the top face.
+#   * Only name objects that appear in the scene table.
+#   * Emit ONLY the assignment. No commentary, no markdown.
+
+# Scene (frame = fr3_link0, metres; +x away from the robot base, +y left, +z up)
+#   shelf: center=[0.720, 0.100, 0.500] size=[0.300, 0.400, 0.060] x=[0.570, 0.870] y=[-0.100, 0.300] z=[0.470, 0.530]
+#   mug: center=[0.500, -0.200, 0.100] size=[0.080, 0.080, 0.100] x=[0.460, 0.540] y=[-0.240, -0.160] z=[0.050, 0.150]
+# Query: put the mug on the shelf.
+ret_val = {
+    'affordance': 'a point 3cm above the center of the shelf top surface',
+    'avoidance': None,
+    'arrival_radius_cm': 6,
+    'label': 'place on shelf',
+}
+
+# Scene (frame = fr3_link0, metres; +x away from the robot base, +y left, +z up)
+#   bowl: center=[0.640, 0.180, 0.430] size=[0.180, 0.180, 0.070] x=[0.550, 0.730] y=[0.090, 0.270] z=[0.395, 0.465]
+#   spoon: center=[0.520, -0.150, 0.410] size=[0.150, 0.030, 0.020] x=[0.445, 0.595] y=[-0.165, -0.135] z=[0.400, 0.420]
+# Query: put the spoon in the bowl.
+ret_val = {
+    'affordance': 'a point 4cm above the rim of the bowl, centered on the bowl',
+    'avoidance': None,
+    'arrival_radius_cm': 5,
+    'label': 'place in bowl',
+}
+
+# Scene (frame = fr3_link0, metres; +x away from the robot base, +y left, +z up)
+#   wine_rack: center=[0.755, -0.166, 0.520] size=[0.280, 0.103, 0.055] x=[0.615, 0.895] y=[-0.218, -0.115] z=[0.493, 0.548]
+#   cabinet: center=[0.680, 0.340, 0.600] size=[0.200, 0.510, 0.070] x=[0.580, 0.780] y=[0.085, 0.595] z=[0.565, 0.635]
+# Query: hang the wine glass upside down on the wine rack.
+ret_val = {
+    'affordance': 'a point 8cm in front of the center of the wine rack',
+    'avoidance': 'everything inside the cabinet',
+    'arrival_radius_cm': 8,
+    'label': 'place on rack',
+}
+
+# Query:

@@ -1,5 +1,6 @@
 outputs/
 data/
+cache/
 __pycache__/
 *.swp
 *.pyc
