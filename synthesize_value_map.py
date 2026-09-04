@@ -1,10 +1,12 @@
 """Task + object list -> SAM 3 boxes in the world frame -> LLM value maps.
 
-The offline half of the steering pipeline. Nothing here runs on the robot: it
-captures a scene, segments the objects you name, fits their bounding boxes in
-the Franka base frame, asks an LLM to turn the task into steering stages over
-those boxes, and writes a .npz that `deploy_diffuser_actor.py` loads with
-`deploy.steering.place_mode=llm`.
+The offline half of the steering pipeline, for inspecting/tuning a task +
+object prompt before deploying. Nothing here runs on the robot: it captures a
+scene, segments the objects you name, fits their bounding boxes in the Franka
+base frame, and asks an LLM to turn the task into a steering stage over those
+boxes. `deploy_diffuser_actor.py` does NOT read this script's artifact — at
+launch it runs the equivalent of this pipeline itself, live, from
+`deploy.task.instruction` / `deploy.task.objects`.
 
 Run it with the LangSteer interpreter, NOT `uv run` — like the deploy, this
 needs torch/plotly/sam3, which live in LangSteer's venv, not franka-teleop's:
@@ -48,24 +50,15 @@ from omegaconf import OmegaConf  # noqa: E402
 
 from clear_franka.geometry import load_T_cam2base  # noqa: E402
 from clear_franka.perception import (  # noqa: E402
-    Sam3Segmenter,
     SvoSource,
     ZedLiveSource,
-    collect_frames,
-    detections_to_scene_boxes,
-    frame_to_world_cloud,
-    label_scene_image,
+    capture_scene_boxes,
     load_scene_boxes,
     load_scene_cloud,
     load_scene_image,
-    match_boxes_to_frame_detections,
-    save_scene_boxes,
-    save_scene_cloud,
-    save_scene_image,
 )
 from clear_franka.value_map_llm import (  # noqa: E402
-    save_stages,
-    synthesize_value_maps,
+    synthesize_and_save,
     workspace_bounds_from_boxes,
 )
 from clear_franka.value_map_viz import (  # noqa: E402
@@ -235,45 +228,27 @@ def capture_boxes(args, cfg):
         source = ZedLiveSource(camera)
 
     try:
-        frames = collect_frames(source, args.frames, skip=args.skip_frames)
-        logger.info("captured %d frame(s) from %s", len(frames), args.source)
-        segmenter = Sam3Segmenter(
-            checkpoint, classes, confidence=confidence, bpe_path=bpe_path
-        )
-        per_frame = [(segmenter.detect(f.rgb), f.xyz) for f in frames]
         K = source.intrinsics
+        boxes, cloud, labeled_image = capture_scene_boxes(
+            source, classes, T_cam2base,
+            sam3_checkpoint=checkpoint,
+            confidence=confidence,
+            bpe_path=bpe_path,
+            max_per_label=args.max_per_label,
+            frames=args.frames,
+            skip_frames=args.skip_frames,
+            boxes_out=args.boxes_out,
+            cloud_out=args.cloud_out,
+            cloud_points=args.cloud_points,
+            image_out=args.image_out,
+        )
     finally:
         source.close()
         if camera is not None:
             camera.close()
 
-    boxes = detections_to_scene_boxes(
-        per_frame, T_cam2base, max_per_label=args.max_per_label
-    )
-    if not boxes:
-        raise SystemExit(
-            f"no objects detected for {classes} — lower --confidence, check the "
-            "camera view, or rename the prompts"
-        )
-    save_scene_boxes(args.boxes_out, boxes)
-
-    cloud = frame_to_world_cloud(
-        frames[-1].xyz, frames[-1].rgb, T_cam2base, max_points=args.cloud_points
-    )
-    save_scene_cloud(args.cloud_out, *cloud)
-
-    # Label the last frame with each box's own SAM footprint (not a reprojected
-    # 3D box) so the planner can tell which physical object in the photo is
-    # 'bowl' vs 'bowl_2' -- the box table's world-frame numbers alone give it
-    # no way to make that correspondence.
-    matches = match_boxes_to_frame_detections(
-        boxes, per_frame[-1][0], args.max_per_label
-    )
-    labeled_image = label_scene_image(frames[-1].rgb, matches)
-    save_scene_image(args.image_out, labeled_image)
-
     if args.viser:
-        _serve_viser(cloud, boxes, rgb=frames[-1].rgb, K=K, T_cam2base=T_cam2base)
+        _serve_viser(cloud, boxes, rgb=labeled_image, K=K, T_cam2base=T_cam2base)
     return boxes, cloud, labeled_image
 
 
@@ -375,9 +350,10 @@ def main() -> int:
                 np.array2string(ws_min, precision=2),
                 np.array2string(ws_max, precision=2))
 
-    stages = synthesize_value_maps(
+    artifact, stages = synthesize_and_save(
         args.task,
         boxes,
+        Path(args.artifact_dir) / f"{args.name}.npz",
         workspace_bounds_min=ws_min,
         workspace_bounds_max=ws_max,
         map_size=args.map_size,
@@ -385,15 +361,7 @@ def main() -> int:
         obstacle_sigma=args.obstacle_sigma,
         workspace_image=workspace_image,
         llm=llm,
-    )
-
-    artifact = save_stages(
-        Path(args.artifact_dir) / f"{args.name}.npz",
-        stages,
-        task=args.task,
         boxes_path=str(boxes_path),
-        avoidance_weight=args.avoidance_weight,
-        obstacle_sigma=args.obstacle_sigma,
     )
 
     overlays = [box_overlay(b.name, b.center, b.size) for b in boxes]
@@ -421,9 +389,12 @@ def main() -> int:
 
     print(f"\nArtifact : {artifact}")
     print(f"Plots    : {Path(args.out_dir)}/{args.name}_stage*.html")
-    print("\nTo steer with it:")
-    print("  deploy.steering.place_mode=llm "
-          f"deploy.steering.llm.artifact_path={artifact}")
+    print(
+        "\nThis is for offline inspection/tuning of the task + object prompts "
+        "-- deploy_diffuser_actor.py synthesizes its own artifact fresh at "
+        "launch from deploy.task.instruction / deploy.task.objects, it does "
+        "not read this file."
+    )
     return 0
 
 

@@ -296,65 +296,106 @@ def _build_policy(deploy_cfg: DictConfig):
     return policy, bool(policy_cfg.get("relative", False)), policy_loc_bounds, policy_home
 
 
-def _build_steering(deploy_cfg: DictConfig, policy, policy_relative, policy_loc_bounds):
-    """Build the optional steering module and wire its schedulers.
+# Scratch hand-off file between _synthesize_llm_value_map (writer) and
+# PositionFieldSteering (reader, via clear_franka.value_map_llm.load_stages) —
+# not a config knob: it's overwritten fresh on every launch that steers.
+_LLM_VALUE_MAP_ARTIFACT = "data/value_maps/place.npz"
+
+
+def _build_steering(cfg: DictConfig, policy, policy_relative, policy_loc_bounds, cam_tp):
+    """Build the task-driven position steering module, or None.
+
+    Steering is gated entirely by deploy.task.instruction: unset -> no
+    steering at all (this is the baseline/no-steering switch). Set -> a fresh
+    LLM value map is synthesized from a live scene capture (see
+    _synthesize_llm_value_map) and one PositionFieldSteering module steers
+    position toward the synthesized target during the place stage. There is
+    no rotation steering — the planner LLM only ever synthesizes a position
+    target (the base policy handles grasp/release orientation), so there is
+    no per-task orientation target to hand-specify; the policy is fully in
+    control of rotation.
 
     Returns (steering, steer_stage_indices). Disabled -> (None, set()).
-    Enabled via a `deploy.steering` block with enabled=true and a target_euler.
-
-    Rotation steering pulls the predicted EE rotation toward a fixed absolute
-    orientation (the inverted-wrist place); it works at the trained 25-step
-    regime because guidance actively biases the denoiser, not the sampling noise.
-
-    When `steering.position.enabled` is also true, a `CombinedBoxSteering` is
-    built instead: it keeps that rotation steering and adds a positional branch
-    driven by hardcoded value maps over the workspace boxes (pulls toward the
-    wine rack, pushes off the cabinet / the volume beneath it). The position
-    branch needs the policy's gripper_loc_bounds + relative flag to map the
-    predicted (relative, normalized) positions into the value map's world frame,
-    so they are merged into the cfg here.
     """
-    steer_cfg = deploy_cfg.get("steering", None)
-    if not steer_cfg or not steer_cfg.get("enabled", False):
+    deploy_cfg = cfg.deploy
+    task_cfg = deploy_cfg.get("task", None)
+    if not task_cfg or not task_cfg.get("instruction"):
         return None, set()
 
+    steer_cfg = deploy_cfg.get("steering", {}) or {}
     container = OmegaConf.to_container(steer_cfg, resolve=True)
+    container["relative"] = bool(policy_relative)
+    container["gripper_loc_bounds"] = (
+        policy_loc_bounds.tolist() if policy_loc_bounds is not None else None
+    )
 
-    # Resolve place_mode → effective rotation target/direction on the container
-    # BEFORE building either steering class. The cabinet (mode A, upright) block
-    # overrides the rack (mode B, inverted) defaults that live at the top level.
-    # Doing it here — not just inside CombinedBoxSteering — means the rotation
-    # steers to the right placement even when position steering is disabled and
-    # only the plain TargetRotationSteering is built (it reads the top-level
-    # target_euler and knows nothing about place_mode).
-    if str(container.get("place_mode", "rack")).lower() == "cabinet":
-        cab = container.get("cabinet", {}) or {}
-        if cab.get("target_euler") is not None:
-            container["target_euler"] = cab["target_euler"]
-        container["rot_reverse_direction"] = bool(cab.get("rot_reverse_direction", False))
-        if cab.get("guidance_strength") is not None:
-            container["guidance_strength"] = cab["guidance_strength"]
+    _synthesize_llm_value_map(cfg, cam_tp, _LLM_VALUE_MAP_ARTIFACT)
+    container["llm"] = {
+        **container.get("llm", {}), "artifact_path": _LLM_VALUE_MAP_ARTIFACT,
+    }
 
-    pos_cfg = steer_cfg.get("position", None)
-    if pos_cfg and pos_cfg.get("enabled", False):
-        from clear_franka.box_field_steering import CombinedBoxSteering
+    from clear_franka.box_field_steering import PositionFieldSteering
 
-        container["relative"] = bool(policy_relative)
-        container["gripper_loc_bounds"] = (
-            policy_loc_bounds.tolist() if policy_loc_bounds is not None else None
-        )
-        steering = CombinedBoxSteering(container)
-    else:
-        from steering.target_rotation import TargetRotationSteering
-
-        steering = TargetRotationSteering(container)
-
-    # alpha_bar for the Tweedie x0 estimate comes from the schedulers.
-    steering.set_rotation_scheduler(policy._model.rotation_noise_scheduler)
+    steering = PositionFieldSteering(container)
+    # alpha_bar for the Tweedie x0 estimate comes from the scheduler.
     steering.set_position_scheduler(policy._model.position_noise_scheduler)
     # Which stage indices to steer; default = place stage only (idx 1).
     stages = steer_cfg.get("stage_indices", [1])
     return steering, {int(s) for s in stages}
+
+
+def _synthesize_llm_value_map(cfg: DictConfig, cam_tp, artifact_path: str) -> None:
+    """Capture the scene from cam_tp and synthesize a fresh LLM value map
+    for deploy.task.instruction, overwriting artifact_path in place."""
+    from clear_franka.geometry import load_T_cam2base
+    from clear_franka.perception import ZedLiveSource, capture_scene_boxes
+    from clear_franka.value_map_llm import synthesize_and_save
+
+    task_cfg = cfg.deploy.task
+    instruction = str(task_cfg.instruction)
+    objects = list(task_cfg.get("objects", []))
+    if not objects:
+        raise RuntimeError(
+            "deploy.task.instruction is set but deploy.task.objects is empty"
+        )
+
+    cam_cfg = cfg.cameras[task_cfg.get("camera", "third_person")]
+    T_cam2base = load_T_cam2base(cam_cfg.extrinsics_path)
+    pcfg = cfg.get("perception", {})
+
+    source = ZedLiveSource(cam_tp, use_stream=False)
+    try:
+        boxes, cloud, workspace_image = capture_scene_boxes(
+            source, objects, T_cam2base,
+            sam3_checkpoint=pcfg.get("sam3_checkpoint"),
+            confidence=float(pcfg.get("confidence", 0.5)),
+            bpe_path=pcfg.get("bpe_path"),
+            max_per_label=int(task_cfg.get("max_per_label", 2)),
+            frames=int(task_cfg.get("frames", 5)),
+            skip_frames=int(task_cfg.get("skip_frames", 2)),
+            boxes_out="data/scene_boxes.json",
+            cloud_out="data/scene_cloud.npz",
+            image_out="data/scene_image.png",
+        )
+    finally:
+        source.close()  # no-op -- cam_tp itself stays open for the control loop
+
+    vm_cfg = cfg.get("value_map_llm", {})
+    llm = {
+        "provider": vm_cfg.get("provider", "anthropic"),
+        "model": vm_cfg.get("model", "claude-opus-5"),
+        "cache_dir": vm_cfg.get("cache_dir", "cache/value_map_llm"),
+    }
+    synthesize_and_save(
+        instruction, boxes, artifact_path,
+        bounds_margin_m=float(task_cfg.get("bounds_margin_m", 0.25)),
+        avoidance_weight=float(task_cfg.get("avoidance_weight", 1.0)),
+        obstacle_sigma=float(task_cfg.get("obstacle_sigma", 3.0)),
+        workspace_image=workspace_image,
+        llm=llm,
+        boxes_path="data/scene_boxes.json",
+    )
+    logger.info("Synthesized LLM value map for task=%r -> %s", instruction, artifact_path)
 
 
 # ---------------------------------------------------------------------------
@@ -930,10 +971,8 @@ def _start_inference_worker(
     outlier_pos_thresh_m: float,
     outlier_eul_thresh_rad: float,
     steering=None,
-    steer_stage_indices: set[int] | None = None,
     deploy_trace: "DeployTrace | None" = None,
 ) -> threading.Thread:
-    steer_stage_indices = steer_stage_indices or set()
     def worker() -> None:
         sequence = 0
         while not stop_event.is_set():
@@ -985,12 +1024,13 @@ def _start_inference_worker(
                 with policy_lock:
                     stage_idx = stage_state["idx"]
                     epoch = stage_state["epoch"]
-                    active_steering = (
-                        steering
-                        if (steering is not None and stage_idx in steer_stage_indices)
-                        else None
-                    )
-                    action = policy.forward(obs, steering=active_steering)
+                    # Always attached (never swapped for None here) — which
+                    # stages actually get non-zero guidance is decided inside
+                    # PositionFieldSteering.get_guidance via set_deploy_stage,
+                    # so its state stays warm across the grasp->place switch.
+                    if steering is not None:
+                        steering.set_deploy_stage(stage_idx)
+                    action = policy.forward(obs, steering=steering)
                 forward_s = time.monotonic() - forward_started_at
 
                 # DiffuserActorBasePolicy.forward() already converts relative
@@ -1126,67 +1166,10 @@ def main(cfg: DictConfig) -> int:
         np.array2string(workspace_hi_np, precision=3),
     )
 
-    # ----- optional steering (rotational toward the inverted place, and
-    # optionally positional toward the wine rack via hardcoded value maps) -----
-    steering, steer_stage_indices = _build_steering(
-        cfg.deploy, policy, policy_relative, policy_loc_bounds
-    )
-    # Stages where the gripper is MANUAL-ONLY: the policy plan's gripper channel
-    # is ignored and only the SpaceMouse chord (both buttons) opens/closes it.
-    # Default = the place stage (1), so the glass is held until the user commands
-    # the release into the rack slot — the policy never auto-opens at the basin.
-    manual_gripper_stages = {
-        int(s) for s in cfg.deploy.get("manual_gripper_stages", [1])
-    }
-    if steering is not None:
-        kind = type(steering).__name__
-        logger.info(
-            f"Steering ENABLED ({kind}) on stages {sorted(steer_stage_indices)}"
-        )
-
-    # Stage 0: grasp, Stage 1: place — primitive ids in the trained vocab.
-    stages = [
-        {"primitive": 0, "object": 0, "label": "grasp glass"},
-        {"primitive": 1, "object": 0, "label": "place glass"},
-    ]
-    stage_idx = 0
-    policy.set_primitive(stages[stage_idx]["primitive"])
-    policy.set_object(stages[stage_idx]["object"])
-    logger.info(f"[stage 0] {stages[stage_idx]['label']}")
-
-    # ----- cameras -----
-    # make_zed_camera() returns an already-opened ZedCamera (it calls
-    # zed.open() inside __init__). Below (inside the ExitStack) we call .run() +
-    # enable_frame_stream() so the background loop publishes the newest frame for
-    # the worker (get_latest_frame) AND records 30fps video off the same grab —
-    # so we no longer use synchronous grab_frame() (which can't run concurrently
-    # with the background loop).
-    cam_hand, cam_tp, pre_hand, pre_tp = _setup_cameras(cfg)
-
-    # ----- gripper (init pattern mirrors teleop.py:184-200) -----
-    gc = cfg.gripper
-    gripper = None
-    if gc.get("enabled", False):
-        gripper = RobotiqGripperProxy(
-            server_host=gc.host,
-            server_port=int(gc.port),
-            auto_activate=True,
-        )
-        # Default open at start (matches training: episodes begin with gripper open).
-        gripper.move_width(gc.open_width_m, wait=False)
-
-    # ----- visualization -----
-    vc = cfg.get("visualization", {})
-    visualizer = CortadoViserVisualizer(
-        host=vc.get("host", "0.0.0.0"),
-        port=int(vc.get("port", 8080)),
-    )
-    visualizer.update_gripper_width(
-        cfg.gripper.open_width_m,
-        max_width_m=cfg.gripper.max_width_m,
-    )
-
     # ----- robot -----
+    # Homed BEFORE steering/cameras: the arm needs to be out of the third-
+    # person camera's view for a clean SAM 3 scene capture when steering
+    # synthesizes a fresh value map below (deploy.task.instruction).
     setup_zero_franky(cfg.zero_franky.ip, cfg.zero_franky.port)
     robot = Robot(cfg.robot.ip)
     robot.recover_from_errors()
@@ -1211,6 +1194,71 @@ def main(cfg: DictConfig) -> int:
     robot.move(JointMotion(JointState(reset_joint_config),
                             relative_dynamics_factor=0.1),
                asynchronous=False)
+
+    # ----- gripper (init pattern mirrors teleop.py:184-200) -----
+    # Opened right alongside homing (not after cameras/steering setup below,
+    # which can take a while) so the arm always starts a run in the same
+    # state training assumes: homed AND open.
+    gc = cfg.gripper
+    gripper = None
+    if gc.get("enabled", False):
+        gripper = RobotiqGripperProxy(
+            server_host=gc.host,
+            server_port=int(gc.port),
+            auto_activate=True,
+        )
+        # Default open at start (matches training: episodes begin with gripper open).
+        gripper.move_width(gc.open_width_m, wait=False)
+
+    # ----- cameras -----
+    # make_zed_camera() returns an already-opened ZedCamera (it calls
+    # zed.open() inside __init__). Below (inside the ExitStack) we call .run() +
+    # enable_frame_stream() so the background loop publishes the newest frame for
+    # the worker (get_latest_frame) AND records 30fps video off the same grab —
+    # so we no longer use synchronous grab_frame() (which can't run concurrently
+    # with the background loop). Opened here, not yet streaming, so
+    # _build_steering below can take synchronous scene-capture grabs off cam_tp.
+    cam_hand, cam_tp, pre_hand, pre_tp = _setup_cameras(cfg)
+
+    # ----- optional steering: synthesizes a fresh LLM value map from a live
+    # scene capture (deploy.task.instruction) and steers position toward it
+    # during the place stage. Rotation is left entirely to the policy. -----
+    steering, steer_stage_indices = _build_steering(
+        cfg, policy, policy_relative, policy_loc_bounds, cam_tp
+    )
+    # Stages where the gripper is MANUAL-ONLY: the policy plan's gripper channel
+    # is ignored and only the SpaceMouse chord (both buttons) opens/closes it.
+    # Default = the place stage (1), so the glass is held until the user commands
+    # the release into the rack slot — the policy never auto-opens at the basin.
+    manual_gripper_stages = {
+        int(s) for s in cfg.deploy.get("manual_gripper_stages", [1])
+    }
+    if steering is not None:
+        kind = type(steering).__name__
+        logger.info(
+            f"Steering ENABLED ({kind}) on stages {sorted(steer_stage_indices)}"
+        )
+
+    # Stage 0: grasp, Stage 1: place — primitive ids in the trained vocab.
+    stages = [
+        {"primitive": 0, "object": 0, "label": "grasp glass"},
+        {"primitive": 1, "object": 0, "label": "place glass"},
+    ]
+    stage_idx = 0
+    policy.set_primitive(stages[stage_idx]["primitive"])
+    policy.set_object(stages[stage_idx]["object"])
+    logger.info(f"[stage 0] {stages[stage_idx]['label']}")
+
+    # ----- visualization -----
+    vc = cfg.get("visualization", {})
+    visualizer = CortadoViserVisualizer(
+        host=vc.get("host", "0.0.0.0"),
+        port=int(vc.get("port", 8080)),
+    )
+    visualizer.update_gripper_width(
+        cfg.gripper.open_width_m,
+        max_width_m=cfg.gripper.max_width_m,
+    )
 
     mouse = None
     try:
@@ -1514,7 +1562,6 @@ def main(cfg: DictConfig) -> int:
                 cfg.deploy.get("outlier_filter", {}).get("eul_thresh_rad", 0.30)
             ),
             steering=steering,
-            steer_stage_indices=steer_stage_indices,
             deploy_trace=deploy_trace,
         )
         stack.callback(lambda: (stop_event.set(), enabled_event.set(), inference_thread.join(timeout=1.0)))

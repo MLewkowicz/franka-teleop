@@ -3,13 +3,14 @@
 This is the seam between perception and steering. Everything above it speaks
 natural language and world-frame boxes; everything below it is the same
 `voxposer.value_map.ValueMap` the hand-built maps in `clear_franka.value_maps`
-produce, so `CombinedBoxSteering` consumes either without caring which.
+produce, so `PositionFieldSteering` consumes either without caring which.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
@@ -248,3 +249,58 @@ def synthesize_value_maps(
         )
 
     return stages
+
+
+def synthesize_and_save(
+    task: str,
+    boxes: list[SceneBox],
+    artifact_path: str | Path,
+    *,
+    workspace_bounds_min: Optional[np.ndarray] = None,
+    workspace_bounds_max: Optional[np.ndarray] = None,
+    bounds_margin_m: float = DEFAULT_BOUNDS_MARGIN_M,
+    map_size: int = 100,
+    avoidance_weight: float = 1.0,
+    obstacle_sigma: float = 3.0,
+    workspace_image: Optional[np.ndarray] = None,
+    llm: Optional[dict] = None,
+    boxes_path: Optional[str] = None,
+) -> tuple[Path, list[SynthesizedStage]]:
+    """`synthesize_value_maps` + `save_stages` in one call.
+
+    Returns (artifact_path, stages) -- the stages are handed back too since
+    the offline CLI needs them for its diagnostic prints/plots; deploy's
+    live-synthesis path just ignores them.
+
+    The shared tail used by both the offline CLI (`synthesize_value_map.py`)
+    and deploy's live-synthesis path, so both write artifacts the exact same
+    way.
+    """
+    if workspace_bounds_min is None or workspace_bounds_max is None:
+        workspace_bounds_min, workspace_bounds_max = workspace_bounds_from_boxes(
+            boxes, bounds_margin_m
+        )
+    stages = synthesize_value_maps(
+        task,
+        boxes,
+        workspace_bounds_min=workspace_bounds_min,
+        workspace_bounds_max=workspace_bounds_max,
+        map_size=map_size,
+        avoidance_weight=avoidance_weight,
+        obstacle_sigma=obstacle_sigma,
+        workspace_image=workspace_image,
+        llm=llm,
+    )
+    # Lazy import: artifact.py imports SynthesizedStage from this module, so a
+    # module-level import here would be circular.
+    from clear_franka.value_map_llm.artifact import save_stages
+
+    artifact = save_stages(
+        artifact_path,
+        stages,
+        task=task,
+        boxes_path=boxes_path,
+        avoidance_weight=avoidance_weight,
+        obstacle_sigma=obstacle_sigma,
+    )
+    return artifact, stages

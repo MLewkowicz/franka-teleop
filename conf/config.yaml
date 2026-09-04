@@ -247,276 +247,86 @@ deploy:
   joint_limit_max_torque: 30.0            # max repulsion torque per joint
   joint_limit_buffer_rad: 0.05            # pad lower/upper limits inward by this
 
+  # Task-conditioned steering. When `instruction` is set, deploy captures a
+  # scene from `camera` (before its background streaming loop starts),
+  # segments `objects` with SAM 3, and asks the planner LLM to synthesize a
+  # fresh position value map for the place stage -- every launch, from
+  # scratch, no caching -- then steers position (deploy.steering.*) toward
+  # it during the place stage; rotation is left to the policy. Leave
+  # `instruction` null to fully disable steering (baseline runs) -- no
+  # capture, no SAM 3, no LLM call, no PositionFieldSteering built at all.
+  task:
+    instruction: "put the mug in the empty bowl"
+    objects: ["mug", "bowl"]     # SAM 3 prompts
+    camera: third_person         # which cameras.* entry to capture from
+    frames: 5
+    skip_frames: 2
+    max_per_label: 2
+    bounds_margin_m: 0.25
+    avoidance_weight: 1.0
+    obstacle_sigma: 3.0
+
   steering:
-    enabled: false                  # flip to true (or override on CLI) to steer
-    # When True, reaching the basin / final position stage turns off ALL steering
-    # (rotation too), not just position — so the policy fully takes over there.
-    latch_disables_rotation: true
-    # Which placement to steer toward (the bimodal policy's "place" is overloaded):
-    #   rack    — mode B: invert the glass onto the wine rack (the params directly
-    #             below: target_euler, rot_reverse_direction, position).
-    #   cabinet — mode A: place the glass UPRIGHT into the cabinet (the `cabinet:`
-    #             block further down overrides the rotation target + position).
-    #   llm     — value maps synthesized offline from a task string + the SAM 3
-    #             scene boxes, loaded from `llm.artifact_path` (see the `llm:`
-    #             block below and synthesize_value_map.py). Rotation still comes
-    #             from target_euler here.
-    # Switch with this one line; the inactive mode's params are preserved.
-    place_mode: cabinet
-    # --- place_mode: llm ----------------------------------------------------
-    # Built by:
-    #   uv run python synthesize_value_map.py --task "..." \
-    #       --objects "wine rack,cabinet" --source live
-    # The artifact carries its own grid bounds and map_size (derived from the
-    # detected scene), so `position.workspace_bounds_*` / `position.map_size`
-    # are IGNORED in this mode — the maps and the coordinate transform have to
-    # index the same grid. Everything else (guidance_strength, delta_norm_cap,
-    # distance ramp, diag logging) falls back to the `position:` block below
-    # unless overridden here.
-    llm:
-      artifact_path: "data/value_maps/place.npz"
-      # guidance_strength: 0.35
-      # delta_norm_cap: 0.04
-    # Absolute target orientation, Euler XYZ radians, SAME convention as
-    # obs.ee_pose[3:6] (ee_rot_to_euler_xyz). Inverted-place value from the
-    # mode-B demos; refine by jogging to the inverted pose and reading ee euler.
-    # target_euler: [1.79, 1.31, -1.73]
-    # NOTE on rotation DIRECTION: the inverted-place pose [-1.35,1.31,1.41] is
-    # ~176° from the grasp orientation (~[-1.88,1.10,-1.17]) — a near-180° flip.
-    # The Rz(180°) "gripper-equivalent" [-1.35,1.31,-1.73] is NOT equivalent for
-    # this hand/glass: it sits only ~16° from grasp, so the glass barely rotates
-    # ("stays level the whole way up") — do NOT use it. Because the real target
-    # is near-antipodal, the LINEAR 6D pull can't choose which way the wrist goes
-    # around (and is ill-conditioned → the ~20° under-convergence + "wrong way").
-    # Controlling the direction needs routing the rotation through an intermediate
-    # orientation (via-target / geodesic SLERP), not a target swap.
-    target_euler: [-1.35, 1.31, 1.41]
-    # NOTE — TargetRotationSteering does NOT do per-horizon SLERP; it pulls
-    # every waypoint toward the same absolute target. To make rotation gradual
-    # (close to LangSteer's voxposer.yaml SLERP behavior with rot_horizon_alpha_max
-    # ~0.6), use a lower strength + ramp_floor=0.0 (so wp[0] gets no pull, wp[H-1]
-    # gets full) + a low start_guidance_timestep (only nudge in the low-noise band
-    # where mode basins separate). Crank back up if the rotation isn't completing.
-    guidance_strength: 0.4          # 0.4 stalled with eul[0] ~40° from target; smooth-handoff
-                                    # + delta_norm_cap now bound the per-step jump, so the
-                                    # earlier "0.6 snapped instantly" failure mode is gated.
+    # Position-only: the planner LLM (deploy.task) only ever synthesizes a
+    # position target -- grasp/release orientation is the base policy's job,
+    # so there is no per-task rotation target to hand-specify here. The
+    # policy is left fully in control of rotation.
     guidance_mode: dps              # "epsilon" (ε-delta) or "dps" (stronger, x-space)
-    ramp_floor: 0.3                 # wp[0] gets 30% pull, wp[H-1] full — earlier-in-horizon
-                                    # waypoints participate so the wrist starts rotating
-                                    # sooner along the trajectory, not just at the endpoint.
-    start_guidance_timestep: 25     # focus on low-t band only — basins separate there
-    # --- Geodesic (SLERP) rotation steering ---------------------------------
-    # The inverted-place target is a ~176° flip from the grasp pose. The default
-    # linear-6D pull (rot_use_slerp=false) can't choose which way the wrist goes
-    # around it and is ill-conditioned near 180° (→ "wrong way" + ~20° short).
-    # SLERP steers cleanly along the SO(3) geodesic; `rot_reverse_direction`
-    # picks which way around. The per-horizon fraction ramps `ramp_floor → max`.
-    rot_use_slerp: true
-    rot_reverse_direction: true     # true = force the LONG way around (opposite wrist
-                                    # direction, same final pose — the fix asked for);
-                                    # false = short-way geodesic. Note: a near-180° flip
-                                    # makes long(184°)/short(176°) close in total angle but
-                                    # OPPOSITE in direction (negated rotation axis).
-    rot_horizon_alpha_max: 0.5      # max geodesic fraction at wp[H-1] per call;
-                                    # higher = more rotation per plan (faster convergence,
-                                    # bigger per-step jump). Convergence accumulates across
-                                    # plans, so <1 is fine. Raise toward 0.7 if still short.
-    rot_reverse_min_angle_rad: 1.2  # only force the LONG way while the remaining rotation
-                                    # is bigger than this (the genuine ~176° flip). Once the
-                                    # wrist is within this of the target, always take the
-                                    # short way — otherwise a tiny residual whose axis flips
-                                    # vs the committed axis triggers a ~360° spin (the arm
-                                    # folds chasing it at the basin). Big flip is unaffected.
     stage_indices: [1]              # steer the place stage only
     horizon: 20
     device: cuda
-    # Positional steering — hardcoded VoxPoser-style value maps over the
-    # workspace boxes (data/workspace_boxes.json). When position.enabled=true the
-    # rotation steering above is preserved and a position branch is added (one
-    # CombinedBoxSteering module); both branches share guidance_mode above.
-    # Affordance = wine-rack front face (attracts); avoidance = cabinet + the
-    # volume beneath it (interior field that pushes the EE out, then the
-    # affordance draws it up to the rack). gripper_loc_bounds / relative are
-    # taken from the policy yaml automatically. Visualize/tune with
-    # `uv run python visualize_value_maps.py`.
+    # PositionFieldGuidance runtime tuning for the position branch that pulls
+    # toward the task's synthesized target (deploy.task). Grid bounds /
+    # map_size come from the synthesized artifact itself, not from here.
+    # gripper_loc_bounds / relative are taken from the policy yaml
+    # automatically.
     position:
-      enabled: true              # flip to true (or override on CLI) to steer position
-      boxes_path: "/home/clear/franka-teleop/data/workspace_boxes.json"
-      # Raw VoxPoser delta = coeff·∇cost in model space. dps_coeff=1/√ᾱ blows
-      # up at high t; cost gradients are ~5-10 per model unit; accumulated over
-      # 25 denoising steps the trajectory pegs the [-1, 1] normalization bounds
-      # and lands far outside the workspace. `delta_norm_cap` is the real safety
-      # bound (per-step L∞ on the position delta, model space); `guidance_strength`
-      # is a secondary throttle. Tune cap up before strength.
-      # Strength stays at 0.15 to keep meaningful y pull; cap dropped sharply
-      # because raw deltas were 75× the cap → trajectory shifted by the full
-      # [-1,1] model range over 25 denoising steps → 10cm jumps between
-      # waypoints + 22cm gap between current EE and adopted waypoint → robot
-      # safety shutdown. Cap=0.03 bounds per-step accumulation to ±0.03 × 25 =
-      # ±0.75 model units (worst-case 38cm world shift in z), and combined
-      # with the smooth-handoff prepend below, the executor never commands a
-      # jump that exceeds max_linear_vel_m_s.
-      guidance_strength: 0.35
-      delta_norm_cap: 0.04          # raised from 0.03 to let y/x components also saturate
-                                    # — smaller slab → smaller raw gradient → only z was
-                                    # hitting the cap; y/x are linear at low magnitude and
-                                    # can't fight the policy's +x rack-approach prior.
-      diag_log_calls: 30            # log the first N pos_delta magnitudes
-      # Distance ramp: keep guidance strong through the entire approach so the
-      # cap-saturated z pull doesn't give up before EE reaches basin height.
-      # Earlier setting (full=0.30, floor=0.0) had EE sagging at z=0.42 while
-      # dist_scale was only ~54% in the dwell band — guidance was fading right
-      # when we needed it most. Tightening `full` keeps the scale pinned to 1.0
-      # past d ≈ 0.15m, and a non-zero `floor` stops the basin from "letting go"
-      # near the target.
-      distance:
-        enabled: true
-        # Tightened 0.4/0.1 → 0.15/0.05. The ramp is on ISOTROPIC |ee-basin|, so
-        # once x and y converge the remaining (large) z-error is most of the
-        # distance — but the old 0.4→0.1 ramp had already faded guidance to ~20%
-        # by d≈0.16m, starving the z pull right when z is the only axis still far
-        # (EE stalled at z≈0.43 vs basin 0.55). Holding full guidance until 0.15m
-        # keeps the upward pull alive through the climb.
-        full: 0.15                 # >= this distance (m) -> full guidance
-        near: 0.05                 # <= this distance (m) -> `floor` (in the basin)
-        floor: 0.0                  # keep half-guidance even at the basin
-      # Basin latch: once the MEASURED EE first comes within this radius (m) of
-      # the basin, the position branch turns OFF for the rest of the stage and
-      # stays off (rotation steering keeps running). The basin is an APPROACH
-      # point, not the final rack-slot pose — the DistanceScaler ramps the pull
-      # to `floor` near the basin but is non-latching, so if the EE drifts back
-      # out the pull re-engages and the EE oscillates in/out of the basin while
-      # the policy aligns with the rack. The latch hands final alignment to the
-      # policy once we've arrived. Set 0 to disable (pure DistanceScaler).
-      # Set to ~the distance at which the EE actually SETTLES from the basin. The
-      # basin is pulled ~8cm out in front of the rack face on purpose (so the pull
-      # holds the EE out at the face instead of drifting back under the shelf),
-      # so the EE equilibrium sits ~7-8cm from the basin (mostly in x) and never
-      # reaches it — at 0.05 the latch never fired. 0.08 fires right at that
-      # settle point, handing position off to the policy there WITHOUT moving the
-      # basin (keeping its pull). One-way latch → no in/out oscillation. If the
-      # settle distance changes, retune this to match it.
-      basin_latch_radius_m: 0.08
-      start_guidance_timestep: 10000  # apply for t <= this; lower to focus low-t
-      avoidance_weight: 420         # strength of the front-face wall vs the rack affordance
-      # Avoidance is built as a *wall* at the front (-x) face of each obstacle
-      # box (cabinet + underneath), Gaussian-smoothed by ValueMap.smooth().
-      # `obstacle_sigma` (voxels) sets the wall's decay length. Underneath top
-      # z = 0.48 and rack basin z = 0.52 — only 4cm apart — so sigma must be
-      # SMALL enough that the wall doesn't bleed up to rack height and repel
-      # the EE as it approaches. sigma=3 voxels ≈ 17-40mm decay → wall is at
-      # ~5% of peak by rack height (1-2cm above underneath top).
-      obstacle_sigma: 3.0
-      # Default off — keeping the global EDT affordance active inside the
-      # obstacle volumes makes sure the EE keeps getting pulled toward the
-      # rack at every height. Suppressing created "dead zones" mid-climb where
-      # predicted waypoints inside the underneath got zero pull and the EE
-      # stalled at certain z heights.
-      suppress_affordance_in_obstacles: false
-      obstacle_back_extend_m: 0.0   # legacy knob for interior-EDT avoidance (no longer default)
-      # Push the avoidance wall slab +x (deeper into the obstacle), away from
-      # the rack-approach corridor. Underneath front face is at x=0.625 and the
-      # rack basin at ~x=0.65 (after the rack-slab change below) — a 5cm offset
-      # plants the wall slab squarely behind the basin, so the wall pushes the
-      # EE back from the underneath body without crowding the basin itself.
-      wall_x_offset_m: 0.05
-      # Soft Gaussian carve around the basin: avoidance is multiplied by
-      # (1 - exp(-d²/(2σ²))) so it's zero at the basin and ramps back to full
-      # at ~2-3σ away. Lets the EE approach the rack from the front without
-      # being repelled by the wall sitting behind it.
-      avoidance_carve_radius_m: 0.10
-      include_underneath_wall: false
-      # Rack-affordance slab geometry — basin sits in front of the rack face,
-      # slightly above center, and biased toward the cabinet (+y) side of the
-      # slot. With forward_extend=0.14 and face_thickness=-0.03:
-      #   slab x  = [0.615 - 0.14, 0.615 - 0.03] = [0.475, 0.585]
-      #   basin x = 0.615 + (-0.03 - 0.14)/2     = 0.530   (8.5cm in front of rack)
-      # `basin_y_offset_m` / `basin_z_offset_m` shift the slab+basin in y/+z
-      # without moving the rack box itself, so the steering aims toward the
-      # cabinet side of the slot and slightly above the rack's z-center.
+      # Raw delta = guidance_strength * dps_coeff(ᾱ) * ∇cost in model space.
+      # dps_coeff=1/√ᾱ is largest at the earliest (noisiest) denoising steps
+      # and shrinks toward the last step -- this already gives "strong pull
+      # while the mode is still being decided, gentler near the end" for
+      # free, no extra timestep knob needed. `delta_norm_cap` then bounds the
+      # per-step L∞ magnitude (safety: keeps the executor from ever commanding
+      # a jump bigger than max_linear_vel_m_s can track).
       #
-      # face_thickness sets the seed's RACK-SIDE (+x) edge at x_min+face_thickness.
-      # The EDT gradient pulls a behind-the-edge EE toward THAT edge (nearest seed
-      # voxel), so this — NOT forward_extend — is the knob that controls where the
-      # EE settles in x. At face=+0.02 the edge sat at 0.635 (2cm UNDER the shelf)
-      # and the descent pull was up-dominated ([-0.62,-0.08,+0.78]) → EE climbed
-      # up under the rack and clipped it. Moving the edge to 0.585 (3cm in FRONT
-      # of the face) makes the pull out-dominated ([-0.86,-0.05,+0.51]) so the EE
-      # is drawn out in front of the rack before rising; the policy + rotation
-      # steering then handle the final insertion (basin latch hands off at 10cm).
-      face_thickness_m: -0.03       # seed rack-side edge 3cm IN FRONT of the face
-      forward_extend_m: 0.14        # slab robot-side extent; NO effect on the pull
-                                    # direction for an EE behind the seed edge (proven
-                                    # via gradient probe) — it only sets the basin x
-                                    # (DistanceScaler/latch target) and the slab length.
-      # Bias the aim point toward the cabinet (+y) side of the slot. The policy
-      # has a residual −y pull off the basin (EE settled ~3cm more negative than
-      # the basin, drifting toward the rack middle), so aim +y of the slot center
-      # to land the EE in-slot. basin y = box_001 center (−0.064) + offset.
-      basin_y_offset_m: 0.02        # +y toward cabinet → basin y = −0.034
-      basin_z_offset_m: -0.08      # basin z = 0.455 (rack center 0.52 − 6.5cm). The inverted
-                                    # glass bottom sits ~7cm ABOVE the EE; aiming the EE here
-                                    # puts the glass bottom (0.455+0.07≈0.525) at the slot.
-      # CRITICAL: clip the affordance seed to a small window in y/z around the
-      # basin center. EDT gradients point to the *nearest* seed voxel — with a
-      # seed spanning the whole rack y range (0.20m wide), a predicted waypoint
-      # at y=0 only has to move 1cm in y to "reach" the seed edge, so the y
-      # gradient is tiny and can't overcome the policy's natural cabinet-mode
-      # bias (+y). A narrow seed (2cm in y centered on rack y) makes the seed
-      # behave like a *point target* — EDT gradient points toward the basin
-      # CENTER from anywhere, with strong y component.
-      affordance_y_extent_m: 0.02
-      affordance_z_extent_m: 0.02
-      map_size: 100
-      workspace_bounds_min: [0.45, -0.50, -0.15]  # value-map grid bounds (covers all boxes)
-      workspace_bounds_max: [1.00,  0.80,  0.75]
-
-    # ===== CABINET (mode A — upright placement) =====================
-    # Active only when place_mode=cabinet. Overrides the rotation target +
-    # direction above and supplies a gentle point-attractor position target.
-    # Grid bounds / map_size / gripper bounds are inherited from `position`.
-    cabinet:
-      # Upright place orientation: mean of 58 cabinet_*.h5 demos' final EE pose
-      # (vs the inverted rack target [-1.35,1.31,1.41]). Refine by jogging to the
-      # upright cabinet-place pose and reading ee euler.
-      target_euler: [-1.47, 0.93, -1.59]   # kept (module requires a target) but INERT
-                                            # while guidance_strength=0 — no rotation steering
-      rot_reverse_direction: false   # upright is a SHORT rotation from grasp — short way
-      # Rotation pull strength. 0 = NO rotation steering (this box_004 setting only
-      # steers position). Set ~0.5 to re-enable holding the upright cabinet target.
-      guidance_strength: 0.0
-      position:
-        # Position stages: the EE is pulled to each stage's target; on arrival
-        # within arrival_radius_m it advances (one-way); after the LAST stage,
-        # steering latches off. A stage target is either explicit `target: [x,y,z]`
-        # or a workspace box by name `target_box: box_004` (→ its center, so it
-        # tracks edits in the viser box editor). With latch_disables_rotation:true
-        # (top of the steering block) the final latch turns off ALL steering.
-        #
-        # ACTIVE: single stage → steer to box_004 center, then turn off all
-        # steering once within 6cm of it.
-        stages:
-          - { target_box: box_004, arrival_radius_m: 0.06 }
-        # Previous cabinet two-stage approach (kept for reference):
-        #   - { target: [0.4, 0.40, 0.65], arrival_radius_m: 0.05 }   # in front
-        #   - { target: [0.75, 0.17, 0.68], arrival_radius_m: 0.01 }  # onto surface
-        seed_extent_m: 0.04          # affordance seed cube edge (m) at each target
-        guidance_strength: 0.5      # pull strength (shared by both stages)
-        delta_norm_cap: 0.04
-        start_guidance_timestep: 10000
-        distance: { enabled: true, full: 0.40, near: 0.05, floor: .3 }
-        # Repulsive blob for the CLOSED cabinet (to the right / −y of the open
-        # cabinet, above the wine rack) so the EE is pushed away from it. Filled
-        # box, Gaussian-smoothed into a repulsion halo. ESTIMATED geometry — a
-        # mirror of the open cabinet (box_002) toward −y, raised into a tall blob
-        # over the rack; ADJUST center/size so it sits flush with the real closed
-        # cabinet (visualize/measure to refine). It must NOT overlap the +y
-        # attractor at y=0.40, or it would fight the pull.
-        avoidance:
-          enabled: true
-          box: { center: [0.68, -0.17, 0.60], size: [0.22, 0.46, 0.24] }
-          weight: 15.0                # avoidance vs affordance in the cost map; raise to push harder
-          sigma: 3.0                 # repulsion halo decay length (voxels)
+      # On the mug/bowl task (arrival_radius ~5cm, delta_norm_cap=0.04) raw
+      # deltas were ~0.05-0.09 -- saturating the cap 60-90% of the time, which
+      # means guidance_strength was barely doing anything (tanh(raw/cap) was
+      # already flat near +-1): lowering it wouldn't smoothly weaken the pull,
+      # it'd do nothing until crossing a threshold where it suddenly went too
+      # weak. Raised the cap toward the observed raw p90 (~0.075) so
+      # guidance_strength becomes a real, continuously-tunable dial again
+      # instead of the cap doing all the work. Re-tune together (cap first,
+      # then strength) if this still saturates hard on the next run.
+      guidance_strength: 0.3
+      delta_norm_cap: 0.025
+      diag_log_calls: 30            # log the first N pos_delta magnitudes
+      # Disabled for now to keep tuning simple: guidance_strength +
+      # delta_norm_cap are the only two knobs while getting the basic
+      # task-conditioned pull working. DistanceScaler.compute() returns 1.0
+      # (full guidance, no ramp-down on approach) whenever enabled=false, so
+      # this is a pure simplification, not a behavior removal — re-enable
+      # once the simple case is tuned if the EE needs to ease off near the
+      # target instead of pulling at full strength all the way in.
+      distance:
+        enabled: false
+        full: 0.15
+        near: 0.05
+        floor: 0.0
+      # StepScaler: ramps guidance_strength down over replans spent in the
+      # place stage (box_field_steering.PositionFieldSteering._stage_steps,
+      # reset every time the stage is (re)entered). full_steps=0 means the
+      # decay starts immediately on the 2nd replan (steps_in_stage=0 on the
+      # very first one, so that one still gets the full 0.35); decay_steps=3
+      # makes it a quick drop-off down to floor by the 4th-5th replan.
+      step:
+        enabled: true
+        full_steps: 0
+        decay_steps: 3
+        floor: 0.00
+      # apply the position pull for t <= this; lower to focus on the low-noise
+      # band only.
+      start_guidance_timestep: 10000
 
   # Median-filter isolated outlier waypoints from the policy's plan before
   # execution. Temporary mitigation for cross-modal gripper-coupled teleports
